@@ -23,13 +23,14 @@
 
 use aya_ebpf::{
     helpers::{
-        bpf_get_current_task, bpf_ktime_get_ns, bpf_probe_read_kernel, bpf_probe_read_kernel_buf,
+        bpf_get_current_comm, bpf_get_current_task, bpf_ktime_get_ns, bpf_probe_read_kernel,
+        bpf_probe_read_kernel_buf,
     },
     macros::{kprobe, map},
     maps::{PerCpuArray, PerfEventByteArray},
     programs::ProbeContext,
 };
-use hop_tap_ebpf_common::{PtyWriteEvent, MAX_CHUNK};
+use hop_tap_ebpf_common::{PtyWriteEvent, COMM_LEN, MAX_CHUNK};
 
 mod vmlinux;
 use vmlinux::{task_struct, tty_driver, tty_struct};
@@ -79,10 +80,21 @@ unsafe fn try_pty_write(ctx: &ProbeContext) -> Result<u32, u32> {
     let subtype_i: i16 =
         unsafe { bpf_probe_read_kernel(&raw const (*driver).subtype) }.map_err(|_| 1u32)?;
 
+    // tty->index — the per-driver unit number. For unix98 ptmx both
+    // master and slave of a pair share the same index, so this gives
+    // us a session key that joins both directions of the conversation.
+    let pty_index: i32 =
+        unsafe { bpf_probe_read_kernel(&raw const (*tty).index) }.map_err(|_| 1u32)?;
+
     // pid via the relocation we proved in 1.3.
     let task = unsafe { bpf_get_current_task() } as *const task_struct;
     let pid =
         unsafe { bpf_probe_read_kernel::<i32>(&raw const (*task).pid) }.map_err(|_| 1u32)? as u32;
+
+    // Process name via the dedicated helper (no relocation needed —
+    // this one is in the BPF helper UAPI). Returns the 16-byte comm
+    // buffer NUL-terminated.
+    let comm = bpf_get_current_comm().unwrap_or([0u8; COMM_LEN]);
 
     let timestamp_ns = unsafe { bpf_ktime_get_ns() };
 
@@ -95,8 +107,9 @@ unsafe fn try_pty_write(ctx: &ProbeContext) -> Result<u32, u32> {
     unsafe {
         (*slot).timestamp_ns = timestamp_ns;
         (*slot).pid = pid;
+        (*slot).pty_index = pty_index;
         (*slot).subtype = subtype_i as u16;
-        (*slot)._pad = 0;
+        (*slot).comm = comm;
         (*slot).total_len = if count > u32::MAX as usize {
             u32::MAX
         } else {

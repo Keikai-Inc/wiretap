@@ -29,8 +29,16 @@ pub const MAX_CHUNK: usize = 128;
 pub const PTY_TYPE_MASTER: u16 = 0x0001;
 pub const PTY_TYPE_SLAVE: u16 = 0x0002;
 
+// `task_struct.comm` is a fixed 16-byte buffer holding the
+// NUL-terminated process name (TASK_COMM_LEN in <linux/sched.h>).
+pub const COMM_LEN: usize = 16;
+
 // One captured `pty_write` invocation. The kernel populates `data[..captured_len]`;
 // callers must not touch bytes past `captured_len`.
+//
+// `pty_index` is the unit number of the pty pair (`tty_struct.index`).
+// Both ends of a pair share the same value, so events flowing in
+// either direction are joinable into one logical session by this key.
 //
 // `#[repr(C)]` + `Copy` is the FFI contract for anything that crosses the
 // kernel→userspace boundary via `PerfEventByteArray`: the kernel writes
@@ -40,10 +48,11 @@ pub const PTY_TYPE_SLAVE: u16 = 0x0002;
 pub struct PtyWriteEvent {
     pub timestamp_ns: u64,
     pub pid: u32,
+    pub pty_index: i32,
     pub subtype: u16,
     pub captured_len: u16,
     pub total_len: u32,
-    pub _pad: u32,
+    pub comm: [u8; COMM_LEN],
     pub data: [u8; MAX_CHUNK],
 }
 

@@ -14,19 +14,21 @@ prototype's architecture (the behavior we're targeting).
 
 ## Status
 
-Phase 1.4 — real `pty_write` capture verified end-to-end on Linux
-6.8 (under colima). The eBPF program reads pid via a CO-RE
-relocation off `task_struct`, chases `tty_struct → driver →
-subtype` through two more relocations to tag direction, and copies
-up to 128 bytes of the flat write buffer per event. Userspace
-prints the printable preview alongside pid, direction, and
-captured/total length — `echo HELLO_FROM_PHASE_1_4` showed up as
-the slave→master string `HELLO_FROM_PHASE_1_4`, an `\x04` Ctrl-D
-showed up as master→slave, etc.
+Phase 1.5 — session tracking verified end-to-end on Linux 6.8.
+The eBPF kprobe now reads `tty_struct.index` via a CO-RE
+relocation; both ends of a pty pair share the same index, so
+events from either direction roll up into one logical session.
+The daemon maintains a `SessionTable` (hash map keyed by
+`pty_index`), accumulates per-direction byte/event counters, and
+prints a periodic summary every 5s. Two concurrent `script(1)`
+invocations produce two distinct `pty=0` and `pty=1` rows with
+matching byte arithmetic; comm and last-pid are tracked per
+session.
 
-Phase 1.5 wires session lifecycle: identify each pty pair by its
-PTS inode, track open/close, build the `SessionState` table the
-daemon uses to fan events out to subscribers.
+Phase 1.6 wires off-screen terminal emulation: each session gets
+a `termwiz::Surface` driven by the captured slave→master byte
+stream, so peers can request a snapshot (escape sequences that
+reproduce the current screen on a fresh terminal).
 
 ## Layout
 
@@ -76,6 +78,6 @@ Not yet — see Phase 1.2.
 | 1.2 | Minimal eBPF kprobe; userspace reads PingEvents | done |
 | 1.3 | `#[relocatable]` types replace all CO-RE shims | done |
 | 1.4 | Real `pty_write` capture (flat buffer; `iov_iter` walker shelved) | done |
-| 1.5 | Session tracking by PTS inode | ← here |
-| 1.6 | `termwiz` Surface per session; snapshot generation | |
+| 1.5 | Session tracking by `tty_struct.index` | done |
+| 1.6 | `termwiz` Surface per session; snapshot generation | ← here |
 | 1.7 | Hop extension wiring (manifest, bootstrap, ExtMessage) | |

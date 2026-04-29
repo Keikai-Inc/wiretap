@@ -8,10 +8,12 @@
 //! to reproduce the current screen on a fresh terminal) when a peer
 //! subscribes.
 //!
-//! Phase 1.4 wires in: load the eBPF object, attach a `pty_write`
-//! kprobe, drain `PtyWriteEvent`s from per-CPU perf arrays, and log
-//! a printable preview of each captured chunk tagged with direction
-//! (master vs slave) and pid.
+//! Phase 1.5 wires in: per-CPU perf-array readers feed events into
+//! a shared `SessionTable` keyed by `tty_struct.index`. Both ends of
+//! a pty pair share the same index, so events from either direction
+//! roll up into the same logical session. A periodic task logs a
+//! summary every 5s — this stands in for the eventual peer-facing
+//! `list` command landing in Phase 1.7.
 
 use anyhow::Result;
 use tracing::info;
@@ -43,30 +45,57 @@ async fn main() -> Result<()> {
 mod linux {
     use anyhow::{Context, Result};
     use aya::{
-        include_bytes_aligned,
-        maps::AsyncPerfEventArray,
-        programs::KProbe,
-        util::online_cpus,
+        include_bytes_aligned, maps::AsyncPerfEventArray, programs::KProbe, util::online_cpus,
         Ebpf,
     };
     use aya_log::EbpfLogger;
     use bytes::BytesMut;
-    use hop_tap_ebpf_common::{PtyWriteEvent, PTY_TYPE_MASTER, PTY_TYPE_SLAVE};
-    use tokio::{signal, task::JoinSet};
-    use tracing::{info, warn};
+    use hop_tap_ebpf_common::{PtyWriteEvent, COMM_LEN, PTY_TYPE_MASTER, PTY_TYPE_SLAVE};
+    use std::{
+        collections::HashMap,
+        sync::{Arc, Mutex},
+        time::{Duration, Instant},
+    };
+    use tokio::{signal, task::JoinSet, time::interval};
+    use tracing::{debug, info, warn};
 
-    // Cross-compiled by build.rs. The bytes are aligned via aya's
-    // include_bytes_aligned! so the verifier sees a properly-aligned
-    // BPF object.
     static EBPF_OBJECT: &[u8] = include_bytes_aligned!(
         "../../hop-tap-ebpf/target/bpfel-unknown-none/release/hop-tap-ebpf"
     );
+
+    /// Per-session running state, accumulated from `pty_write`
+    /// events as they stream in.
+    ///
+    /// Keyed by `pty_index` (`tty_struct.index`) — the unit number
+    /// the kernel assigns to a pty pair. Both master and slave ends
+    /// of a pair share the same index, so input keystrokes (master
+    /// → slave) and program output (slave → master) accumulate into
+    /// one row.
+    ///
+    /// `last_*` fields are best-effort; a long-running session may
+    /// see many different writers (`bash` → `vim` → `bash` again as
+    /// the user runs commands). Phase 1.6 will replace per-event
+    /// `comm` snapshots with a real session-lifecycle model that
+    /// records the controlling process at session creation.
+    #[derive(Debug)]
+    struct SessionState {
+        pty_index: i32,
+        created_at: Instant,
+        last_activity: Instant,
+        last_pid: u32,
+        last_comm: String,
+        output_bytes: u64,
+        input_bytes: u64,
+        output_events: u64,
+        input_events: u64,
+    }
+
+    type SessionTable = Arc<Mutex<HashMap<i32, SessionState>>>;
 
     pub async fn run() -> Result<()> {
         bump_memlock();
 
         let mut bpf = Ebpf::load(EBPF_OBJECT).context("loading hop-tap-ebpf bytecode")?;
-
         if let Err(e) = EbpfLogger::init(&mut bpf) {
             warn!("eBPF logger init failed (no log statements?): {e}");
         }
@@ -79,11 +108,12 @@ mod linux {
             .try_into()
             .context("PTY_EVENTS is not a PerfEventArray")?;
 
+        let sessions: SessionTable = Arc::new(Mutex::new(HashMap::new()));
+
         let mut readers: JoinSet<()> = JoinSet::new();
         for cpu_id in online_cpus().map_err(|(_, e)| e).context("online_cpus")? {
-            let mut buf = perf
-                .open(cpu_id, Some(128))
-                .context("perf open")?;
+            let mut buf = perf.open(cpu_id, Some(128)).context("perf open")?;
+            let sessions = sessions.clone();
             readers.spawn(async move {
                 let mut bufs =
                     vec![BytesMut::with_capacity(core::mem::size_of::<PtyWriteEvent>()); 16];
@@ -100,46 +130,136 @@ mod linux {
                     }
                     for raw in bufs.iter().take(events.read) {
                         let event = unsafe { &*(raw.as_ptr() as *const PtyWriteEvent) };
-                        let dir = match event.subtype {
-                            PTY_TYPE_MASTER => "master→slave (input)",
-                            PTY_TYPE_SLAVE => "slave→master (output)",
-                            other => {
-                                // Non-PTY tty hooked us — shouldn't happen
-                                // when attached to pty_write but logged for
-                                // diagnosis if it does.
-                                warn!(cpu = cpu_id, subtype = other, "unexpected tty subtype");
-                                "unknown"
-                            }
-                        };
-                        let captured = event.captured_len.min(event.data.len() as u16) as usize;
-                        let preview = printable_preview(&event.data[..captured], 48);
-                        let truncated = event.captured_len as u32 != event.total_len;
-                        info!(
-                            pid = event.pid,
-                            ts_ns = event.timestamp_ns,
-                            dir,
-                            captured = event.captured_len,
-                            total = event.total_len,
-                            truncated,
-                            "{preview}"
-                        );
+                        ingest_event(&sessions, cpu_id, event);
                     }
                 }
             });
         }
 
+        // Periodic session summary. Stand-in for the peer-facing
+        // `list` command — keeps the operator informed of what's
+        // captured without spamming the per-event log.
+        let summary_table = sessions.clone();
+        let summary = tokio::spawn(async move {
+            let mut tick = interval(Duration::from_secs(5));
+            tick.tick().await; // skip the immediate fire
+            loop {
+                tick.tick().await;
+                log_summary(&summary_table);
+            }
+        });
+
         info!("hop-tap-d running; Ctrl-C to exit");
         signal::ctrl_c().await.context("ctrl-c")?;
         info!("shutting down");
+        summary.abort();
         readers.abort_all();
+        log_summary(&sessions);
         Ok(())
     }
 
+    /// Update the session table for a single decoded event and emit
+    /// a debug-level event log line.
+    fn ingest_event(sessions: &SessionTable, cpu_id: u32, event: &PtyWriteEvent) {
+        let now = Instant::now();
+        let comm = comm_to_string(&event.comm);
+
+        let mut table = sessions.lock().expect("session table mutex poisoned");
+        let state = table
+            .entry(event.pty_index)
+            .or_insert_with(|| SessionState {
+                pty_index: event.pty_index,
+                created_at: now,
+                last_activity: now,
+                last_pid: event.pid,
+                last_comm: comm.clone(),
+                output_bytes: 0,
+                input_bytes: 0,
+                output_events: 0,
+                input_events: 0,
+            });
+        state.last_activity = now;
+        state.last_pid = event.pid;
+        state.last_comm = comm;
+        match event.subtype {
+            PTY_TYPE_SLAVE => {
+                state.output_bytes += event.total_len as u64;
+                state.output_events += 1;
+            }
+            PTY_TYPE_MASTER => {
+                state.input_bytes += event.total_len as u64;
+                state.input_events += 1;
+            }
+            _ => {}
+        }
+        drop(table);
+
+        // Detailed event log at debug level so the default-info
+        // summary stays readable. Run with `RUST_LOG=hop_tap_d=debug`
+        // to see every byte chunk.
+        let dir = direction_label(event.subtype);
+        let captured = event.captured_len.min(event.data.len() as u16) as usize;
+        let preview = printable_preview(&event.data[..captured], 48);
+        let truncated = event.captured_len as u32 != event.total_len;
+        debug!(
+            cpu = cpu_id,
+            pty = event.pty_index,
+            pid = event.pid,
+            comm = %comm_to_string(&event.comm),
+            dir,
+            captured = event.captured_len,
+            total = event.total_len,
+            truncated,
+            "{preview}"
+        );
+    }
+
+    fn direction_label(subtype: u16) -> &'static str {
+        match subtype {
+            PTY_TYPE_MASTER => "master→slave (input)",
+            PTY_TYPE_SLAVE => "slave→master (output)",
+            _ => "unknown",
+        }
+    }
+
+    /// Snapshot the session table and print one log line per
+    /// session, plus a header.
+    fn log_summary(sessions: &SessionTable) {
+        let table = sessions.lock().expect("session table mutex poisoned");
+        if table.is_empty() {
+            info!("session summary: (no active sessions)");
+            return;
+        }
+        info!("session summary: {} active session(s)", table.len());
+        // Stable order so successive logs are easy to diff.
+        let mut rows: Vec<&SessionState> = table.values().collect();
+        rows.sort_by_key(|s| s.pty_index);
+        for s in rows {
+            let idle_ms = s.last_activity.elapsed().as_millis();
+            let age_ms = s.created_at.elapsed().as_millis();
+            info!(
+                pty = s.pty_index,
+                comm = %s.last_comm,
+                last_pid = s.last_pid,
+                out_bytes = s.output_bytes,
+                in_bytes = s.input_bytes,
+                out_events = s.output_events,
+                in_events = s.input_events,
+                age_ms,
+                idle_ms,
+                "  session"
+            );
+        }
+    }
+
+    /// Convert the kernel's NUL-padded 16-byte comm buffer into a
+    /// human-readable String. Trims at the first NUL.
+    fn comm_to_string(comm: &[u8; COMM_LEN]) -> String {
+        let end = comm.iter().position(|&b| b == 0).unwrap_or(COMM_LEN);
+        String::from_utf8_lossy(&comm[..end]).into_owned()
+    }
+
     fn bump_memlock() {
-        // Older kernels (pre-5.11) charge BPF maps against RLIMIT_MEMLOCK
-        // rather than the memcg. Setting both to RLIM_INFINITY is the
-        // conventional aya example pattern; on modern kernels it's a
-        // no-op.
         let rlim = libc::rlimit {
             rlim_cur: libc::RLIM_INFINITY,
             rlim_max: libc::RLIM_INFINITY,

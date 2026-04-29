@@ -41,6 +41,11 @@ pub struct tty_struct {
     // Pointer into kernel memory; we never deref it directly, only
     // chase a single field on the other side via another relocation.
     pub driver: *const tty_driver,
+    // Unit number within the driver. For unix98 ptmx, master and
+    // slave of a pair share the same `index` — exactly what we want
+    // as a session key, since events from either end of a pty roll
+    // up into the same logical session.
+    pub index: i32,
 }
 
 #[relocatable]
