@@ -3,17 +3,15 @@
 //! Loads the kernel-side eBPF program (compiled separately by
 //! `hop-tap-ebpf` with vlad's rustc fork), attaches its kprobes /
 //! tracepoints, and reads captured TTY events from per-CPU perf
-//! arrays. Maintains an off-screen `termwiz::Surface` per session so
-//! it can produce a "snapshot" payload (escape sequences sufficient
-//! to reproduce the current screen on a fresh terminal) when a peer
-//! subscribes.
+//! arrays. Maintains an off-screen `alacritty_terminal::Term` per
+//! session so it can produce a snapshot of the current screen
+//! when a peer subscribes (Phase 1.7+).
 //!
-//! Phase 1.5 wires in: per-CPU perf-array readers feed events into
-//! a shared `SessionTable` keyed by `tty_struct.index`. Both ends of
-//! a pty pair share the same index, so events from either direction
-//! roll up into the same logical session. A periodic task logs a
-//! summary every 5s — this stands in for the eventual peer-facing
-//! `list` command landing in Phase 1.7.
+//! Phase 1.6 wires the emulator: each session owns a `Term`
+//! (alacritty's full state machine — colors, cursor, alt-screen,
+//! scroll regions, the lot). The slave→master byte stream is
+//! driven through `vte::ansi::Processor::advance` so all CSI / OSC
+//! / ESC sequences land in the right cell-grid mutations.
 
 use anyhow::Result;
 use tracing::info;
@@ -56,8 +54,43 @@ mod linux {
         sync::{Arc, Mutex},
         time::{Duration, Instant},
     };
+    use alacritty_terminal::{
+        event::VoidListener,
+        grid::Dimensions,
+        index::{Column, Line, Point},
+        term::{Config, Term},
+        vte::ansi::Processor,
+    };
     use tokio::{signal, task::JoinSet, time::interval};
     use tracing::{debug, info, warn};
+
+    /// Default off-screen terminal dimensions. Real implementations
+    /// will track SIGWINCH / TIOCSWINSZ events to learn the actual
+    /// shell-side size; for Phase 1.6 we assume the conventional
+    /// 80x24 terminal.
+    const SURFACE_COLS: usize = 80;
+    const SURFACE_ROWS: usize = 24;
+
+    /// Trivial `Dimensions` impl for constructing a `Term` at fixed
+    /// rows × cols. We match `screen_lines` and `total_lines` so the
+    /// grid has no scrollback (we never read it), reducing per-session
+    /// memory footprint.
+    #[derive(Copy, Clone)]
+    struct FixedDims {
+        cols: usize,
+        lines: usize,
+    }
+    impl Dimensions for FixedDims {
+        fn total_lines(&self) -> usize {
+            self.lines
+        }
+        fn screen_lines(&self) -> usize {
+            self.lines
+        }
+        fn columns(&self) -> usize {
+            self.cols
+        }
+    }
 
     static EBPF_OBJECT: &[u8] = include_bytes_aligned!(
         "../../hop-tap-ebpf/target/bpfel-unknown-none/release/hop-tap-ebpf"
@@ -77,7 +110,6 @@ mod linux {
     /// the user runs commands). Phase 1.6 will replace per-event
     /// `comm` snapshots with a real session-lifecycle model that
     /// records the controlling process at session creation.
-    #[derive(Debug)]
     struct SessionState {
         pty_index: i32,
         created_at: Instant,
@@ -88,6 +120,74 @@ mod linux {
         input_bytes: u64,
         output_events: u64,
         input_events: u64,
+        // Off-screen terminal state. The processor parses the
+        // slave→master byte stream and applies actions to the
+        // alacritty `Term`'s cell grid — full CSI / OSC / ESC
+        // semantics, the same state machine that drives Alacritty.
+        processor: Processor,
+        term: Term<VoidListener>,
+        dims: FixedDims,
+    }
+
+    impl SessionState {
+        fn new(pty_index: i32, now: Instant, pid: u32, comm: String) -> Self {
+            let dims = FixedDims {
+                cols: SURFACE_COLS,
+                lines: SURFACE_ROWS,
+            };
+            // Disable scrollback — at 80×24, even a default 10k-line
+            // history would multiply per-session memory by ~400×.
+            // Phase 1.7+ can reintroduce a small scrollback if/when
+            // we expose it to peers.
+            let mut config = Config::default();
+            config.scrolling_history = 0;
+            let term = Term::new(config, &dims, VoidListener);
+            Self {
+                pty_index,
+                created_at: now,
+                last_activity: now,
+                last_pid: pid,
+                last_comm: comm,
+                output_bytes: 0,
+                input_bytes: 0,
+                output_events: 0,
+                input_events: 0,
+                processor: Processor::new(),
+                term,
+                dims,
+            }
+        }
+
+        /// Feed a slave→master chunk through the processor. Every
+        /// byte (printable, control, escape) lands in the right
+        /// cell-grid mutation via alacritty's `Handler` impl on
+        /// `Term`. Kernel-side bytes are *truncated* at MAX_CHUNK so
+        /// long writes are partially captured — the emulator stays
+        /// well-defined within the captured prefix.
+        fn ingest_output(&mut self, bytes: &[u8]) {
+            self.processor.advance(&mut self.term, bytes);
+        }
+
+        /// Return the most recent non-empty line on screen, trimmed
+        /// of trailing whitespace. `None` if the screen is blank.
+        fn snapshot_last_line(&self) -> Option<String> {
+            let grid = self.term.grid();
+            let cols = self.dims.cols;
+            let lines = self.dims.lines as i32;
+            // Walk bottom-up so we find the most recent line first.
+            for line_idx in (0..lines).rev() {
+                let mut row = String::with_capacity(cols);
+                for col in 0..cols {
+                    let p = Point::new(Line(line_idx), Column(col));
+                    row.push(grid[p].c);
+                }
+                let trimmed = row.trim_end();
+                if !trimmed.is_empty() {
+                    return Some(trimmed.to_string());
+                }
+            }
+            None
+        }
     }
 
     type SessionTable = Arc<Mutex<HashMap<i32, SessionState>>>;
@@ -167,24 +267,21 @@ mod linux {
         let mut table = sessions.lock().expect("session table mutex poisoned");
         let state = table
             .entry(event.pty_index)
-            .or_insert_with(|| SessionState {
-                pty_index: event.pty_index,
-                created_at: now,
-                last_activity: now,
-                last_pid: event.pid,
-                last_comm: comm.clone(),
-                output_bytes: 0,
-                input_bytes: 0,
-                output_events: 0,
-                input_events: 0,
-            });
+            .or_insert_with(|| SessionState::new(event.pty_index, now, event.pid, comm.clone()));
         state.last_activity = now;
         state.last_pid = event.pid;
         state.last_comm = comm;
+        let captured = event.captured_len.min(event.data.len() as u16) as usize;
         match event.subtype {
             PTY_TYPE_SLAVE => {
                 state.output_bytes += event.total_len as u64;
                 state.output_events += 1;
+                // Drive the off-screen surface from output bytes only.
+                // Master→slave traffic is what the user typed, which
+                // doesn't contribute to on-screen state directly (the
+                // shell will echo it back through slave→master if
+                // appropriate).
+                state.ingest_output(&event.data[..captured]);
             }
             PTY_TYPE_MASTER => {
                 state.input_bytes += event.total_len as u64;
@@ -237,6 +334,7 @@ mod linux {
         for s in rows {
             let idle_ms = s.last_activity.elapsed().as_millis();
             let age_ms = s.created_at.elapsed().as_millis();
+            let snapshot = s.snapshot_last_line().unwrap_or_else(|| "(blank)".into());
             info!(
                 pty = s.pty_index,
                 comm = %s.last_comm,
@@ -247,7 +345,7 @@ mod linux {
                 in_events = s.input_events,
                 age_ms,
                 idle_ms,
-                "  session"
+                "  session — last screen line: {snapshot}"
             );
         }
     }

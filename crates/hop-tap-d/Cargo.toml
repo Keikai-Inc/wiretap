@@ -20,6 +20,11 @@ anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
+# Off-screen terminal emulation. Cross-platform — the daemon
+# crate compiles on macOS too. See the project memory and the
+# workspace Cargo.toml for the choice rationale.
+alacritty_terminal.workspace = true
+
 # Linux-only: eBPF loader and per-CPU perf-array consumer.
 # Target-gated so the workspace still resolves on macOS / dev machines
 # where aya's syscall surface (perf_event_open, BPF()) is unavailable.

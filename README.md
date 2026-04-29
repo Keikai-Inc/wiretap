@@ -14,21 +14,18 @@ prototype's architecture (the behavior we're targeting).
 
 ## Status
 
-Phase 1.5 — session tracking verified end-to-end on Linux 6.8.
-The eBPF kprobe now reads `tty_struct.index` via a CO-RE
-relocation; both ends of a pty pair share the same index, so
-events from either direction roll up into one logical session.
-The daemon maintains a `SessionTable` (hash map keyed by
-`pty_index`), accumulates per-direction byte/event counters, and
-prints a periodic summary every 5s. Two concurrent `script(1)`
-invocations produce two distinct `pty=0` and `pty=1` rows with
-matching byte arithmetic; comm and last-pid are tracked per
-session.
+Phase 1.6 — off-screen emulation. Each session now owns an
+`alacritty_terminal::Term` (80×24, no scrollback) driven through
+alacritty's vte `Processor::advance` from the slave→master byte
+stream. Full CSI / OSC / ESC / SGR semantics — same state machine
+that powers Alacritty proper, so `vim`/`htop` redraws stay
+coherent. The periodic summary appends each session's most recent
+non-empty screen line; two concurrent script sessions resolve to
+the distinct strings they last echoed.
 
-Phase 1.6 wires off-screen terminal emulation: each session gets
-a `termwiz::Surface` driven by the captured slave→master byte
-stream, so peers can request a snapshot (escape sequences that
-reproduce the current screen on a fresh terminal).
+Phase 1.7 wires the Hop extension protocol: ipc-channel
+bootstrap, ExtMessage handlers (`list`, `connect`), the
+`hop tap` CLI verb, and the per-peer scope check.
 
 ## Layout
 
@@ -79,5 +76,5 @@ Not yet — see Phase 1.2.
 | 1.3 | `#[relocatable]` types replace all CO-RE shims | done |
 | 1.4 | Real `pty_write` capture (flat buffer; `iov_iter` walker shelved) | done |
 | 1.5 | Session tracking by `tty_struct.index` | done |
-| 1.6 | `termwiz` Surface per session; snapshot generation | ← here |
-| 1.7 | Hop extension wiring (manifest, bootstrap, ExtMessage) | |
+| 1.6 | `alacritty_terminal::Term` per session; snapshot generation | done |
+| 1.7 | Hop extension wiring (manifest, bootstrap, ExtMessage) | ← here |

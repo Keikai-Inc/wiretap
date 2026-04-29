@@ -26,8 +26,14 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# Phase 1.6 (terminal emulator). Cross-platform.
-termwiz = "0.23"
+# Phase 1.6 (terminal emulator). Cross-platform. We use
+# alacritty's headless emulator backend — pure Rust, on
+# crates.io, no GUI/font/image deps. `default-features = false`
+# disables the optional `serde` feature; we don't serialize
+# emulator state. Explicitly NOT vt100, which had
+# replay-divergence bugs in past use. (See the project memory on
+# emulator choice for the full rationale.)
+alacritty_terminal = { version = "0.26", default-features = false }
 
 # Serialization (used as we add features).
 serde = { version = "1", features = ["derive"] }
