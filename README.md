@@ -83,3 +83,5 @@ Not yet — see Phase 1.2.
 | 1.5 | Session tracking by `tty_struct.index` | done |
 | 1.6 | `alacritty_terminal::Term` per session; snapshot generation | done |
 | 1.7 | Hop extension wiring (manifest, bootstrap, ExtMessage) | done |
+| 1.8a | PTY dimension tracking via `tty_struct.winsize` | done |
+| 1.8b | Live byte streaming (`StreamOpen` / replay + Output / Resize) | done |

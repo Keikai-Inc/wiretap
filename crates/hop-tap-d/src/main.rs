@@ -71,7 +71,9 @@ async fn main() -> Result<()> {
 mod linux {
     use super::Args;
     use hop_tap_d::extension::{write_bootstrap_atomically, ExtMessage};
-    use hop_tap_d::protocol::{SessionInfo, TapRequest, TapResponse};
+    use hop_tap_d::protocol::{
+        SessionInfo, TapRequest, TapResponse, TapStreamFrame, TapStreamRequest,
+    };
     use alacritty_terminal::{
         event::VoidListener,
         grid::Dimensions,
@@ -89,14 +91,24 @@ mod linux {
     use hop_tap_ebpf_common::{PtyWriteEvent, COMM_LEN, PTY_TYPE_MASTER, PTY_TYPE_SLAVE};
     use ipc_channel::ipc::{IpcOneShotServer, IpcSender};
     use std::{
-        collections::HashMap,
+        collections::{HashMap, VecDeque},
         path::PathBuf,
-        sync::{Arc, Mutex},
+        sync::{
+            atomic::{AtomicU64, Ordering},
+            Arc, Mutex,
+        },
         thread,
         time::{Duration, Instant},
     };
     use tokio::{signal, task::JoinSet, time::interval};
     use tracing::{debug, info, warn};
+
+    /// Bound on the per-session replay ring buffer. 64 KiB is large
+    /// enough to capture a full screen's worth of recent activity
+    /// (a 200×80 terminal of fully-coloured output at the upper
+    /// bound is ~80 KiB, but typical replay only needs the most
+    /// recent few rows for the operator to orient).
+    const REPLAY_BYTES: usize = 64 * 1024;
 
     /// Fallback dimensions used only until the first `pty_write`
     /// surfaces real ones. Most sessions will resize within
@@ -142,6 +154,15 @@ mod linux {
         processor: Processor,
         term: Term<VoidListener>,
         dims: FixedDims,
+        // Rolling slave→master byte history, capped at REPLAY_BYTES.
+        // Sent verbatim as the first frame of any new stream
+        // subscription so the subscriber catches up on whatever's
+        // already been written.
+        replay: VecDeque<u8>,
+        // stream_ids currently subscribed to live updates from this
+        // session. Most sessions have zero subscribers so the fan-out
+        // hot path is just an `is_empty()` check.
+        subscribers: Vec<u64>,
     }
 
     impl SessionState {
@@ -166,7 +187,27 @@ mod linux {
                 processor: Processor::new(),
                 term,
                 dims,
+                replay: VecDeque::with_capacity(REPLAY_BYTES),
+                subscribers: Vec::new(),
             }
+        }
+
+        fn append_replay(&mut self, bytes: &[u8]) {
+            // If the chunk itself is bigger than our cap, keep only
+            // its tail (best-effort recent context).
+            let take = bytes.len().min(REPLAY_BYTES);
+            let start = bytes.len() - take;
+            for &b in &bytes[start..] {
+                if self.replay.len() == REPLAY_BYTES {
+                    self.replay.pop_front();
+                }
+                self.replay.push_back(b);
+            }
+        }
+
+        fn replay_snapshot(&self) -> Vec<u8> {
+            // VecDeque can be non-contiguous; flatten for the wire.
+            self.replay.iter().copied().collect()
         }
 
         /// Resize the off-screen terminal if the kernel-reported
@@ -251,6 +292,17 @@ mod linux {
 
     type SessionTable = Arc<Mutex<HashMap<i32, SessionState>>>;
 
+    /// Daemon-shared handle for sending `ExtMessage` to the connected
+    /// hop daemon. Populated once the handshake completes; checked by
+    /// both the request-handler thread (to send Responses) and the
+    /// per-CPU tokio readers (to fan out live `StreamFrame`s to
+    /// subscribers).
+    ///
+    /// The Mutex is held only across a single `.send()` call. Brief
+    /// contention with thousands of events/sec is fine; if it ever
+    /// becomes hot we can swap to a dedicated writer thread + mpsc.
+    type WriterSlot = Arc<Mutex<Option<IpcSender<ExtMessage>>>>;
+
     pub async fn run(args: Args) -> Result<()> {
         bump_memlock();
 
@@ -268,11 +320,13 @@ mod linux {
             .context("PTY_EVENTS is not a PerfEventArray")?;
 
         let sessions: SessionTable = Arc::new(Mutex::new(HashMap::new()));
+        let writer: WriterSlot = Arc::new(Mutex::new(None));
 
         let mut readers: JoinSet<()> = JoinSet::new();
         for cpu_id in online_cpus().map_err(|(_, e)| e).context("online_cpus")? {
             let mut buf = perf.open(cpu_id, Some(128)).context("perf open")?;
             let sessions = sessions.clone();
+            let writer = writer.clone();
             readers.spawn(async move {
                 let mut bufs =
                     vec![BytesMut::with_capacity(core::mem::size_of::<PtyWriteEvent>()); 16];
@@ -289,7 +343,7 @@ mod linux {
                     }
                     for raw in bufs.iter().take(events.read) {
                         let event = unsafe { &*(raw.as_ptr() as *const PtyWriteEvent) };
-                        ingest_event(&sessions, cpu_id, event);
+                        ingest_event(&sessions, &writer, cpu_id, event);
                     }
                 }
             });
@@ -311,9 +365,10 @@ mod linux {
         // touching the tokio runtime directly.
         let ext_thread = if let Some(bootstrap) = args.bootstrap.clone() {
             let sessions = sessions.clone();
+            let writer = writer.clone();
             let version = args.protocol_version.clone();
             Some(thread::spawn(move || {
-                if let Err(e) = run_extension(bootstrap, version, sessions) {
+                if let Err(e) = run_extension(bootstrap, version, sessions, writer) {
                     warn!(error = %e, "extension thread exited with error");
                 }
             }))
@@ -347,6 +402,7 @@ mod linux {
         bootstrap_path: PathBuf,
         protocol_version: String,
         sessions: SessionTable,
+        writer: WriterSlot,
     ) -> Result<()> {
         let (server, server_name) = IpcOneShotServer::<ExtMessage>::new()
             .context("creating ipc-channel server")?;
@@ -374,7 +430,12 @@ mod linux {
                 ext_version: protocol_version,
             })
             .context("sending HelloAck")?;
+        // Publish the sender so tokio-side fan-out (live StreamFrames)
+        // can write to the same hop connection.
+        *writer.lock().expect("writer mutex poisoned") = Some(tx_to_hop.clone());
         info!("extension handshake complete");
+
+        let next_stream_id = AtomicU64::new(1);
 
         loop {
             let msg = match rx_from_hop.recv() {
@@ -403,17 +464,160 @@ mod linux {
                         break;
                     }
                 }
-                ExtMessage::StreamOpen { request_id, .. } => {
-                    let _ = tx_to_hop.send(ExtMessage::StreamClosed {
-                        stream_id: request_id,
-                        reason: Some("hop-tap streaming not yet implemented".into()),
-                    });
+                ExtMessage::StreamOpen {
+                    request_id,
+                    payload,
+                    ..
+                } => {
+                    let stream_id = next_stream_id.fetch_add(1, Ordering::Relaxed);
+                    handle_stream_open(
+                        &sessions,
+                        &tx_to_hop,
+                        request_id,
+                        stream_id,
+                        &payload,
+                    );
                 }
-                other => debug!(?other, "ignored non-Request message"),
+                ExtMessage::StreamClose { stream_id } => {
+                    handle_stream_close(&sessions, stream_id);
+                }
+                other => debug!(?other, "ignored unsupported message"),
             }
         }
 
+        // Tear down the writer slot so any tokio readers know not to
+        // try sending past this point.
+        *writer.lock().expect("writer mutex poisoned") = None;
         Ok(())
+    }
+
+    /// Decode the stream-open payload, find the requested session,
+    /// register the subscriber, and send `StreamOpened` followed by
+    /// the `Initial` frame containing the session's recent byte
+    /// history. If the request can't be served (decode failure or
+    /// missing pty), reply with `StreamClosed { reason: ... }`.
+    fn handle_stream_open(
+        sessions: &SessionTable,
+        tx_to_hop: &IpcSender<ExtMessage>,
+        request_id: u64,
+        stream_id: u64,
+        payload: &[u8],
+    ) {
+        let cfg = bincode::config::standard();
+        let req: TapStreamRequest = match bincode::serde::decode_from_slice(payload, cfg) {
+            Ok((req, _)) => req,
+            Err(e) => {
+                let _ = tx_to_hop.send(ExtMessage::StreamClosed {
+                    stream_id,
+                    reason: Some(format!("decode TapStreamRequest: {e}")),
+                });
+                return;
+            }
+        };
+        let TapStreamRequest::Subscribe { pty_index } = req;
+
+        let initial = {
+            let mut table = sessions.lock().expect("session table mutex poisoned");
+            let Some(state) = table.get_mut(&pty_index) else {
+                drop(table);
+                let _ = tx_to_hop.send(ExtMessage::StreamClosed {
+                    stream_id,
+                    reason: Some(format!("no session with pty_index={pty_index}")),
+                });
+                return;
+            };
+            state.subscribers.push(stream_id);
+            TapStreamFrame::Initial {
+                rows: state.dims.lines as u16,
+                cols: state.dims.cols as u16,
+                replay_bytes: state.replay_snapshot(),
+            }
+        };
+
+        if tx_to_hop
+            .send(ExtMessage::StreamOpened {
+                request_id,
+                stream_id,
+            })
+            .is_err()
+        {
+            return;
+        }
+        let frame_bytes = match bincode::serde::encode_to_vec(&initial, cfg) {
+            Ok(b) => b,
+            Err(e) => {
+                let _ = tx_to_hop.send(ExtMessage::StreamClosed {
+                    stream_id,
+                    reason: Some(format!("encode Initial: {e}")),
+                });
+                return;
+            }
+        };
+        let _ = tx_to_hop.send(ExtMessage::StreamFrame {
+            stream_id,
+            payload: frame_bytes,
+        });
+        info!(stream_id, pty_index, "stream subscribed");
+    }
+
+    fn handle_stream_close(sessions: &SessionTable, stream_id: u64) {
+        let mut table = sessions.lock().expect("session table mutex poisoned");
+        for state in table.values_mut() {
+            state.subscribers.retain(|&id| id != stream_id);
+        }
+        info!(stream_id, "stream closed");
+    }
+
+    /// Fan-out payload built inside the sessions lock and applied
+    /// outside it (so we never hold sessions + writer locks at the
+    /// same time).
+    struct FanOut {
+        subscribers: Vec<u64>,
+        /// Some(bytes) if this event carried slave→master output to
+        /// forward; None for input or empty events.
+        live_bytes: Option<Vec<u8>>,
+        /// Some((rows, cols)) if the kernel-reported dimensions
+        /// changed on this event.
+        dim_change: Option<(u16, u16)>,
+    }
+
+    /// Send `Output` and/or `Resize` frames to each subscriber. Drops
+    /// silently if the writer slot is unset (handshake hasn't run
+    /// yet, or the hop connection is gone) — in either case the
+    /// subscribers themselves are gone too.
+    fn fan_out(writer: &WriterSlot, f: FanOut) {
+        let cfg = bincode::config::standard();
+        let mut payloads: Vec<(u64, Vec<u8>)> = Vec::new();
+        if let Some((rows, cols)) = f.dim_change {
+            let frame = TapStreamFrame::Resize { rows, cols };
+            if let Ok(bytes) = bincode::serde::encode_to_vec(&frame, cfg) {
+                for &sid in &f.subscribers {
+                    payloads.push((sid, bytes.clone()));
+                }
+            }
+        }
+        if let Some(bytes) = f.live_bytes {
+            let frame = TapStreamFrame::Output(bytes);
+            if let Ok(b) = bincode::serde::encode_to_vec(&frame, cfg) {
+                for &sid in &f.subscribers {
+                    payloads.push((sid, b.clone()));
+                }
+            }
+        }
+        if payloads.is_empty() {
+            return;
+        }
+        let guard = writer.lock().expect("writer mutex poisoned");
+        if let Some(tx) = guard.as_ref() {
+            for (stream_id, payload) in payloads {
+                if tx
+                    .send(ExtMessage::StreamFrame { stream_id, payload })
+                    .is_err()
+                {
+                    warn!(stream_id, "stream frame send failed");
+                }
+            }
+        }
     }
 
     /// Decode a `TapRequest` from `payload`, run the handler, encode
@@ -457,36 +661,80 @@ mod linux {
         }
     }
 
-    fn ingest_event(sessions: &SessionTable, cpu_id: u32, event: &PtyWriteEvent) {
+    fn ingest_event(
+        sessions: &SessionTable,
+        writer: &WriterSlot,
+        cpu_id: u32,
+        event: &PtyWriteEvent,
+    ) {
         let now = Instant::now();
         let comm = comm_to_string(&event.comm);
-
-        let mut table = sessions.lock().expect("session table mutex poisoned");
-        let state = table
-            .entry(event.pty_index)
-            .or_insert_with(|| SessionState::new(event.pty_index, now, event.pid, comm.clone()));
-        state.last_activity = now;
-        state.last_pid = event.pid;
-        state.last_comm = comm;
-        // Apply the kernel-reported window size *before* feeding bytes,
-        // so escape sequences that depend on dimensions (e.g. cursor
-        // positioning to "row N where N is the last row") interpret
-        // against the right grid.
-        state.maybe_resize(event.rows, event.cols);
         let captured = event.captured_len.min(event.data.len() as u16) as usize;
-        match event.subtype {
-            PTY_TYPE_SLAVE => {
-                state.output_bytes += event.total_len as u64;
-                state.output_events += 1;
-                state.ingest_output(&event.data[..captured]);
+
+        // Inside the sessions lock: update state, then snapshot the
+        // small amount of data the fan-out needs (the live bytes,
+        // any dim change, the subscribers list). We deliberately
+        // *do not* take the writer lock here — that would mean
+        // holding both locks at once and risk a deadlock with the
+        // request handler thread (which takes writer then sessions).
+        let fanout: Option<FanOut> = {
+            let mut table = sessions.lock().expect("session table mutex poisoned");
+            let state = table.entry(event.pty_index).or_insert_with(|| {
+                SessionState::new(event.pty_index, now, event.pid, comm.clone())
+            });
+            state.last_activity = now;
+            state.last_pid = event.pid;
+            state.last_comm = comm.clone();
+            // Apply the kernel-reported window size *before* feeding
+            // bytes, so escape sequences that depend on dimensions
+            // (cursor positioning, scroll regions) interpret against
+            // the right grid.
+            let prev_dims = state.dims;
+            state.maybe_resize(event.rows, event.cols);
+            let dim_change = (state.dims.cols != prev_dims.cols
+                || state.dims.lines != prev_dims.lines)
+                .then_some((state.dims.lines as u16, state.dims.cols as u16));
+
+            let live_bytes: Option<Vec<u8>> = match event.subtype {
+                PTY_TYPE_SLAVE => {
+                    state.output_bytes += event.total_len as u64;
+                    state.output_events += 1;
+                    state.ingest_output(&event.data[..captured]);
+                    state.append_replay(&event.data[..captured]);
+                    if state.subscribers.is_empty() {
+                        None
+                    } else {
+                        Some(event.data[..captured].to_vec())
+                    }
+                }
+                PTY_TYPE_MASTER => {
+                    state.input_bytes += event.total_len as u64;
+                    state.input_events += 1;
+                    None
+                }
+                _ => None,
+            };
+
+            // Snapshot subscribers only when we actually have something
+            // to forward (live bytes OR a dim change). For sessions
+            // with no subscribers the hot path stays a single empty
+            // check.
+            if state.subscribers.is_empty() {
+                None
+            } else if live_bytes.is_some() || dim_change.is_some() {
+                Some(FanOut {
+                    subscribers: state.subscribers.clone(),
+                    live_bytes,
+                    dim_change,
+                })
+            } else {
+                None
             }
-            PTY_TYPE_MASTER => {
-                state.input_bytes += event.total_len as u64;
-                state.input_events += 1;
-            }
-            _ => {}
+        };
+
+        if let Some(f) = fanout {
+            fan_out(writer, f);
         }
-        drop(table);
 
         let dir = direction_label(event.subtype);
         let captured = event.captured_len.min(event.data.len() as u16) as usize;

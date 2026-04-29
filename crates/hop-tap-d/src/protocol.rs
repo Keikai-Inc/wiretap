@@ -68,3 +68,42 @@ pub struct SessionInfo {
     /// Milliseconds since last observed activity.
     pub idle_ms: u64,
 }
+
+/// Carried inside `ExtMessage::StreamOpen.payload`. The peer asks
+/// to subscribe to live updates from a specific session.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum TapStreamRequest {
+    Subscribe { pty_index: i32 },
+}
+
+/// Carried inside `ExtMessage::StreamFrame.payload`. The first frame
+/// after `StreamOpened` is always [`TapStreamFrame::Initial`] which
+/// catches the subscriber up to current state; subsequent frames
+/// stream live as the session produces output.
+///
+/// Wire fidelity is byte-level: `Output(bytes)` is the raw kernel-
+/// captured slave→master write, including any escape sequences. The
+/// subscriber writes those bytes to its own terminal verbatim and
+/// the receiving terminal interprets them — same path the original
+/// shell→pty bytes would take. No client-side emulator round-trip.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum TapStreamFrame {
+    /// Sent once, immediately after `StreamOpened`. Carries the
+    /// kernel's current view of the session's dimensions plus a
+    /// recent byte history (rolling buffer; size bounded by the
+    /// daemon) the client should write to its terminal first so it
+    /// catches up to the current screen state.
+    Initial {
+        rows: u16,
+        cols: u16,
+        replay_bytes: Vec<u8>,
+    },
+    /// Live slave→master output bytes since the last frame. Written
+    /// verbatim to the subscriber's terminal.
+    Output(Vec<u8>),
+    /// The kernel-reported dimensions changed (TIOCSWINSZ). The
+    /// subscriber may or may not propagate this to its own terminal
+    /// — semantically it's "this is the size the underlying session
+    /// thinks it has," not "resize your viewport now."
+    Resize { rows: u16, cols: u16 },
+}

@@ -20,8 +20,9 @@ use std::path::PathBuf;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use hop_tap_d::extension::{Bootstrap, ExtMessage};
-use hop_tap_d::protocol::{TapRequest, TapResponse};
-use ipc_channel::ipc::{IpcOneShotServer, IpcSender};
+use hop_tap_d::protocol::{TapRequest, TapResponse, TapStreamFrame, TapStreamRequest};
+use ipc_channel::ipc::{IpcOneShotServer, IpcReceiver, IpcSender};
+use std::io::Write;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -46,10 +47,22 @@ enum Cmd {
         #[arg(long = "pty")]
         pty_index: i32,
     },
+    /// Subscribe to a session's live byte stream. Replays recent
+    /// history first, then writes each captured chunk to stdout
+    /// verbatim — your terminal interprets the escape sequences
+    /// natively, so the session renders the same way it would for
+    /// the original user.
+    Watch {
+        #[arg(long = "pty")]
+        pty_index: i32,
+    },
 }
 
 fn main() -> Result<()> {
+    // Logs go to stderr so `watch` can stream raw session bytes to
+    // stdout without log lines interleaving them.
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
 
@@ -92,11 +105,39 @@ fn main() -> Result<()> {
         other => bail!("expected HelloAck, got {:?}", other),
     }
 
-    // Build, send, receive.
-    let req = match args.cmd {
-        Cmd::List => TapRequest::List,
-        Cmd::Snapshot { pty_index } => TapRequest::Snapshot { pty_index },
-    };
+    let cfg = bincode::config::standard();
+    match args.cmd {
+        Cmd::List => one_shot(tx_to_ext, rx_from_ext, TapRequest::List),
+        Cmd::Snapshot { pty_index } => {
+            one_shot(tx_to_ext, rx_from_ext, TapRequest::Snapshot { pty_index })
+        }
+        Cmd::Watch { pty_index } => {
+            // Send the StreamOpen, render frames as they arrive.
+            let payload = bincode::serde::encode_to_vec(
+                &TapStreamRequest::Subscribe { pty_index },
+                cfg,
+            )
+            .context("encoding TapStreamRequest")?;
+            let request_id = 1;
+            tx_to_ext
+                .send(ExtMessage::StreamOpen {
+                    request_id,
+                    peer_id: "probe".into(),
+                    peer_username: Some("probe".into()),
+                    peer_role: "creator".into(),
+                    payload,
+                })
+                .context("sending StreamOpen")?;
+            watch_loop(rx_from_ext, request_id)
+        }
+    }
+}
+
+fn one_shot(
+    tx_to_ext: IpcSender<ExtMessage>,
+    rx_from_ext: IpcReceiver<ExtMessage>,
+    req: TapRequest,
+) -> Result<()> {
     let cfg = bincode::config::standard();
     let payload = bincode::serde::encode_to_vec(&req, cfg).context("encoding TapRequest")?;
     let request_id = 1;
@@ -124,6 +165,76 @@ fn main() -> Result<()> {
                 let (resp, _): (TapResponse, _) = bincode::serde::decode_from_slice(&payload, cfg)
                     .context("decoding TapResponse")?;
                 print_response(&resp);
+                return Ok(());
+            }
+            other => warn!(?other, "ignoring non-matching message"),
+        }
+    }
+}
+
+/// Live-watch loop. Awaits StreamOpened, then prints each StreamFrame
+/// payload to stdout as raw bytes. Terminates on StreamClosed or
+/// receiver disconnect.
+///
+/// We deliberately don't trap Ctrl-C here — process exit closes the
+/// ipc-channel, the daemon notices and removes the subscriber on its
+/// next attempt. A polished UI would send `StreamClose` proactively;
+/// for the probe we stay minimal.
+fn watch_loop(rx_from_ext: IpcReceiver<ExtMessage>, request_id: u64) -> Result<()> {
+    let cfg = bincode::config::standard();
+    let mut stdout = std::io::stdout().lock();
+    let mut stream_id: Option<u64> = None;
+    loop {
+        let msg = rx_from_ext.recv().context("recv from extension")?;
+        match msg {
+            ExtMessage::StreamOpened {
+                request_id: rid,
+                stream_id: sid,
+            } if rid == request_id => {
+                eprintln!("(stream opened: stream_id={sid})");
+                // Clear the operator's terminal so the replay starts
+                // clean. ESC [ 2 J = erase entire screen, ESC [ H =
+                // home cursor.
+                stdout.write_all(b"\x1b[2J\x1b[H").ok();
+                stdout.flush().ok();
+                stream_id = Some(sid);
+            }
+            ExtMessage::StreamFrame {
+                stream_id: sid,
+                payload,
+            } if Some(sid) == stream_id => {
+                let (frame, _): (TapStreamFrame, _) =
+                    bincode::serde::decode_from_slice(&payload, cfg)
+                        .context("decoding TapStreamFrame")?;
+                match frame {
+                    TapStreamFrame::Initial {
+                        rows,
+                        cols,
+                        replay_bytes,
+                    } => {
+                        eprintln!(
+                            "(initial frame: {}x{}, replay={} bytes)",
+                            rows,
+                            cols,
+                            replay_bytes.len()
+                        );
+                        stdout.write_all(&replay_bytes).ok();
+                        stdout.flush().ok();
+                    }
+                    TapStreamFrame::Output(bytes) => {
+                        stdout.write_all(&bytes).ok();
+                        stdout.flush().ok();
+                    }
+                    TapStreamFrame::Resize { rows, cols } => {
+                        eprintln!("(resize: {}x{})", rows, cols);
+                    }
+                }
+            }
+            ExtMessage::StreamClosed {
+                stream_id: sid,
+                reason,
+            } if Some(sid) == stream_id || stream_id.is_none() => {
+                eprintln!("(stream closed: {reason:?})");
                 return Ok(());
             }
             other => warn!(?other, "ignoring non-matching message"),
