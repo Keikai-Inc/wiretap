@@ -68,3 +68,27 @@ pub struct PtyWriteEvent {
 
 #[cfg(all(target_os = "linux", feature = "user"))]
 unsafe impl aya::Pod for PtyWriteEvent {}
+
+/// Emitted exactly once per side of a pty pair as the kernel tears
+/// it down (kprobe on `tty_release_struct`). Userspace treats the
+/// first end event for a given `pty_index` as authoritative
+/// "session is gone" and is idempotent on subsequent ones — for the
+/// other side of the pair, or for whatever rare case a re-tear
+/// fires.
+///
+/// `tty_release_struct` is called from `tty_release` after the
+/// final fd reference drops, so it's the canonical kernel signal
+/// for "this tty is done." Compared to a process-exit-based hook
+/// it's strictly more accurate: a session can outlive any one
+/// process (the shell forks runs commands etc.), and dies exactly
+/// when the kernel frees its tty_struct.
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+pub struct PtyEndEvent {
+    pub timestamp_ns: u64,
+    pub pty_index: i32,
+    pub _pad: u32,
+}
+
+#[cfg(all(target_os = "linux", feature = "user"))]
+unsafe impl aya::Pod for PtyEndEvent {}

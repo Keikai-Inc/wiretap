@@ -30,13 +30,16 @@ use aya_ebpf::{
     maps::{PerCpuArray, PerfEventByteArray},
     programs::ProbeContext,
 };
-use hop_tap_ebpf_common::{PtyWriteEvent, COMM_LEN, MAX_CHUNK};
+use hop_tap_ebpf_common::{PtyEndEvent, PtyWriteEvent, COMM_LEN, MAX_CHUNK};
 
 mod vmlinux;
 use vmlinux::{task_struct, tty_driver, tty_struct};
 
 #[map]
 pub static mut PTY_EVENTS: PerfEventByteArray = PerfEventByteArray::new(0);
+
+#[map]
+pub static mut PTY_END_EVENTS: PerfEventByteArray = PerfEventByteArray::new(0);
 
 // Per-CPU scratch buffer for assembling the event before perf-output.
 // Stack would also work for this struct size (~152 B) but going through
@@ -164,6 +167,40 @@ unsafe fn try_pty_write(ctx: &ProbeContext) -> Result<u32, u32> {
     };
     let evp = &raw mut PTY_EVENTS;
     unsafe { (*evp).output(ctx, bytes, 0) };
+    Ok(0)
+}
+
+/// Fires exactly once per side of a pty as the kernel destroys it.
+/// `tty_release_struct(struct tty_struct *tty, int idx)` — arg0 is
+/// the tty being released. We read its index via the existing
+/// CO-RE relocation and emit a small event. No need to read winsize
+/// or pid here: the session is over, we just need the key.
+#[kprobe]
+pub fn tty_release_handler(ctx: ProbeContext) -> u32 {
+    unsafe { try_tty_release(&ctx) }.unwrap_or(1)
+}
+
+unsafe fn try_tty_release(ctx: &ProbeContext) -> Result<u32, u32> {
+    let tty: *const tty_struct = ctx.arg(0).ok_or(1u32)?;
+    if tty.is_null() {
+        return Ok(0);
+    }
+    let pty_index: i32 =
+        unsafe { bpf_probe_read_kernel(&raw const (*tty).index) }.map_err(|_| 1u32)?;
+    let timestamp_ns = unsafe { bpf_ktime_get_ns() };
+    let event = PtyEndEvent {
+        timestamp_ns,
+        pty_index,
+        _pad: 0,
+    };
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            &raw const event as *const u8,
+            core::mem::size_of::<PtyEndEvent>(),
+        )
+    };
+    let p = &raw mut PTY_END_EVENTS;
+    unsafe { (*p).output(ctx, bytes, 0) };
     Ok(0)
 }
 

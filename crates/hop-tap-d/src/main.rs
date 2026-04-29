@@ -88,7 +88,9 @@ mod linux {
     };
     use aya_log::EbpfLogger;
     use bytes::BytesMut;
-    use hop_tap_ebpf_common::{PtyWriteEvent, COMM_LEN, PTY_TYPE_MASTER, PTY_TYPE_SLAVE};
+    use hop_tap_ebpf_common::{
+        PtyEndEvent, PtyWriteEvent, COMM_LEN, PTY_TYPE_MASTER, PTY_TYPE_SLAVE,
+    };
     use ipc_channel::ipc::{IpcOneShotServer, IpcSender};
     use std::{
         collections::{HashMap, VecDeque},
@@ -318,12 +320,19 @@ mod linux {
             .context("PTY_EVENTS map missing from bytecode")?
             .try_into()
             .context("PTY_EVENTS is not a PerfEventArray")?;
+        let mut perf_end: AsyncPerfEventArray<_> = bpf
+            .take_map("PTY_END_EVENTS")
+            .context("PTY_END_EVENTS map missing from bytecode")?
+            .try_into()
+            .context("PTY_END_EVENTS is not a PerfEventArray")?;
 
         let sessions: SessionTable = Arc::new(Mutex::new(HashMap::new()));
         let writer: WriterSlot = Arc::new(Mutex::new(None));
 
         let mut readers: JoinSet<()> = JoinSet::new();
-        for cpu_id in online_cpus().map_err(|(_, e)| e).context("online_cpus")? {
+        let cpus = online_cpus().map_err(|(_, e)| e).context("online_cpus")?;
+        for cpu_id in &cpus {
+            let cpu_id = *cpu_id;
             let mut buf = perf.open(cpu_id, Some(128)).context("perf open")?;
             let sessions = sessions.clone();
             let writer = writer.clone();
@@ -344,6 +353,32 @@ mod linux {
                     for raw in bufs.iter().take(events.read) {
                         let event = unsafe { &*(raw.as_ptr() as *const PtyWriteEvent) };
                         ingest_event(&sessions, &writer, cpu_id, event);
+                    }
+                }
+            });
+        }
+        for cpu_id in &cpus {
+            let cpu_id = *cpu_id;
+            let mut buf = perf_end.open(cpu_id, Some(8)).context("perf_end open")?;
+            let sessions = sessions.clone();
+            let writer = writer.clone();
+            readers.spawn(async move {
+                let mut bufs =
+                    vec![BytesMut::with_capacity(core::mem::size_of::<PtyEndEvent>()); 8];
+                loop {
+                    let events = match buf.read_events(&mut bufs).await {
+                        Ok(e) => e,
+                        Err(e) => {
+                            warn!(cpu = cpu_id, "perf_end read error: {e}");
+                            break;
+                        }
+                    };
+                    if events.lost > 0 {
+                        warn!(cpu = cpu_id, lost = events.lost, "session-end events dropped");
+                    }
+                    for raw in bufs.iter().take(events.read) {
+                        let event = unsafe { &*(raw.as_ptr() as *const PtyEndEvent) };
+                        ingest_end_event(&sessions, &writer, event);
                     }
                 }
             });
@@ -558,6 +593,46 @@ mod linux {
             payload: frame_bytes,
         });
         info!(stream_id, pty_index, "stream subscribed");
+    }
+
+    /// Handle a PtyEndEvent from the kernel. Removes the session
+    /// (idempotent — the event fires once per side of a pty pair, so
+    /// the second one for the same index naturally finds nothing to
+    /// remove) and proactively closes any active stream subscribers
+    /// with `StreamClosed { reason: "session ended" }`.
+    fn ingest_end_event(sessions: &SessionTable, writer: &WriterSlot, event: &PtyEndEvent) {
+        // Snapshot subscribers inside the sessions lock, drop the
+        // session, release the lock, then take the writer lock to
+        // send StreamClosed. Same lock-ordering discipline as
+        // ingest_event.
+        let subscribers: Vec<u64> = {
+            let mut table = sessions.lock().expect("session table mutex poisoned");
+            match table.remove(&event.pty_index) {
+                Some(state) => {
+                    info!(
+                        pty = event.pty_index,
+                        comm = %state.last_comm,
+                        out_bytes = state.output_bytes,
+                        in_bytes = state.input_bytes,
+                        "session ended"
+                    );
+                    state.subscribers
+                }
+                None => return,
+            }
+        };
+        if subscribers.is_empty() {
+            return;
+        }
+        let guard = writer.lock().expect("writer mutex poisoned");
+        if let Some(tx) = guard.as_ref() {
+            for stream_id in subscribers {
+                let _ = tx.send(ExtMessage::StreamClosed {
+                    stream_id,
+                    reason: Some("session ended".into()),
+                });
+            }
+        }
     }
 
     fn handle_stream_close(sessions: &SessionTable, stream_id: u64) {
@@ -805,6 +880,8 @@ mod linux {
     }
 
     fn attach_kprobes(bpf: &mut Ebpf) -> Result<()> {
+        // Content capture: every kernel-side pty_write produces one
+        // PtyWriteEvent with pid, dimensions, direction, bytes.
         let prog: &mut KProbe = bpf
             .program_mut("pty_write_handler")
             .context("pty_write_handler program missing from bytecode")?
@@ -812,6 +889,18 @@ mod linux {
         prog.load().context("loading pty_write_handler")?;
         prog.attach("pty_write", 0)
             .context("attaching pty_write_handler to kprobe:pty_write")?;
+
+        // Session-end signal: tty_release_struct fires once per
+        // side of a pty as the kernel tears it down. First firing
+        // for a given index is treated as "session gone" by the
+        // daemon (subsequent firings are no-ops).
+        let prog: &mut KProbe = bpf
+            .program_mut("tty_release_handler")
+            .context("tty_release_handler program missing from bytecode")?
+            .try_into()?;
+        prog.load().context("loading tty_release_handler")?;
+        prog.attach("tty_release_struct", 0)
+            .context("attaching tty_release_handler to kprobe:tty_release_struct")?;
         Ok(())
     }
 
