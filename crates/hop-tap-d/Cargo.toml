@@ -9,6 +9,13 @@ build = "build.rs"
 name = "hop-tap-d"
 path = "src/main.rs"
 
+[[bin]]
+# Test client used in lieu of a running hop daemon. Reads the
+# bootstrap rendezvous file, performs the Hello/HelloAck handshake,
+# and sends a single Tap subprotocol request, printing the response.
+name = "hop-tap-probe"
+path = "src/bin/probe.rs"
+
 [dependencies]
 hop-tap-ebpf-common = { workspace = true, features = ["user"] }
 
@@ -19,11 +26,21 @@ tokio.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+clap.workspace = true
 
 # Off-screen terminal emulation. Cross-platform — the daemon
 # crate compiles on macOS too. See the project memory and the
 # workspace Cargo.toml for the choice rationale.
 alacritty_terminal.workspace = true
+
+# Hop extension protocol — local mirror of hop-core's ExtMessage
+# and Bootstrap (we deliberately don't pull hop-core to avoid its
+# heavy transitive dep tree, including iroh / redb / ed25519-dalek).
+ipc-channel.workspace = true
+serde.workspace = true
+toml.workspace = true
+bincode.workspace = true
+libc.workspace = true
 
 # Linux-only: eBPF loader and per-CPU perf-array consumer.
 # Target-gated so the workspace still resolves on macOS / dev machines

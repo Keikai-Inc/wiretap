@@ -7,15 +7,37 @@
 //! session so it can produce a snapshot of the current screen
 //! when a peer subscribes (Phase 1.7+).
 //!
-//! Phase 1.6 wires the emulator: each session owns a `Term`
-//! (alacritty's full state machine — colors, cursor, alt-screen,
-//! scroll regions, the lot). The slave→master byte stream is
-//! driven through `vte::ansi::Processor::advance` so all CSI / OSC
-//! / ESC sequences land in the right cell-grid mutations.
+//! Phase 1.7 wires the daemon up as a Hop extension: with
+//! `--bootstrap <path>` it writes a TOML rendezvous file, accepts
+//! one hop daemon connection, performs the Hello/HelloAck handshake,
+//! and dispatches `ExtMessage::Request`s to a `TapRequest` handler.
+//! Without `--bootstrap` it runs standalone (the prior 1.5/1.6
+//! behaviour: log a session summary every 5s).
+
+use std::path::PathBuf;
 
 use anyhow::Result;
+use clap::Parser;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
+
+#[derive(Parser, Debug)]
+#[command(version, about = "hop-tap eBPF terminal capture daemon")]
+struct Args {
+    /// Run as a Hop extension daemon: write a bootstrap rendezvous
+    /// file at the given path and serve `ExtMessage` traffic on
+    /// the ipc-channel server it advertises.
+    ///
+    /// Without this flag, hop-tap-d runs standalone (logs per-session
+    /// summaries every 5 seconds; useful for development).
+    #[arg(long)]
+    bootstrap: Option<PathBuf>,
+
+    /// Protocol version advertised in the bootstrap file. Must match
+    /// the corresponding hop-side manifest's `version`.
+    #[arg(long = "protocol-version", default_value = "0.1.0")]
+    protocol_version: String,
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -23,15 +45,21 @@ async fn main() -> Result<()> {
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
 
-    info!(version = env!("CARGO_PKG_VERSION"), "hop-tap-d starting");
+    let args = Args::parse();
+    info!(
+        version = env!("CARGO_PKG_VERSION"),
+        bootstrap = ?args.bootstrap,
+        "hop-tap-d starting"
+    );
 
     #[cfg(target_os = "linux")]
     {
-        linux::run().await
+        linux::run(args).await
     }
 
     #[cfg(not(target_os = "linux"))]
     {
+        let _ = args;
         anyhow::bail!(
             "hop-tap-d only runs on Linux; this build is a workspace-resolution stub. \
              Cross-compile / run inside a Linux host or container."
@@ -41,19 +69,9 @@ async fn main() -> Result<()> {
 
 #[cfg(target_os = "linux")]
 mod linux {
-    use anyhow::{Context, Result};
-    use aya::{
-        include_bytes_aligned, maps::AsyncPerfEventArray, programs::KProbe, util::online_cpus,
-        Ebpf,
-    };
-    use aya_log::EbpfLogger;
-    use bytes::BytesMut;
-    use hop_tap_ebpf_common::{PtyWriteEvent, COMM_LEN, PTY_TYPE_MASTER, PTY_TYPE_SLAVE};
-    use std::{
-        collections::HashMap,
-        sync::{Arc, Mutex},
-        time::{Duration, Instant},
-    };
+    use super::Args;
+    use hop_tap_d::extension::{write_bootstrap_atomically, ExtMessage};
+    use hop_tap_d::protocol::{SessionInfo, TapRequest, TapResponse};
     use alacritty_terminal::{
         event::VoidListener,
         grid::Dimensions,
@@ -61,20 +79,32 @@ mod linux {
         term::{Config, Term},
         vte::ansi::Processor,
     };
+    use anyhow::{bail, Context, Result};
+    use aya::{
+        include_bytes_aligned, maps::AsyncPerfEventArray, programs::KProbe, util::online_cpus,
+        Ebpf,
+    };
+    use aya_log::EbpfLogger;
+    use bytes::BytesMut;
+    use hop_tap_ebpf_common::{PtyWriteEvent, COMM_LEN, PTY_TYPE_MASTER, PTY_TYPE_SLAVE};
+    use ipc_channel::ipc::{IpcOneShotServer, IpcSender};
+    use std::{
+        collections::HashMap,
+        path::PathBuf,
+        sync::{Arc, Mutex},
+        thread,
+        time::{Duration, Instant},
+    };
     use tokio::{signal, task::JoinSet, time::interval};
     use tracing::{debug, info, warn};
 
-    /// Default off-screen terminal dimensions. Real implementations
-    /// will track SIGWINCH / TIOCSWINSZ events to learn the actual
-    /// shell-side size; for Phase 1.6 we assume the conventional
-    /// 80x24 terminal.
     const SURFACE_COLS: usize = 80;
     const SURFACE_ROWS: usize = 24;
 
-    /// Trivial `Dimensions` impl for constructing a `Term` at fixed
-    /// rows × cols. We match `screen_lines` and `total_lines` so the
-    /// grid has no scrollback (we never read it), reducing per-session
-    /// memory footprint.
+    /// Trivial `Dimensions` impl used to construct a `Term` at a
+    /// fixed rows × cols and zero scrollback (so per-session memory
+    /// is bounded — alacritty's default 10k-line history would
+    /// inflate it ~400×).
     #[derive(Copy, Clone)]
     struct FixedDims {
         cols: usize,
@@ -96,20 +126,6 @@ mod linux {
         "../../hop-tap-ebpf/target/bpfel-unknown-none/release/hop-tap-ebpf"
     );
 
-    /// Per-session running state, accumulated from `pty_write`
-    /// events as they stream in.
-    ///
-    /// Keyed by `pty_index` (`tty_struct.index`) — the unit number
-    /// the kernel assigns to a pty pair. Both master and slave ends
-    /// of a pair share the same index, so input keystrokes (master
-    /// → slave) and program output (slave → master) accumulate into
-    /// one row.
-    ///
-    /// `last_*` fields are best-effort; a long-running session may
-    /// see many different writers (`bash` → `vim` → `bash` again as
-    /// the user runs commands). Phase 1.6 will replace per-event
-    /// `comm` snapshots with a real session-lifecycle model that
-    /// records the controlling process at session creation.
     struct SessionState {
         pty_index: i32,
         created_at: Instant,
@@ -120,10 +136,6 @@ mod linux {
         input_bytes: u64,
         output_events: u64,
         input_events: u64,
-        // Off-screen terminal state. The processor parses the
-        // slave→master byte stream and applies actions to the
-        // alacritty `Term`'s cell grid — full CSI / OSC / ESC
-        // semantics, the same state machine that drives Alacritty.
         processor: Processor,
         term: Term<VoidListener>,
         dims: FixedDims,
@@ -135,10 +147,6 @@ mod linux {
                 cols: SURFACE_COLS,
                 lines: SURFACE_ROWS,
             };
-            // Disable scrollback — at 80×24, even a default 10k-line
-            // history would multiply per-session memory by ~400×.
-            // Phase 1.7+ can reintroduce a small scrollback if/when
-            // we expose it to peers.
             let mut config = Config::default();
             config.scrolling_history = 0;
             let term = Term::new(config, &dims, VoidListener);
@@ -158,29 +166,16 @@ mod linux {
             }
         }
 
-        /// Feed a slave→master chunk through the processor. Every
-        /// byte (printable, control, escape) lands in the right
-        /// cell-grid mutation via alacritty's `Handler` impl on
-        /// `Term`. Kernel-side bytes are *truncated* at MAX_CHUNK so
-        /// long writes are partially captured — the emulator stays
-        /// well-defined within the captured prefix.
         fn ingest_output(&mut self, bytes: &[u8]) {
             self.processor.advance(&mut self.term, bytes);
         }
 
-        /// Return the most recent non-empty line on screen, trimmed
-        /// of trailing whitespace. `None` if the screen is blank.
         fn snapshot_last_line(&self) -> Option<String> {
             let grid = self.term.grid();
             let cols = self.dims.cols;
             let lines = self.dims.lines as i32;
-            // Walk bottom-up so we find the most recent line first.
             for line_idx in (0..lines).rev() {
-                let mut row = String::with_capacity(cols);
-                for col in 0..cols {
-                    let p = Point::new(Line(line_idx), Column(col));
-                    row.push(grid[p].c);
-                }
+                let row = self.read_row(grid, line_idx, cols);
                 let trimmed = row.trim_end();
                 if !trimmed.is_empty() {
                     return Some(trimmed.to_string());
@@ -188,11 +183,51 @@ mod linux {
             }
             None
         }
+
+        /// Render every visible row top-to-bottom into a `Vec<String>`.
+        /// Trailing whitespace is preserved so the caller can decide
+        /// whether to display fixed-width or trim.
+        fn snapshot_full_screen(&self) -> Vec<String> {
+            let grid = self.term.grid();
+            let cols = self.dims.cols;
+            let lines = self.dims.lines as i32;
+            (0..lines)
+                .map(|line_idx| self.read_row(grid, line_idx, cols))
+                .collect()
+        }
+
+        fn read_row(
+            &self,
+            grid: &alacritty_terminal::grid::Grid<alacritty_terminal::term::cell::Cell>,
+            line_idx: i32,
+            cols: usize,
+        ) -> String {
+            let mut row = String::with_capacity(cols);
+            for col in 0..cols {
+                let p = Point::new(Line(line_idx), Column(col));
+                row.push(grid[p].c);
+            }
+            row
+        }
+
+        fn to_session_info(&self) -> SessionInfo {
+            SessionInfo {
+                pty_index: self.pty_index,
+                last_pid: self.last_pid,
+                last_comm: self.last_comm.clone(),
+                output_bytes: self.output_bytes,
+                input_bytes: self.input_bytes,
+                output_events: self.output_events,
+                input_events: self.input_events,
+                age_ms: self.created_at.elapsed().as_millis() as u64,
+                idle_ms: self.last_activity.elapsed().as_millis() as u64,
+            }
+        }
     }
 
     type SessionTable = Arc<Mutex<HashMap<i32, SessionState>>>;
 
-    pub async fn run() -> Result<()> {
+    pub async fn run(args: Args) -> Result<()> {
         bump_memlock();
 
         let mut bpf = Ebpf::load(EBPF_OBJECT).context("loading hop-tap-ebpf bytecode")?;
@@ -236,9 +271,6 @@ mod linux {
             });
         }
 
-        // Periodic session summary. Stand-in for the peer-facing
-        // `list` command — keeps the operator informed of what's
-        // captured without spamming the per-event log.
         let summary_table = sessions.clone();
         let summary = tokio::spawn(async move {
             let mut tick = interval(Duration::from_secs(5));
@@ -249,17 +281,158 @@ mod linux {
             }
         });
 
+        // Extension thread: synchronous (ipc-channel is blocking),
+        // owns the hop ↔ extension RPC. Joins through the SessionTable
+        // Arc so request handlers can serve the latest state without
+        // touching the tokio runtime directly.
+        let ext_thread = if let Some(bootstrap) = args.bootstrap.clone() {
+            let sessions = sessions.clone();
+            let version = args.protocol_version.clone();
+            Some(thread::spawn(move || {
+                if let Err(e) = run_extension(bootstrap, version, sessions) {
+                    warn!(error = %e, "extension thread exited with error");
+                }
+            }))
+        } else {
+            None
+        };
+
         info!("hop-tap-d running; Ctrl-C to exit");
         signal::ctrl_c().await.context("ctrl-c")?;
         info!("shutting down");
         summary.abort();
         readers.abort_all();
         log_summary(&sessions);
+
+        if let Some(path) = args.bootstrap.as_ref() {
+            // Best-effort cleanup. The thread itself owns the
+            // IpcOneShotServer and will tear it down when it exits;
+            // we just remove the on-disk bootstrap so a stale entry
+            // doesn't trick a future hop into trying to connect.
+            let _ = std::fs::remove_file(path);
+        }
+        // We don't join the extension thread because ipc-channel's
+        // recv has no cancellation primitive — exiting the process
+        // closes the underlying socket and the thread will unwind.
+        let _ = ext_thread;
+
         Ok(())
     }
 
-    /// Update the session table for a single decoded event and emit
-    /// a debug-level event log line.
+    fn run_extension(
+        bootstrap_path: PathBuf,
+        protocol_version: String,
+        sessions: SessionTable,
+    ) -> Result<()> {
+        let (server, server_name) = IpcOneShotServer::<ExtMessage>::new()
+            .context("creating ipc-channel server")?;
+        debug!(%server_name, "ipc-channel server bound");
+
+        write_bootstrap_atomically(&bootstrap_path, &server_name, &protocol_version)?;
+        info!(path = %bootstrap_path.display(), "bootstrap written; awaiting hop Hello");
+
+        let (rx_from_hop, hello) = server.accept().context("waiting for hop Hello")?;
+        let reverse_name = match hello {
+            ExtMessage::Hello {
+                hop_version,
+                reverse_name,
+            } => {
+                info!(%hop_version, "hop connected");
+                reverse_name
+            }
+            other => bail!("expected Hello from hop, got {:?}", other),
+        };
+
+        let tx_to_hop: IpcSender<ExtMessage> =
+            IpcSender::connect(reverse_name).context("connecting to hop reverse server")?;
+        tx_to_hop
+            .send(ExtMessage::HelloAck {
+                ext_version: protocol_version,
+            })
+            .context("sending HelloAck")?;
+        info!("extension handshake complete");
+
+        loop {
+            let msg = match rx_from_hop.recv() {
+                Ok(m) => m,
+                Err(e) => {
+                    warn!(error = ?e, "ipc-channel recv failed; shutting down");
+                    break;
+                }
+            };
+            match msg {
+                ExtMessage::Request {
+                    request_id,
+                    payload,
+                    ..
+                } => {
+                    let response_payload = serve_request(&sessions, &payload);
+                    if tx_to_hop
+                        .send(ExtMessage::Response {
+                            request_id,
+                            ok: true,
+                            payload: response_payload,
+                        })
+                        .is_err()
+                    {
+                        warn!("send to hop failed; shutting down");
+                        break;
+                    }
+                }
+                ExtMessage::StreamOpen { request_id, .. } => {
+                    let _ = tx_to_hop.send(ExtMessage::StreamClosed {
+                        stream_id: request_id,
+                        reason: Some("hop-tap streaming not yet implemented".into()),
+                    });
+                }
+                other => debug!(?other, "ignored non-Request message"),
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Decode a `TapRequest` from `payload`, run the handler, encode
+    /// the `TapResponse`. Decode failures are surfaced as an error
+    /// response so the peer always sees something well-formed.
+    fn serve_request(sessions: &SessionTable, payload: &[u8]) -> Vec<u8> {
+        let cfg = bincode::config::standard();
+        let req: TapRequest = match bincode::serde::decode_from_slice(payload, cfg) {
+            Ok((req, _)) => req,
+            Err(e) => {
+                let err = TapResponse::Error(format!("decode TapRequest: {e}"));
+                return bincode::serde::encode_to_vec(&err, cfg).unwrap_or_default();
+            }
+        };
+        let resp = handle_tap_request(sessions, req);
+        bincode::serde::encode_to_vec(&resp, cfg).unwrap_or_default()
+    }
+
+    fn handle_tap_request(sessions: &SessionTable, req: TapRequest) -> TapResponse {
+        match req {
+            TapRequest::List => {
+                let table = sessions.lock().expect("session table mutex poisoned");
+                let mut infos: Vec<SessionInfo> = table.values().map(|s| s.to_session_info()).collect();
+                infos.sort_by_key(|i| i.pty_index);
+                TapResponse::SessionList(infos)
+            }
+            TapRequest::Snapshot { pty_index } => {
+                let table = sessions.lock().expect("session table mutex poisoned");
+                match table.get(&pty_index) {
+                    Some(s) => TapResponse::Snapshot {
+                        pty_index,
+                        rows: s.dims.lines as u16,
+                        cols: s.dims.cols as u16,
+                        contents: s.snapshot_full_screen(),
+                    },
+                    None => TapResponse::Error(format!(
+                        "no active session with pty_index={pty_index}"
+                    )),
+                }
+            }
+        }
+    }
+
     fn ingest_event(sessions: &SessionTable, cpu_id: u32, event: &PtyWriteEvent) {
         let now = Instant::now();
         let comm = comm_to_string(&event.comm);
@@ -276,11 +449,6 @@ mod linux {
             PTY_TYPE_SLAVE => {
                 state.output_bytes += event.total_len as u64;
                 state.output_events += 1;
-                // Drive the off-screen surface from output bytes only.
-                // Master→slave traffic is what the user typed, which
-                // doesn't contribute to on-screen state directly (the
-                // shell will echo it back through slave→master if
-                // appropriate).
                 state.ingest_output(&event.data[..captured]);
             }
             PTY_TYPE_MASTER => {
@@ -291,9 +459,6 @@ mod linux {
         }
         drop(table);
 
-        // Detailed event log at debug level so the default-info
-        // summary stays readable. Run with `RUST_LOG=hop_tap_d=debug`
-        // to see every byte chunk.
         let dir = direction_label(event.subtype);
         let captured = event.captured_len.min(event.data.len() as u16) as usize;
         let preview = printable_preview(&event.data[..captured], 48);
@@ -319,8 +484,6 @@ mod linux {
         }
     }
 
-    /// Snapshot the session table and print one log line per
-    /// session, plus a header.
     fn log_summary(sessions: &SessionTable) {
         let table = sessions.lock().expect("session table mutex poisoned");
         if table.is_empty() {
@@ -328,7 +491,6 @@ mod linux {
             return;
         }
         info!("session summary: {} active session(s)", table.len());
-        // Stable order so successive logs are easy to diff.
         let mut rows: Vec<&SessionState> = table.values().collect();
         rows.sort_by_key(|s| s.pty_index);
         for s in rows {
@@ -350,8 +512,6 @@ mod linux {
         }
     }
 
-    /// Convert the kernel's NUL-padded 16-byte comm buffer into a
-    /// human-readable String. Trims at the first NUL.
     fn comm_to_string(comm: &[u8; COMM_LEN]) -> String {
         let end = comm.iter().position(|&b| b == 0).unwrap_or(COMM_LEN);
         String::from_utf8_lossy(&comm[..end]).into_owned()
@@ -378,10 +538,6 @@ mod linux {
         Ok(())
     }
 
-    /// Render captured bytes as a single-line preview suitable for a
-    /// log field. Printable ASCII stays as-is; control codes (CR/LF,
-    /// escape sequences, etc.) become `\xNN`. Truncates to `max_chars`
-    /// rendered chars and appends an ellipsis on truncation.
     fn printable_preview(bytes: &[u8], max_chars: usize) -> String {
         let mut out = String::with_capacity(bytes.len());
         for &b in bytes {

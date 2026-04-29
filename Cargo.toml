@@ -41,6 +41,11 @@ toml = "0.8"
 bincode = { version = "2", features = ["serde"] }
 libc = "0.2"
 
+# Phase 1.7 (Hop extension wiring). ipc-channel for the
+# hop↔extension RPC, clap for the daemon CLI.
+ipc-channel = "0.20"
+clap = { version = "4", features = ["derive"] }
+
 # Linux-only eBPF stack. These appear in workspace.dependencies so that
 # every crate that uses them references the same version, but they are
 # pulled into hop-tap-d/Cargo.toml only via a `cfg(target_os = "linux")`

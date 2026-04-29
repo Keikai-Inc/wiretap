@@ -1,0 +1,40 @@
+# Example hop extension manifest for hop-tap.
+#
+# Install this file at one of:
+#   ~/.config/hop/extensions/tap-terminal.toml   (per-user)
+#   /etc/hop/extensions/tap-terminal.toml        (system-wide;
+#                                                 not yet read at v0)
+#
+# Run hop-tap-d with the same bootstrap path (and as root, since
+# loading eBPF programs requires CAP_BPF / CAP_PERFMON / CAP_SYS_ADMIN):
+#
+#   sudo hop-tap-d --bootstrap /run/hop-tap/bootstrap
+#
+# Restart `hop host`. From a peer:
+#
+#   hop <host> ext list
+#   hop <host> ext call tap.terminal --hex <bincode-encoded TapRequest>
+#
+# Or, during development, use the bundled probe in lieu of a real
+# hop daemon:
+#
+#   hop-tap-probe --bootstrap /run/hop-tap/bootstrap list
+#   hop-tap-probe --bootstrap /run/hop-tap/bootstrap snapshot --pty 0
+
+ext_id         = "tap.terminal"
+description    = "Terminal session capture via eBPF (CO-RE on vlad's rustc)"
+bootstrap_path = "/run/hop-tap/bootstrap"
+
+# Set this to the UID `hop-tap-d` runs as. Since hop-tap-d needs
+# CAP_BPF/CAP_PERFMON it almost always runs as root (uid 0). The hop
+# daemon refuses to trust the bootstrap file unless its owner matches.
+expected_uid   = 0
+
+# Must match --protocol-version on hop-tap-d (default "0.1.0").
+version        = "0.1.0"
+
+# Auditing intent: terminal contents are sensitive, so this extension
+# is restricted to admin peers by default. Operators with different
+# trust models can relax to "peer" (any authenticated peer) — see the
+# planning doc §6 for the broader scope-check model.
+required_role  = "creator"

@@ -14,14 +14,19 @@ prototype's architecture (the behavior we're targeting).
 
 ## Status
 
-Phase 1.6 — off-screen emulation. Each session now owns an
-`alacritty_terminal::Term` (80×24, no scrollback) driven through
-alacritty's vte `Processor::advance` from the slave→master byte
-stream. Full CSI / OSC / ESC / SGR semantics — same state machine
-that powers Alacritty proper, so `vim`/`htop` redraws stay
-coherent. The periodic summary appends each session's most recent
-non-empty screen line; two concurrent script sessions resolve to
-the distinct strings they last echoed.
+Phase 1.7 — Hop extension wiring. With `--bootstrap <path>` the
+daemon writes a TOML rendezvous file, accepts one hop daemon
+connection, performs the Hello/HelloAck handshake, and dispatches
+`ExtMessage::Request`s to a `TapRequest` handler. Subprotocol
+covers `List` (active sessions) and `Snapshot { pty_index }`
+(full 80×24 grid). A bundled `hop-tap-probe` simulates the hop
+side; verified end-to-end on Linux 6.8 — `probe list` returns the
+live session table, `probe snapshot --pty 0` reproduces the exact
+echoed lines on a fresh terminal grid.
+
+ExtMessage wire types are a local mirror of hop-core's; the dep
+on hop-core itself is deliberately avoided to keep hop-tap's
+compile fast.
 
 Phase 1.7 wires the Hop extension protocol: ipc-channel
 bootstrap, ExtMessage handlers (`list`, `connect`), the
@@ -77,4 +82,4 @@ Not yet — see Phase 1.2.
 | 1.4 | Real `pty_write` capture (flat buffer; `iov_iter` walker shelved) | done |
 | 1.5 | Session tracking by `tty_struct.index` | done |
 | 1.6 | `alacritty_terminal::Term` per session; snapshot generation | done |
-| 1.7 | Hop extension wiring (manifest, bootstrap, ExtMessage) | ← here |
+| 1.7 | Hop extension wiring (manifest, bootstrap, ExtMessage) | done |
