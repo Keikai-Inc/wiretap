@@ -5,7 +5,11 @@
 # supports #[relocatable] for CO-RE relocations). Including it here would
 # force those constraints onto the userspace crates too. The hop-tap-d
 # build.rs invokes a separate `cargo build` for the eBPF crate.
-members = ["crates/hop-tap-d", "crates/hop-tap-ebpf-common"]
+members = [
+    "crates/hop-tap-d",
+    "crates/hop-tap-ebpf-common",
+    "crates/hop-tap-protocol",
+]
 exclude = ["crates/hop-tap-ebpf"]
 resolver = "2"
 
@@ -17,6 +21,7 @@ license = "LicenseRef-Proprietary"
 [workspace.dependencies]
 # Workspace-internal
 hop-tap-ebpf-common = { path = "crates/hop-tap-ebpf-common" }
+hop-tap-protocol = { path = "crates/hop-tap-protocol" }
 
 # Async runtime
 tokio = { version = "1", features = ["macros", "net", "rt", "rt-multi-thread", "sync", "time", "signal"] }

@@ -1,0 +1,15 @@
+[package]
+name = "hop-tap-protocol"
+description = "Wire types for the hop-tap extension subprotocol (TapRequest / TapResponse / streaming frames)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# `serde` is the only dependency. We deliberately keep this crate
+# tiny so cross-repo consumers (hop-cli) don't pull a transitive
+# weight from depending on the tap protocol.
+serde.workspace = true

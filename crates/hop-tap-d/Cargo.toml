@@ -18,6 +18,7 @@ path = "src/bin/probe.rs"
 
 [dependencies]
 hop-tap-ebpf-common = { workspace = true, features = ["user"] }
+hop-tap-protocol.workspace = true
 
 # Async runtime
 tokio.workspace = true

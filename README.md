@@ -41,9 +41,36 @@ hop-tap/
 │   ├── hop-tap-ebpf-common/         # shared no_std types (event structs)
 │   ├── hop-tap-ebpf/                # kernel-side; built with vlad's stage1 rustc
 │   │   └── .cargo/config.toml       # bpfel-unknown-none + bpf-linker
-│   └── hop-tap-d/                   # userspace daemon (stable Rust)
+│   ├── hop-tap-protocol/            # wire types (TapRequest/Response,
+│   │                                #   stream frames). Tiny crate;
+│   │                                #   hop-cli depends on it via path.
+│   └── hop-tap-d/                   # userspace daemon (stable Rust);
+│                                    #   bundles `hop-tap-probe` test client
 └── manifests/
-    └── hop-tap.toml.example         # example Hop extension manifest
+    └── tap-terminal.toml.example    # example Hop extension manifest
+```
+
+## Production deployment
+
+Once `hop-tap-d` is running on a host with the manifest installed
+under `/etc/hop/extensions/tap-terminal.toml` (or the user-local
+equivalent) and the hop daemon has been restarted, the extension
+shows up in the cli:
+
+```bash
+hop <host> ext list                       # tap.terminal listed as available
+hop <host> tap list                       # active sessions, with opener vs writer
+hop <host> tap snapshot 0                 # 24x80 grid for pty=0
+```
+
+`hop <host> tap watch <pty>` is wired but currently bails — it
+needs hop-core's extension-streaming dispatcher
+(`ExtMessage::StreamOpen` / `StreamFrame` / `StreamClosed`) which
+is marked "not yet implemented" upstream. For live byte streams
+today, run the bundled probe directly on the target host:
+
+```bash
+hop-tap-probe --bootstrap /run/hop-tap/bootstrap watch --pty 0
 ```
 
 The `hop-tap-ebpf` crate is intentionally **outside** the workspace
@@ -90,3 +117,4 @@ Not yet — see Phase 1.2.
 | 1.8e | Sticky session-opener identity (separate from per-event writer) | done |
 | 1.8f | Probe REPL: multiple commands over one daemon connection | done |
 | 1.8g | SGR-aware grid replay (vim/htop fidelity on mid-session subscribe) | done |
+| 1.8h | `hop &lt;host&gt; tap` verb in hop-cli + extracted `hop-tap-protocol` crate | done |
