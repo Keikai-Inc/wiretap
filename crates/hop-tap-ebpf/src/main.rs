@@ -1,22 +1,30 @@
 //! hop-tap eBPF kernel-side programs.
 //!
-//! Phase 1.2: a single `tty_write` kprobe that emits one `PingEvent`
-//! per invocation through a `PerfEventByteArray`. No CO-RE field
-//! access yet — that's Phase 1.3, when the user/system pid we record
-//! here will become the real pid read off `task_struct` via
-//! `#[relocatable]`. For now we use `bpf_get_current_pid_tgid` as a
-//! sanity payload so we can prove the kernel→userspace round trip.
+//! Phase 1.3: pid is now read off `task_struct` via vlad's
+//! `#[relocatable]` instead of the `bpf_get_current_pid_tgid()`
+//! helper. The field offset is patched by aya at load time against
+//! the running kernel's BTF, so the same `.bpf.o` works on any
+//! kernel that has `task_struct.pid` (validated cross-kernel
+//! earlier: 5.4 → offset 1336, 6.8 → 1592).
+//!
+//! Phase 1.4 will replace the `tty_write` heartbeat with a real
+//! `pty_write` content hook (see `docs/hop-tap-plan.md` §3.2 for
+//! why pty_write over tty_write).
 
 #![no_std]
 #![no_main]
+#![feature(relocatable_types)]
 
 use aya_ebpf::{
-    helpers::{bpf_get_current_pid_tgid, bpf_ktime_get_ns},
+    helpers::{bpf_get_current_task, bpf_ktime_get_ns, bpf_probe_read_kernel},
     macros::{kprobe, map},
     maps::{PerCpuArray, PerfEventByteArray},
     programs::ProbeContext,
 };
 use hop_tap_ebpf_common::PingEvent;
+
+mod vmlinux;
+use vmlinux::task_struct;
 
 #[map]
 pub static mut PING_EVENTS: PerfEventByteArray = PerfEventByteArray::new(0);
@@ -35,7 +43,16 @@ pub fn tty_write_handler(ctx: ProbeContext) -> u32 {
 unsafe fn try_emit_ping(ctx: &ProbeContext) -> Result<u32, u32> {
     let seq = unsafe { next_seq() }.ok_or(1u32)?;
     let timestamp_ns = unsafe { bpf_ktime_get_ns() };
-    let pid = (bpf_get_current_pid_tgid() & 0xFFFF_FFFF) as u32;
+    // Read pid off `task_struct` via the CO-RE relocation. The
+    // `&raw const (*task).pid` expression compiles down to:
+    //   1. a magic global (`@"llvm.task_struct:0:0$0:0"`) that
+    //      bpf-linker turns into a CORE_FIELD_BYTE_OFFSET reloc;
+    //   2. a getelementptr that bakes the relocated offset into the
+    //      kernel-pointer; passed to `bpf_probe_read_kernel` for
+    //      the actual safe load.
+    let task = unsafe { bpf_get_current_task() } as *const task_struct;
+    let pid_field: *const i32 = unsafe { &raw const (*task).pid };
+    let pid = unsafe { bpf_probe_read_kernel::<i32>(pid_field) }.map_err(|_| 1u32)? as u32;
 
     let event = PingEvent {
         seq,
