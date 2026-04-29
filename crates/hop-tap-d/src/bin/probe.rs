@@ -56,6 +56,12 @@ enum Cmd {
         #[arg(long = "pty")]
         pty_index: i32,
     },
+    /// Interactive REPL: do the handshake once, then accept
+    /// multiple commands on stdin (`list`, `snapshot N`, `watch N`,
+    /// `exit`) over a single daemon connection. Standalone
+    /// subcommands like `list` always reconnect to a fresh
+    /// daemon — the REPL avoids that.
+    Repl,
 }
 
 fn main() -> Result<()> {
@@ -105,42 +111,30 @@ fn main() -> Result<()> {
         other => bail!("expected HelloAck, got {:?}", other),
     }
 
-    let cfg = bincode::config::standard();
+    let mut next_id = 1u64;
     match args.cmd {
-        Cmd::List => one_shot(tx_to_ext, rx_from_ext, TapRequest::List),
-        Cmd::Snapshot { pty_index } => {
-            one_shot(tx_to_ext, rx_from_ext, TapRequest::Snapshot { pty_index })
-        }
-        Cmd::Watch { pty_index } => {
-            // Send the StreamOpen, render frames as they arrive.
-            let payload = bincode::serde::encode_to_vec(
-                &TapStreamRequest::Subscribe { pty_index },
-                cfg,
-            )
-            .context("encoding TapStreamRequest")?;
-            let request_id = 1;
-            tx_to_ext
-                .send(ExtMessage::StreamOpen {
-                    request_id,
-                    peer_id: "probe".into(),
-                    peer_username: Some("probe".into()),
-                    peer_role: "creator".into(),
-                    payload,
-                })
-                .context("sending StreamOpen")?;
-            watch_loop(rx_from_ext, request_id)
-        }
+        Cmd::List => one_shot(&tx_to_ext, &rx_from_ext, &mut next_id, TapRequest::List),
+        Cmd::Snapshot { pty_index } => one_shot(
+            &tx_to_ext,
+            &rx_from_ext,
+            &mut next_id,
+            TapRequest::Snapshot { pty_index },
+        ),
+        Cmd::Watch { pty_index } => watch(&tx_to_ext, &rx_from_ext, &mut next_id, pty_index),
+        Cmd::Repl => repl(&tx_to_ext, &rx_from_ext, &mut next_id),
     }
 }
 
 fn one_shot(
-    tx_to_ext: IpcSender<ExtMessage>,
-    rx_from_ext: IpcReceiver<ExtMessage>,
+    tx_to_ext: &IpcSender<ExtMessage>,
+    rx_from_ext: &IpcReceiver<ExtMessage>,
+    next_id: &mut u64,
     req: TapRequest,
 ) -> Result<()> {
     let cfg = bincode::config::standard();
     let payload = bincode::serde::encode_to_vec(&req, cfg).context("encoding TapRequest")?;
-    let request_id = 1;
+    let request_id = *next_id;
+    *next_id += 1;
     tx_to_ext
         .send(ExtMessage::Request {
             request_id,
@@ -172,6 +166,97 @@ fn one_shot(
     }
 }
 
+fn watch(
+    tx_to_ext: &IpcSender<ExtMessage>,
+    rx_from_ext: &IpcReceiver<ExtMessage>,
+    next_id: &mut u64,
+    pty_index: i32,
+) -> Result<()> {
+    let cfg = bincode::config::standard();
+    let payload =
+        bincode::serde::encode_to_vec(&TapStreamRequest::Subscribe { pty_index }, cfg)
+            .context("encoding TapStreamRequest")?;
+    let request_id = *next_id;
+    *next_id += 1;
+    tx_to_ext
+        .send(ExtMessage::StreamOpen {
+            request_id,
+            peer_id: "probe".into(),
+            peer_username: Some("probe".into()),
+            peer_role: "creator".into(),
+            payload,
+        })
+        .context("sending StreamOpen")?;
+    watch_loop(rx_from_ext, request_id)
+}
+
+/// Interactive command loop. Reads lines from stdin, dispatches each
+/// to the existing handlers over the same daemon connection. Shows
+/// the prompt on stderr so it doesn't get tangled up with raw bytes
+/// flowing from `watch`.
+fn repl(
+    tx_to_ext: &IpcSender<ExtMessage>,
+    rx_from_ext: &IpcReceiver<ExtMessage>,
+    next_id: &mut u64,
+) -> Result<()> {
+    use std::io::{BufRead, Write as _};
+    eprintln!("hop-tap-probe REPL — commands: list | snapshot N | watch N | exit");
+    let stdin = std::io::stdin();
+    let mut stdin = stdin.lock();
+    let mut line = String::new();
+    loop {
+        eprint!("> ");
+        std::io::stderr().flush().ok();
+        line.clear();
+        let n = stdin.read_line(&mut line).context("read stdin")?;
+        if n == 0 {
+            // EOF
+            eprintln!();
+            return Ok(());
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let mut parts = trimmed.split_whitespace();
+        let Some(cmd) = parts.next() else { continue };
+        let arg = parts.next();
+        match cmd {
+            "list" => {
+                if let Err(e) = one_shot(tx_to_ext, rx_from_ext, next_id, TapRequest::List) {
+                    eprintln!("error: {e}");
+                }
+            }
+            "snapshot" => match arg.and_then(|s| s.parse::<i32>().ok()) {
+                Some(pty_index) => {
+                    if let Err(e) = one_shot(
+                        tx_to_ext,
+                        rx_from_ext,
+                        next_id,
+                        TapRequest::Snapshot { pty_index },
+                    ) {
+                        eprintln!("error: {e}");
+                    }
+                }
+                None => eprintln!("usage: snapshot <pty_index>"),
+            },
+            "watch" => match arg.and_then(|s| s.parse::<i32>().ok()) {
+                Some(pty_index) => {
+                    if let Err(e) = watch(tx_to_ext, rx_from_ext, next_id, pty_index) {
+                        eprintln!("error: {e}");
+                    }
+                }
+                None => eprintln!("usage: watch <pty_index>"),
+            },
+            "exit" | "quit" => return Ok(()),
+            "help" | "?" => {
+                eprintln!("commands: list | snapshot N | watch N | exit");
+            }
+            other => eprintln!("unknown command: {other}  (try `help`)"),
+        }
+    }
+}
+
 /// Live-watch loop. Awaits StreamOpened, then prints each StreamFrame
 /// payload to stdout as raw bytes. Terminates on StreamClosed or
 /// receiver disconnect.
@@ -180,7 +265,7 @@ fn one_shot(
 /// ipc-channel, the daemon notices and removes the subscriber on its
 /// next attempt. A polished UI would send `StreamClose` proactively;
 /// for the probe we stay minimal.
-fn watch_loop(rx_from_ext: IpcReceiver<ExtMessage>, request_id: u64) -> Result<()> {
+fn watch_loop(rx_from_ext: &IpcReceiver<ExtMessage>, request_id: u64) -> Result<()> {
     let cfg = bincode::config::standard();
     let mut stdout = std::io::stdout().lock();
     let mut stream_id: Option<u64> = None;
