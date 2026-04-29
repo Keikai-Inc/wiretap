@@ -1,0 +1,5 @@
+/target
+/crates/hop-tap-ebpf/target
+Cargo.lock
+*.swp
+.DS_Store

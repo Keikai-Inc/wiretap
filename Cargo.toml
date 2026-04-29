@@ -1,0 +1,56 @@
+[workspace]
+# Note: hop-tap-ebpf is intentionally NOT a workspace member.
+# It must be cross-compiled for bpfel-unknown-none with -Z build-std=core
+# on a nightly toolchain (specifically: vlad's stage1 rustc fork that
+# supports #[relocatable] for CO-RE relocations). Including it here would
+# force those constraints onto the userspace crates too. The hop-tap-d
+# build.rs invokes a separate `cargo build` for the eBPF crate.
+members = ["crates/hop-tap-d", "crates/hop-tap-ebpf-common"]
+exclude = ["crates/hop-tap-ebpf"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "LicenseRef-Proprietary"
+
+[workspace.dependencies]
+# Workspace-internal
+hop-tap-ebpf-common = { path = "crates/hop-tap-ebpf-common" }
+
+# Async runtime
+tokio = { version = "1", features = ["macros", "net", "rt", "rt-multi-thread", "sync", "time", "signal"] }
+
+# Error handling & logging
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Phase 1.6 (terminal emulator). Cross-platform.
+termwiz = "0.23"
+
+# Serialization (used as we add features).
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+bincode = { version = "2", features = ["serde"] }
+libc = "0.2"
+
+# Phase 1.2+ Linux-only deps. Pulled in via target-gated dependencies in
+# hop-tap-d/Cargo.toml so the workspace builds on macOS too:
+#   aya         = "0.13"   (eBPF loader)
+#   aya-log     = "0.2"
+#
+# Phase 1.7 (Hop integration). Held back because hop-core's transitive
+# ed25519-dalek pre-release pulls in a buggy combination under workspace
+# feature unification:
+#   hop-core    = { path = "../hop/crates/hop-core" }
+#   ipc-channel = "0.20"
+
+# Testing
+tempfile = "3"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

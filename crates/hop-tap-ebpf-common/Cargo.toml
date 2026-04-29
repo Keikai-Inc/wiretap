@@ -1,0 +1,15 @@
+[package]
+name = "hop-tap-ebpf-common"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+# `user` is reserved for Phase 1.2 when we'll add an aya::Pod impl gated
+# on the userspace target. For Phase 1.1 (skeleton) it's a no-op so the
+# crate compiles on macOS too without pulling in aya (which is Linux-only).
+user = []
+
+[dependencies]
+# (no deps yet — Phase 1.1 stub)
