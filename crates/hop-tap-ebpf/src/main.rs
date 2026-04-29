@@ -86,6 +86,15 @@ unsafe fn try_pty_write(ctx: &ProbeContext) -> Result<u32, u32> {
     let pty_index: i32 =
         unsafe { bpf_probe_read_kernel(&raw const (*tty).index) }.map_err(|_| 1u32)?;
 
+    // tty->winsize — current dimensions per the latest TIOCSWINSZ.
+    // Two more CO-RE relocations: the type spec is "tty_struct:0:N:0"
+    // and "tty_struct:0:N:1" for ws_row and ws_col respectively (where
+    // N is the field index of `winsize` in tty_struct, patched by aya).
+    let rows: u16 =
+        unsafe { bpf_probe_read_kernel(&raw const (*tty).winsize.ws_row) }.map_err(|_| 1u32)?;
+    let cols: u16 =
+        unsafe { bpf_probe_read_kernel(&raw const (*tty).winsize.ws_col) }.map_err(|_| 1u32)?;
+
     // pid via the relocation we proved in 1.3.
     let task = unsafe { bpf_get_current_task() } as *const task_struct;
     let pid =
@@ -109,6 +118,8 @@ unsafe fn try_pty_write(ctx: &ProbeContext) -> Result<u32, u32> {
         (*slot).pid = pid;
         (*slot).pty_index = pty_index;
         (*slot).subtype = subtype_i as u16;
+        (*slot).rows = rows;
+        (*slot).cols = cols;
         (*slot).comm = comm;
         (*slot).total_len = if count > u32::MAX as usize {
             u32::MAX

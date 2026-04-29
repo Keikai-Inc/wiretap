@@ -46,6 +46,18 @@ pub struct tty_struct {
     // as a session key, since events from either end of a pty roll
     // up into the same logical session.
     pub index: i32,
+    // Current screen dimensions, updated by the kernel from
+    // TIOCSWINSZ ioctls (the terminal emulator informs the kernel
+    // when its window resizes; the shell then receives SIGWINCH and
+    // re-reads via TIOCGWINSZ to update its idea of the size).
+    pub winsize: winsize,
+}
+
+#[relocatable]
+#[repr(C)]
+pub struct winsize {
+    pub ws_row: u16,
+    pub ws_col: u16,
 }
 
 #[relocatable]

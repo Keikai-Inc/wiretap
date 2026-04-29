@@ -98,13 +98,16 @@ mod linux {
     use tokio::{signal, task::JoinSet, time::interval};
     use tracing::{debug, info, warn};
 
-    const SURFACE_COLS: usize = 80;
-    const SURFACE_ROWS: usize = 24;
+    /// Fallback dimensions used only until the first `pty_write`
+    /// surfaces real ones. Most sessions will resize within
+    /// milliseconds of opening (the shell's stty / SIGWINCH path).
+    const FALLBACK_COLS: usize = 80;
+    const FALLBACK_ROWS: usize = 24;
 
-    /// Trivial `Dimensions` impl used to construct a `Term` at a
-    /// fixed rows × cols and zero scrollback (so per-session memory
-    /// is bounded — alacritty's default 10k-line history would
-    /// inflate it ~400×).
+    /// Mutable `Dimensions` impl for `Term` construction and resize.
+    /// `total_lines == screen_lines` so the grid carries no
+    /// scrollback (per-session memory stays bounded; alacritty's
+    /// default 10k-line history would inflate it ~400×).
     #[derive(Copy, Clone)]
     struct FixedDims {
         cols: usize,
@@ -144,8 +147,8 @@ mod linux {
     impl SessionState {
         fn new(pty_index: i32, now: Instant, pid: u32, comm: String) -> Self {
             let dims = FixedDims {
-                cols: SURFACE_COLS,
-                lines: SURFACE_ROWS,
+                cols: FALLBACK_COLS,
+                lines: FALLBACK_ROWS,
             };
             let mut config = Config::default();
             config.scrolling_history = 0;
@@ -164,6 +167,27 @@ mod linux {
                 term,
                 dims,
             }
+        }
+
+        /// Resize the off-screen terminal if the kernel-reported
+        /// dimensions have changed since our last update. Skips
+        /// (0, 0) which the kernel surfaces for ptys that haven't
+        /// been sized yet (e.g. immediately after open, before the
+        /// terminal emulator issues TIOCSWINSZ).
+        fn maybe_resize(&mut self, rows: u16, cols: u16) {
+            if rows == 0 || cols == 0 {
+                return;
+            }
+            let new_cols = cols as usize;
+            let new_lines = rows as usize;
+            if new_cols == self.dims.cols && new_lines == self.dims.lines {
+                return;
+            }
+            self.dims = FixedDims {
+                cols: new_cols,
+                lines: new_lines,
+            };
+            self.term.resize(self.dims);
         }
 
         fn ingest_output(&mut self, bytes: &[u8]) {
@@ -444,6 +468,11 @@ mod linux {
         state.last_activity = now;
         state.last_pid = event.pid;
         state.last_comm = comm;
+        // Apply the kernel-reported window size *before* feeding bytes,
+        // so escape sequences that depend on dimensions (e.g. cursor
+        // positioning to "row N where N is the last row") interpret
+        // against the right grid.
+        state.maybe_resize(event.rows, event.cols);
         let captured = event.captured_len.min(event.data.len() as u16) as usize;
         match event.subtype {
             PTY_TYPE_SLAVE => {
