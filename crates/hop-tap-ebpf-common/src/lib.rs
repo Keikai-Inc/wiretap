@@ -62,6 +62,12 @@ pub struct PtyWriteEvent {
     pub total_len: u32,
     pub rows: u16,
     pub cols: u16,
+    /// uid of whoever made this write (BPF helper view — the
+    /// kernel's "real" uid, not fsuid). On a sudo'd command the
+    /// session would see uid=0 mid-stream; that's accurate, since
+    /// the bytes really were emitted by a uid=0 process.
+    pub uid: u32,
+    pub gid: u32,
     pub comm: [u8; COMM_LEN],
     pub data: [u8; MAX_CHUNK],
 }

@@ -86,3 +86,4 @@ Not yet — see Phase 1.2.
 | 1.8a | PTY dimension tracking via `tty_struct.winsize` | done |
 | 1.8b | Live byte streaming (`StreamOpen` / replay + Output / Resize) | done |
 | 1.8c | Session-end detection via `tty_release_struct` kprobe | done |
+| 1.8d | Owner attribution (uid/gid → username via `getpwuid_r`) | done |

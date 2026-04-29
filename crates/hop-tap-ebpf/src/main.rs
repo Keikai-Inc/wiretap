@@ -23,8 +23,8 @@
 
 use aya_ebpf::{
     helpers::{
-        bpf_get_current_comm, bpf_get_current_task, bpf_ktime_get_ns, bpf_probe_read_kernel,
-        bpf_probe_read_kernel_buf,
+        bpf_get_current_comm, bpf_get_current_task, bpf_get_current_uid_gid, bpf_ktime_get_ns,
+        bpf_probe_read_kernel, bpf_probe_read_kernel_buf,
     },
     macros::{kprobe, map},
     maps::{PerCpuArray, PerfEventByteArray},
@@ -108,6 +108,13 @@ unsafe fn try_pty_write(ctx: &ProbeContext) -> Result<u32, u32> {
     // buffer NUL-terminated.
     let comm = bpf_get_current_comm().unwrap_or([0u8; COMM_LEN]);
 
+    // uid + gid of the writing task. bpf_get_current_uid_gid packs
+    // them as (gid << 32) | uid; lower 32 bits = uid, upper 32 = gid.
+    // Stable BPF helper, no relocation needed.
+    let uid_gid = bpf_get_current_uid_gid();
+    let uid = (uid_gid & 0xFFFF_FFFF) as u32;
+    let gid = (uid_gid >> 32) as u32;
+
     let timestamp_ns = unsafe { bpf_ktime_get_ns() };
 
     // Acquire the per-CPU scratch slot, zero its data tail, and fill
@@ -123,6 +130,8 @@ unsafe fn try_pty_write(ctx: &ProbeContext) -> Result<u32, u32> {
         (*slot).subtype = subtype_i as u16;
         (*slot).rows = rows;
         (*slot).cols = cols;
+        (*slot).uid = uid;
+        (*slot).gid = gid;
         (*slot).comm = comm;
         (*slot).total_len = if count > u32::MAX as usize {
             u32::MAX

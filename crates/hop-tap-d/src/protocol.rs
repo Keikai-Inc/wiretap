@@ -59,6 +59,19 @@ pub struct SessionInfo {
     pub pty_index: i32,
     pub last_pid: u32,
     pub last_comm: String,
+    /// Last observed real uid of a writer in this session. The
+    /// "owner" semantics here are deliberately weak: a sudo'd
+    /// command shifts last_uid to 0 mid-session, which is
+    /// accurate (the bytes really came from a uid=0 process) but
+    /// not the same as "who logged in." A future phase can record
+    /// the controlling process's uid separately at session
+    /// creation time.
+    pub last_uid: u32,
+    pub last_gid: u32,
+    /// Best-effort username resolution via `getpwuid_r`. None if
+    /// the uid doesn't exist in the daemon's view of /etc/passwd
+    /// (common under PID/user namespacing).
+    pub last_username: Option<String>,
     pub output_bytes: u64,
     pub input_bytes: u64,
     pub output_events: u64,

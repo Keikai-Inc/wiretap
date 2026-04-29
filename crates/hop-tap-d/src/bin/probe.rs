@@ -251,10 +251,15 @@ fn print_response(resp: &TapResponse) {
             }
             println!("{} active session(s):", sessions.len());
             for s in sessions {
+                let user = match &s.last_username {
+                    Some(name) => format!("{}({})", name, s.last_uid),
+                    None => format!("uid={}", s.last_uid),
+                };
                 println!(
-                    "  pty={:>3}  comm={:<12}  pid={:>7}  out={}b/{}ev  in={}b/{}ev  \
-                     age={}ms idle={}ms",
+                    "  pty={:>3}  user={:<14}  comm={:<10}  pid={:>7}  \
+                     out={}b/{}ev  in={}b/{}ev  age={}ms idle={}ms",
                     s.pty_index,
+                    user,
                     s.last_comm,
                     s.last_pid,
                     s.output_bytes,

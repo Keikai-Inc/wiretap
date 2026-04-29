@@ -149,6 +149,8 @@ mod linux {
         last_activity: Instant,
         last_pid: u32,
         last_comm: String,
+        last_uid: u32,
+        last_gid: u32,
         output_bytes: u64,
         input_bytes: u64,
         output_events: u64,
@@ -168,7 +170,14 @@ mod linux {
     }
 
     impl SessionState {
-        fn new(pty_index: i32, now: Instant, pid: u32, comm: String) -> Self {
+        fn new(
+            pty_index: i32,
+            now: Instant,
+            pid: u32,
+            comm: String,
+            uid: u32,
+            gid: u32,
+        ) -> Self {
             let dims = FixedDims {
                 cols: FALLBACK_COLS,
                 lines: FALLBACK_ROWS,
@@ -182,6 +191,8 @@ mod linux {
                 last_activity: now,
                 last_pid: pid,
                 last_comm: comm,
+                last_uid: uid,
+                last_gid: gid,
                 output_bytes: 0,
                 input_bytes: 0,
                 output_events: 0,
@@ -282,6 +293,9 @@ mod linux {
                 pty_index: self.pty_index,
                 last_pid: self.last_pid,
                 last_comm: self.last_comm.clone(),
+                last_uid: self.last_uid,
+                last_gid: self.last_gid,
+                last_username: lookup_username(self.last_uid),
                 output_bytes: self.output_bytes,
                 input_bytes: self.input_bytes,
                 output_events: self.output_events,
@@ -290,6 +304,36 @@ mod linux {
                 idle_ms: self.last_activity.elapsed().as_millis() as u64,
             }
         }
+    }
+
+    /// Best-effort uid → username resolution via `getpwuid_r`.
+    /// Returns None if the uid isn't in the daemon's view of
+    /// /etc/passwd. Container PID/user namespacing routinely makes
+    /// this happen — the session uid may not exist on the host
+    /// where hop-tap-d runs. We surface that as `None` rather than
+    /// fabricating a name; callers display "uid=NNN" instead.
+    fn lookup_username(uid: u32) -> Option<String> {
+        // Buffer size: passwd entries are typically <256 B; sysconf
+        // _SC_GETPW_R_SIZE_MAX is the kernel's recommended ceiling.
+        // 4 KiB is a safe upper bound that avoids the EINVAL/ERANGE
+        // dance for resizing.
+        let mut buf = vec![0u8; 4096];
+        let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+        let mut result: *mut libc::passwd = std::ptr::null_mut();
+        let rc = unsafe {
+            libc::getpwuid_r(
+                uid as libc::uid_t,
+                &mut pwd,
+                buf.as_mut_ptr() as *mut _,
+                buf.len(),
+                &mut result,
+            )
+        };
+        if rc != 0 || result.is_null() {
+            return None;
+        }
+        let name = unsafe { std::ffi::CStr::from_ptr(pwd.pw_name) };
+        Some(name.to_string_lossy().into_owned())
     }
 
     type SessionTable = Arc<Mutex<HashMap<i32, SessionState>>>;
@@ -755,11 +799,20 @@ mod linux {
         let fanout: Option<FanOut> = {
             let mut table = sessions.lock().expect("session table mutex poisoned");
             let state = table.entry(event.pty_index).or_insert_with(|| {
-                SessionState::new(event.pty_index, now, event.pid, comm.clone())
+                SessionState::new(
+                    event.pty_index,
+                    now,
+                    event.pid,
+                    comm.clone(),
+                    event.uid,
+                    event.gid,
+                )
             });
             state.last_activity = now;
             state.last_pid = event.pid;
             state.last_comm = comm.clone();
+            state.last_uid = event.uid;
+            state.last_gid = event.gid;
             // Apply the kernel-reported window size *before* feeding
             // bytes, so escape sequences that depend on dimensions
             // (cursor positioning, scroll regions) interpret against
@@ -849,9 +902,13 @@ mod linux {
             let idle_ms = s.last_activity.elapsed().as_millis();
             let age_ms = s.created_at.elapsed().as_millis();
             let snapshot = s.snapshot_last_line().unwrap_or_else(|| "(blank)".into());
+            let user = lookup_username(s.last_uid)
+                .map(|n| format!("{}({})", n, s.last_uid))
+                .unwrap_or_else(|| format!("uid={}", s.last_uid));
             info!(
                 pty = s.pty_index,
                 comm = %s.last_comm,
+                user = %user,
                 last_pid = s.last_pid,
                 out_bytes = s.output_bytes,
                 in_bytes = s.input_bytes,
