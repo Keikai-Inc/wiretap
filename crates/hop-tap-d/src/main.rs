@@ -8,9 +8,10 @@
 //! to reproduce the current screen on a fresh terminal) when a peer
 //! subscribes.
 //!
-//! Phase 1.2 wires in: load the eBPF object, attach a `tty_write`
-//! kprobe, drain `PingEvent`s from per-CPU perf arrays. Real CO-RE
-//! field access lands in 1.3, real output capture in 1.4.
+//! Phase 1.4 wires in: load the eBPF object, attach a `pty_write`
+//! kprobe, drain `PtyWriteEvent`s from per-CPU perf arrays, and log
+//! a printable preview of each captured chunk tagged with direction
+//! (master vs slave) and pid.
 
 use anyhow::Result;
 use tracing::info;
@@ -50,7 +51,7 @@ mod linux {
     };
     use aya_log::EbpfLogger;
     use bytes::BytesMut;
-    use hop_tap_ebpf_common::PingEvent;
+    use hop_tap_ebpf_common::{PtyWriteEvent, PTY_TYPE_MASTER, PTY_TYPE_SLAVE};
     use tokio::{signal, task::JoinSet};
     use tracing::{info, warn};
 
@@ -73,16 +74,19 @@ mod linux {
         attach_kprobes(&mut bpf)?;
 
         let mut perf: AsyncPerfEventArray<_> = bpf
-            .take_map("PING_EVENTS")
-            .context("PING_EVENTS map missing from bytecode")?
+            .take_map("PTY_EVENTS")
+            .context("PTY_EVENTS map missing from bytecode")?
             .try_into()
-            .context("PING_EVENTS is not a PerfEventArray")?;
+            .context("PTY_EVENTS is not a PerfEventArray")?;
 
         let mut readers: JoinSet<()> = JoinSet::new();
         for cpu_id in online_cpus().map_err(|(_, e)| e).context("online_cpus")? {
-            let mut buf = perf.open(cpu_id, Some(128)).context("perf open")?;
+            let mut buf = perf
+                .open(cpu_id, Some(128))
+                .context("perf open")?;
             readers.spawn(async move {
-                let mut bufs = vec![BytesMut::with_capacity(core::mem::size_of::<PingEvent>()); 16];
+                let mut bufs =
+                    vec![BytesMut::with_capacity(core::mem::size_of::<PtyWriteEvent>()); 16];
                 loop {
                     let events = match buf.read_events(&mut bufs).await {
                         Ok(e) => e,
@@ -95,13 +99,29 @@ mod linux {
                         warn!(cpu = cpu_id, lost = events.lost, "perf events dropped");
                     }
                     for raw in bufs.iter().take(events.read) {
-                        let event = unsafe { &*(raw.as_ptr() as *const PingEvent) };
+                        let event = unsafe { &*(raw.as_ptr() as *const PtyWriteEvent) };
+                        let dir = match event.subtype {
+                            PTY_TYPE_MASTER => "master→slave (input)",
+                            PTY_TYPE_SLAVE => "slave→master (output)",
+                            other => {
+                                // Non-PTY tty hooked us — shouldn't happen
+                                // when attached to pty_write but logged for
+                                // diagnosis if it does.
+                                warn!(cpu = cpu_id, subtype = other, "unexpected tty subtype");
+                                "unknown"
+                            }
+                        };
+                        let captured = event.captured_len.min(event.data.len() as u16) as usize;
+                        let preview = printable_preview(&event.data[..captured], 48);
+                        let truncated = event.captured_len as u32 != event.total_len;
                         info!(
-                            cpu = cpu_id,
-                            seq = event.seq,
                             pid = event.pid,
                             ts_ns = event.timestamp_ns,
-                            "tty_write"
+                            dir,
+                            captured = event.captured_len,
+                            total = event.total_len,
+                            truncated,
+                            "{preview}"
                         );
                     }
                 }
@@ -131,12 +151,35 @@ mod linux {
 
     fn attach_kprobes(bpf: &mut Ebpf) -> Result<()> {
         let prog: &mut KProbe = bpf
-            .program_mut("tty_write_handler")
-            .context("tty_write_handler program missing from bytecode")?
+            .program_mut("pty_write_handler")
+            .context("pty_write_handler program missing from bytecode")?
             .try_into()?;
-        prog.load().context("loading tty_write_handler")?;
-        prog.attach("tty_write", 0)
-            .context("attaching tty_write_handler to kprobe:tty_write")?;
+        prog.load().context("loading pty_write_handler")?;
+        prog.attach("pty_write", 0)
+            .context("attaching pty_write_handler to kprobe:pty_write")?;
         Ok(())
+    }
+
+    /// Render captured bytes as a single-line preview suitable for a
+    /// log field. Printable ASCII stays as-is; control codes (CR/LF,
+    /// escape sequences, etc.) become `\xNN`. Truncates to `max_chars`
+    /// rendered chars and appends an ellipsis on truncation.
+    fn printable_preview(bytes: &[u8], max_chars: usize) -> String {
+        let mut out = String::with_capacity(bytes.len());
+        for &b in bytes {
+            if out.len() >= max_chars {
+                out.push('…');
+                break;
+            }
+            match b {
+                0x20..=0x7e => out.push(b as char),
+                b'\n' => out.push_str("\\n"),
+                b'\r' => out.push_str("\\r"),
+                b'\t' => out.push_str("\\t"),
+                0x1b => out.push_str("\\e"),
+                _ => out.push_str(&format!("\\x{:02x}", b)),
+            }
+        }
+        out
     }
 }

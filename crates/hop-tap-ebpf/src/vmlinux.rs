@@ -21,9 +21,11 @@
 //!   pid offset 1336, 6.8 → 1592 (256 bytes of drift, transparently
 //!   patched).
 //!
-//! Phase 1.3 starts with the minimum: `task_struct.pid`. Phase 1.4
-//! adds `tty_struct` (passed to `pty_write` as arg0), `tty_driver`,
-//! and `file`/`inode` for session identification.
+//! Phase 1.3 started with the minimum: `task_struct.pid`. Phase 1.4
+//! adds `tty_struct` (passed to `pty_write` as arg0) and `tty_driver`
+//! (so we can disambiguate master vs slave PTY ends via
+//! `subtype`). `file`/`inode` for session identification will land
+//! in Phase 1.5.
 
 #![allow(non_camel_case_types)]
 
@@ -31,4 +33,21 @@
 #[repr(C)]
 pub struct task_struct {
     pub pid: i32,
+}
+
+#[relocatable]
+#[repr(C)]
+pub struct tty_struct {
+    // Pointer into kernel memory; we never deref it directly, only
+    // chase a single field on the other side via another relocation.
+    pub driver: *const tty_driver,
+}
+
+#[relocatable]
+#[repr(C)]
+pub struct tty_driver {
+    // `short` in the kernel; sized as i16 here. CO-RE patches the
+    // offset at load time, so the order/spacing of fields above does
+    // not need to match the upstream header.
+    pub subtype: i16,
 }

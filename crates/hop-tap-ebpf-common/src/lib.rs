@@ -12,27 +12,40 @@
 
 #![no_std]
 
-// First event type — a heartbeat the kprobe emits on every tty_write.
-// It exists so we can prove the perf-array round trip works before we
-// start populating real fields off `task_struct` / `tty_struct` in
-// Phase 1.4.
+// Maximum bytes captured per `pty_write` invocation. Power of two so
+// the eBPF side can use a mask-and-bound trick to satisfy the verifier
+// when slicing the destination buffer for `bpf_probe_read_kernel_buf`.
+// Larger writes are truncated at this length and `PtyWriteEvent::total_len`
+// records the original `count` so userspace can flag truncation.
+pub const MAX_CHUNK: usize = 128;
+
+// PTY subtype constants from `include/uapi/linux/tty.h`. Matched
+// against `tty_struct.driver.subtype` to tag direction:
+//   - master = the side held by the terminal emulator (sshd, tmux);
+//     a `pty_write` with subtype=master means "user keystrokes
+//     forwarded into the slave's input queue" (input).
+//   - slave = the side held by the shell; subtype=slave means
+//     "shell wrote output that will appear on screen" (output).
+pub const PTY_TYPE_MASTER: u16 = 0x0001;
+pub const PTY_TYPE_SLAVE: u16 = 0x0002;
+
+// One captured `pty_write` invocation. The kernel populates `data[..captured_len]`;
+// callers must not touch bytes past `captured_len`.
 //
-// `#[repr(C)]` + `Copy` is the contract for anything that crosses the
-// kernel→userspace FFI boundary via `PerfEventByteArray`: the kernel
-// writes raw bytes, userspace re-interprets the same memory layout.
+// `#[repr(C)]` + `Copy` is the FFI contract for anything that crosses the
+// kernel→userspace boundary via `PerfEventByteArray`: the kernel writes
+// raw bytes, userspace re-interprets the same memory layout.
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
-pub struct PingEvent {
-    pub seq: u64,
+pub struct PtyWriteEvent {
     pub timestamp_ns: u64,
     pub pid: u32,
+    pub subtype: u16,
+    pub captured_len: u16,
+    pub total_len: u32,
     pub _pad: u32,
+    pub data: [u8; MAX_CHUNK],
 }
 
-// Mark `PingEvent` as a "plain old data" type for aya so that
-// `AsyncPerfEventArray::read_events` can hand us a `&PingEvent` cast
-// straight off the perf ring. Gated on Linux + the `user` feature so
-// the kernel-side build (bpfel-unknown-none, no aya dep) and macOS dev
-// builds (no aya dep) both stay green.
 #[cfg(all(target_os = "linux", feature = "user"))]
-unsafe impl aya::Pod for PingEvent {}
+unsafe impl aya::Pod for PtyWriteEvent {}

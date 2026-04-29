@@ -14,15 +14,19 @@ prototype's architecture (the behavior we're targeting).
 
 ## Status
 
-Phase 1.2 — `tty_write` kprobe + perf-array round trip verified
-end-to-end on Linux 6.8 (under colima). The userspace daemon loads
-the embedded `.bpf.o`, attaches the kprobe, and decodes one
-`PingEvent` per kernel-side `tty_write` invocation across per-CPU
-perf arrays.
+Phase 1.4 — real `pty_write` capture verified end-to-end on Linux
+6.8 (under colima). The eBPF program reads pid via a CO-RE
+relocation off `task_struct`, chases `tty_struct → driver →
+subtype` through two more relocations to tag direction, and copies
+up to 128 bytes of the flat write buffer per event. Userspace
+prints the printable preview alongside pid, direction, and
+captured/total length — `echo HELLO_FROM_PHASE_1_4` showed up as
+the slave→master string `HELLO_FROM_PHASE_1_4`, an `\x04` Ctrl-D
+showed up as master→slave, etc.
 
-Phase 1.4 will switch the content hook from `tty_write` to
-`pty_write` (flat buffer in both pty directions; sidesteps the
-`iov_iter` walker entirely — see `docs/hop-tap-plan.md` §3.2).
+Phase 1.5 wires session lifecycle: identify each pty pair by its
+PTS inode, track open/close, build the `SessionState` table the
+daemon uses to fan events out to subscribers.
 
 ## Layout
 
@@ -70,8 +74,8 @@ Not yet — see Phase 1.2.
 |---|---|---|
 | 1.1 | Workspace skeleton, three crates that build cleanly | done |
 | 1.2 | Minimal eBPF kprobe; userspace reads PingEvents | done |
-| 1.3 | `#[relocatable]` types replace all CO-RE shims | ← here |
-| 1.4 | Real `pty_write` capture (flat buffer; `iov_iter` walker shelved) | |
-| 1.5 | Session tracking by PTS inode | |
+| 1.3 | `#[relocatable]` types replace all CO-RE shims | done |
+| 1.4 | Real `pty_write` capture (flat buffer; `iov_iter` walker shelved) | done |
+| 1.5 | Session tracking by PTS inode | ← here |
 | 1.6 | `termwiz` Surface per session; snapshot generation | |
 | 1.7 | Hop extension wiring (manifest, bootstrap, ExtMessage) | |
