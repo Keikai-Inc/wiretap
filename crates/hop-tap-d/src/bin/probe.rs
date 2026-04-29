@@ -33,6 +33,19 @@ struct Args {
     #[arg(long)]
     bootstrap: PathBuf,
 
+    /// Identity to claim as the calling peer. The daemon's per-peer
+    /// scope check (matches opener_username for non-creator peers)
+    /// uses this. Default: "probe".
+    #[arg(long = "peer-username", default_value = "probe")]
+    peer_username: String,
+
+    /// Role to claim as the calling peer. "creator" bypasses the
+    /// scope check (admin tier); anything else is gated by
+    /// peer_username == opener_username. Default: "creator" so
+    /// the existing tests aren't filtered.
+    #[arg(long = "peer-role", default_value = "creator")]
+    peer_role: String,
+
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -111,23 +124,45 @@ fn main() -> Result<()> {
         other => bail!("expected HelloAck, got {:?}", other),
     }
 
+    let identity = PeerIdentity {
+        username: args.peer_username,
+        role: args.peer_role,
+    };
     let mut next_id = 1u64;
     match args.cmd {
-        Cmd::List => one_shot(&tx_to_ext, &rx_from_ext, &mut next_id, TapRequest::List),
+        Cmd::List => one_shot(
+            &tx_to_ext,
+            &rx_from_ext,
+            &identity,
+            &mut next_id,
+            TapRequest::List,
+        ),
         Cmd::Snapshot { pty_index } => one_shot(
             &tx_to_ext,
             &rx_from_ext,
+            &identity,
             &mut next_id,
             TapRequest::Snapshot { pty_index },
         ),
-        Cmd::Watch { pty_index } => watch(&tx_to_ext, &rx_from_ext, &mut next_id, pty_index),
-        Cmd::Repl => repl(&tx_to_ext, &rx_from_ext, &mut next_id),
+        Cmd::Watch { pty_index } => {
+            watch(&tx_to_ext, &rx_from_ext, &identity, &mut next_id, pty_index)
+        }
+        Cmd::Repl => repl(&tx_to_ext, &rx_from_ext, &identity, &mut next_id),
     }
+}
+
+/// Identity claimed by the probe on behalf of "the peer." Mirrors
+/// the fields the hop daemon would pass over the wire if this were
+/// a real ext call.
+struct PeerIdentity {
+    username: String,
+    role: String,
 }
 
 fn one_shot(
     tx_to_ext: &IpcSender<ExtMessage>,
     rx_from_ext: &IpcReceiver<ExtMessage>,
+    identity: &PeerIdentity,
     next_id: &mut u64,
     req: TapRequest,
 ) -> Result<()> {
@@ -138,9 +173,9 @@ fn one_shot(
     tx_to_ext
         .send(ExtMessage::Request {
             request_id,
-            peer_id: "probe".into(),
-            peer_username: Some("probe".into()),
-            peer_role: "creator".into(),
+            peer_id: format!("probe:{}", identity.username),
+            peer_username: Some(identity.username.clone()),
+            peer_role: identity.role.clone(),
             payload,
         })
         .context("sending Request")?;
@@ -169,6 +204,7 @@ fn one_shot(
 fn watch(
     tx_to_ext: &IpcSender<ExtMessage>,
     rx_from_ext: &IpcReceiver<ExtMessage>,
+    identity: &PeerIdentity,
     next_id: &mut u64,
     pty_index: i32,
 ) -> Result<()> {
@@ -181,9 +217,9 @@ fn watch(
     tx_to_ext
         .send(ExtMessage::StreamOpen {
             request_id,
-            peer_id: "probe".into(),
-            peer_username: Some("probe".into()),
-            peer_role: "creator".into(),
+            peer_id: format!("probe:{}", identity.username),
+            peer_username: Some(identity.username.clone()),
+            peer_role: identity.role.clone(),
             payload,
         })
         .context("sending StreamOpen")?;
@@ -197,6 +233,7 @@ fn watch(
 fn repl(
     tx_to_ext: &IpcSender<ExtMessage>,
     rx_from_ext: &IpcReceiver<ExtMessage>,
+    identity: &PeerIdentity,
     next_id: &mut u64,
 ) -> Result<()> {
     use std::io::{BufRead, Write as _};
@@ -223,7 +260,9 @@ fn repl(
         let arg = parts.next();
         match cmd {
             "list" => {
-                if let Err(e) = one_shot(tx_to_ext, rx_from_ext, next_id, TapRequest::List) {
+                if let Err(e) =
+                    one_shot(tx_to_ext, rx_from_ext, identity, next_id, TapRequest::List)
+                {
                     eprintln!("error: {e}");
                 }
             }
@@ -232,6 +271,7 @@ fn repl(
                     if let Err(e) = one_shot(
                         tx_to_ext,
                         rx_from_ext,
+                        identity,
                         next_id,
                         TapRequest::Snapshot { pty_index },
                     ) {
@@ -242,7 +282,8 @@ fn repl(
             },
             "watch" => match arg.and_then(|s| s.parse::<i32>().ok()) {
                 Some(pty_index) => {
-                    if let Err(e) = watch(tx_to_ext, rx_from_ext, next_id, pty_index) {
+                    if let Err(e) = watch(tx_to_ext, rx_from_ext, identity, next_id, pty_index)
+                    {
                         eprintln!("error: {e}");
                     }
                 }

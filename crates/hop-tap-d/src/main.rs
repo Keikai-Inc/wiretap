@@ -477,6 +477,49 @@ mod linux {
 
     type SessionTable = Arc<Mutex<HashMap<i32, SessionState>>>;
 
+    /// Identity of the peer making this request, as reported by the
+    /// hop daemon in `ExtMessage::Request` / `ExtMessage::StreamOpen`.
+    /// We trust these fields — hop authenticated the QUIC connection
+    /// before forwarding the call, so the peer_id / peer_username /
+    /// peer_role are vouched for by the hop daemon's auth layer.
+    #[derive(Debug, Clone)]
+    struct PeerContext {
+        /// Opaque peer identifier (NodeId). Carried for future audit
+        /// logging; not currently used for authorization decisions
+        /// (which key off `peer_username` and `peer_role`).
+        #[allow(dead_code)]
+        peer_id: String,
+        peer_username: Option<String>,
+        peer_role: String,
+    }
+
+    impl PeerContext {
+        /// Authorization gate. Returns true if `peer` is allowed to
+        /// see / interact with `state`.
+        ///
+        /// Policy:
+        /// - `peer_role == "creator"` is the admin tier and sees
+        ///   every session.
+        /// - Any other role can only see sessions whose
+        ///   `opener_username` matches the peer's username. If
+        ///   either side is unknown (None), deny — explicit identity
+        ///   is required for non-admin access.
+        ///
+        /// Username comparison is case-sensitive byte equality. We
+        /// don't try to resolve container/host UID namespacing
+        /// mismatches here; that's a richer policy concern for
+        /// later phases.
+        fn scope_allows(&self, state: &SessionState) -> bool {
+            if self.peer_role == "creator" {
+                return true;
+            }
+            match (&self.peer_username, lookup_username(state.opener_uid)) {
+                (Some(peer), Some(opener)) => peer == &opener,
+                _ => false,
+            }
+        }
+    }
+
     /// Daemon-shared handle for sending `ExtMessage` to the connected
     /// hop daemon. Populated once the handshake completes; checked by
     /// both the request-handler thread (to send Responses) and the
@@ -666,10 +709,17 @@ mod linux {
             match msg {
                 ExtMessage::Request {
                     request_id,
+                    peer_id,
+                    peer_username,
+                    peer_role,
                     payload,
-                    ..
                 } => {
-                    let response_payload = serve_request(&sessions, &payload);
+                    let peer = PeerContext {
+                        peer_id,
+                        peer_username,
+                        peer_role,
+                    };
+                    let response_payload = serve_request(&sessions, &peer, &payload);
                     if tx_to_hop
                         .send(ExtMessage::Response {
                             request_id,
@@ -684,13 +734,21 @@ mod linux {
                 }
                 ExtMessage::StreamOpen {
                     request_id,
+                    peer_id,
+                    peer_username,
+                    peer_role,
                     payload,
-                    ..
                 } => {
                     let stream_id = next_stream_id.fetch_add(1, Ordering::Relaxed);
+                    let peer = PeerContext {
+                        peer_id,
+                        peer_username,
+                        peer_role,
+                    };
                     handle_stream_open(
                         &sessions,
                         &tx_to_hop,
+                        &peer,
                         request_id,
                         stream_id,
                         &payload,
@@ -717,6 +775,7 @@ mod linux {
     fn handle_stream_open(
         sessions: &SessionTable,
         tx_to_hop: &IpcSender<ExtMessage>,
+        peer: &PeerContext,
         request_id: u64,
         stream_id: u64,
         payload: &[u8],
@@ -744,6 +803,17 @@ mod linux {
                 });
                 return;
             };
+            // Authorization gate. Same wording as the snapshot
+            // denial so peers can't enumerate other users' ptys
+            // by probing.
+            if !peer.scope_allows(state) {
+                drop(table);
+                let _ = tx_to_hop.send(ExtMessage::StreamClosed {
+                    stream_id,
+                    reason: Some(format!("no session with pty_index={pty_index}")),
+                });
+                return;
+            }
             state.subscribers.push(stream_id);
             TapStreamFrame::Initial {
                 rows: state.dims.lines as u16,
@@ -881,7 +951,7 @@ mod linux {
     /// Decode a `TapRequest` from `payload`, run the handler, encode
     /// the `TapResponse`. Decode failures are surfaced as an error
     /// response so the peer always sees something well-formed.
-    fn serve_request(sessions: &SessionTable, payload: &[u8]) -> Vec<u8> {
+    fn serve_request(sessions: &SessionTable, peer: &PeerContext, payload: &[u8]) -> Vec<u8> {
         let cfg = bincode::config::standard();
         let req: TapRequest = match bincode::serde::decode_from_slice(payload, cfg) {
             Ok((req, _)) => req,
@@ -890,27 +960,47 @@ mod linux {
                 return bincode::serde::encode_to_vec(&err, cfg).unwrap_or_default();
             }
         };
-        let resp = handle_tap_request(sessions, req);
+        let resp = handle_tap_request(sessions, peer, req);
         bincode::serde::encode_to_vec(&resp, cfg).unwrap_or_default()
     }
 
-    fn handle_tap_request(sessions: &SessionTable, req: TapRequest) -> TapResponse {
+    fn handle_tap_request(
+        sessions: &SessionTable,
+        peer: &PeerContext,
+        req: TapRequest,
+    ) -> TapResponse {
         match req {
             TapRequest::List => {
+                // Filter to only the sessions this peer is allowed
+                // to see. `creator` role peers see everything; other
+                // roles see only their own sessions.
                 let table = sessions.lock().expect("session table mutex poisoned");
-                let mut infos: Vec<SessionInfo> = table.values().map(|s| s.to_session_info()).collect();
+                let mut infos: Vec<SessionInfo> = table
+                    .values()
+                    .filter(|s| peer.scope_allows(s))
+                    .map(|s| s.to_session_info())
+                    .collect();
                 infos.sort_by_key(|i| i.pty_index);
                 TapResponse::SessionList(infos)
             }
             TapRequest::Snapshot { pty_index } => {
                 let table = sessions.lock().expect("session table mutex poisoned");
                 match table.get(&pty_index) {
-                    Some(s) => TapResponse::Snapshot {
+                    Some(s) if peer.scope_allows(s) => TapResponse::Snapshot {
                         pty_index,
                         rows: s.dims.lines as u16,
                         cols: s.dims.cols as u16,
                         contents: s.snapshot_full_screen(),
                     },
+                    Some(_) => {
+                        // Session exists but this peer can't see it.
+                        // Surface as the same error as "doesn't exist"
+                        // so the response can't be used to enumerate
+                        // other users' ptys by probing.
+                        TapResponse::Error(format!(
+                            "no active session with pty_index={pty_index}"
+                        ))
+                    }
                     None => TapResponse::Error(format!(
                         "no active session with pty_index={pty_index}"
                     )),
