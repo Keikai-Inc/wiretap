@@ -3,6 +3,7 @@ name = "hop-tap-d"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+build = "build.rs"
 
 [[bin]]
 name = "hop-tap-d"
@@ -19,7 +20,14 @@ anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
-# Phase 1.2+ deps will be added here as we hit them.
+# Linux-only: eBPF loader and per-CPU perf-array consumer.
+# Target-gated so the workspace still resolves on macOS / dev machines
+# where aya's syscall surface (perf_event_open, BPF()) is unavailable.
+[target.'cfg(target_os = "linux")'.dependencies]
+aya = { workspace = true }
+aya-log = { workspace = true }
+bytes = { workspace = true }
+libc = { workspace = true }
 
 [dev-dependencies]
 tempfile.workspace = true

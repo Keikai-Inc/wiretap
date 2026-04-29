@@ -12,17 +12,27 @@
 
 #![no_std]
 
-// First event type — placeholder, expanded in subsequent sub-phases.
+// First event type — a heartbeat the kprobe emits on every tty_write.
+// It exists so we can prove the perf-array round trip works before we
+// start populating real fields off `task_struct` / `tty_struct` in
+// Phase 1.4.
 //
-// Tagged with `#[repr(C)]` and Copy so the kernel can write raw bytes
-// into a PerfEventByteArray and userspace can re-cast them.
+// `#[repr(C)]` + `Copy` is the contract for anything that crosses the
+// kernel→userspace FFI boundary via `PerfEventByteArray`: the kernel
+// writes raw bytes, userspace re-interprets the same memory layout.
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
 pub struct PingEvent {
     pub seq: u64,
     pub timestamp_ns: u64,
+    pub pid: u32,
+    pub _pad: u32,
 }
 
-// Phase 1.2 will add an `unsafe impl aya::Pod for PingEvent {}` here
-// gated on `feature = "user"` and `cfg(target_os = "linux")` so the
-// crate stays buildable on non-Linux dev machines.
+// Mark `PingEvent` as a "plain old data" type for aya so that
+// `AsyncPerfEventArray::read_events` can hand us a `&PingEvent` cast
+// straight off the perf ring. Gated on Linux + the `user` feature so
+// the kernel-side build (bpfel-unknown-none, no aya dep) and macOS dev
+// builds (no aya dep) both stay green.
+#[cfg(all(target_os = "linux", feature = "user"))]
+unsafe impl aya::Pod for PingEvent {}
