@@ -57,15 +57,22 @@ pub enum TapResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionInfo {
     pub pty_index: i32,
+    /// Sticky identity captured the first time the daemon saw this
+    /// pty. For sessions that started after the daemon, this is the
+    /// controlling shell — i.e., who logged in. Diverges from
+    /// `last_*` whenever a privileged sub-command (sudo, su) writes
+    /// into the same pty. **Use `opener_*` for authorization
+    /// decisions** (e.g. "is this peer allowed to view this
+    /// session"); use `last_*` for diagnostic display.
+    pub opener_pid: u32,
+    pub opener_comm: String,
+    pub opener_uid: u32,
+    pub opener_gid: u32,
+    pub opener_username: Option<String>,
+    /// Most recent writer — what's actually emitting bytes right
+    /// now. Updates on every event.
     pub last_pid: u32,
     pub last_comm: String,
-    /// Last observed real uid of a writer in this session. The
-    /// "owner" semantics here are deliberately weak: a sudo'd
-    /// command shifts last_uid to 0 mid-session, which is
-    /// accurate (the bytes really came from a uid=0 process) but
-    /// not the same as "who logged in." A future phase can record
-    /// the controlling process's uid separately at session
-    /// creation time.
     pub last_uid: u32,
     pub last_gid: u32,
     /// Best-effort username resolution via `getpwuid_r`. None if

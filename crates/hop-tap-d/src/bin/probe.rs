@@ -242,6 +242,13 @@ fn watch_loop(rx_from_ext: IpcReceiver<ExtMessage>, request_id: u64) -> Result<(
     }
 }
 
+fn format_user(username: &Option<String>, uid: u32) -> String {
+    match username {
+        Some(name) => format!("{}({})", name, uid),
+        None => format!("uid={}", uid),
+    }
+}
+
 fn print_response(resp: &TapResponse) {
     match resp {
         TapResponse::SessionList(sessions) => {
@@ -251,17 +258,28 @@ fn print_response(resp: &TapResponse) {
             }
             println!("{} active session(s):", sessions.len());
             for s in sessions {
-                let user = match &s.last_username {
-                    Some(name) => format!("{}({})", name, s.last_uid),
-                    None => format!("uid={}", s.last_uid),
+                let opener = format_user(&s.opener_username, s.opener_uid);
+                let writer = format_user(&s.last_username, s.last_uid);
+                let identity = if s.opener_uid == s.last_uid && s.opener_pid == s.last_pid {
+                    format!("user={opener:<14} comm={:<10}", s.last_comm)
+                } else if s.opener_uid == s.last_uid {
+                    // Same user, different process — typical (the
+                    // shell ran a child like `vim` or `ls`).
+                    format!(
+                        "user={opener:<14} comm={:<10} (writer={})",
+                        s.last_comm, s.last_pid
+                    )
+                } else {
+                    // Different uid — privilege escalation (sudo / su).
+                    format!(
+                        "opener={opener:<14} writer={writer:<14} comm={:<10}",
+                        s.last_comm
+                    )
                 };
                 println!(
-                    "  pty={:>3}  user={:<14}  comm={:<10}  pid={:>7}  \
-                     out={}b/{}ev  in={}b/{}ev  age={}ms idle={}ms",
+                    "  pty={:>3}  {identity}  out={}b/{}ev  in={}b/{}ev  \
+                     age={}ms idle={}ms",
                     s.pty_index,
-                    user,
-                    s.last_comm,
-                    s.last_pid,
                     s.output_bytes,
                     s.output_events,
                     s.input_bytes,

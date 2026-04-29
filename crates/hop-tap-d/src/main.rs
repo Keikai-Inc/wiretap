@@ -147,6 +147,21 @@ mod linux {
         pty_index: i32,
         created_at: Instant,
         last_activity: Instant,
+        // The "opener" — sticky values captured the very first time
+        // we saw this pty. For sessions that started after the
+        // daemon was launched, this is the controlling shell's
+        // first writer (typically the bash that printed the
+        // prompt). For pre-existing sessions we missed the actual
+        // open, so opener_* is just "first writer the daemon
+        // observed." Documented limit; future work could capture
+        // session-creation specifically via a tty_open hook.
+        opener_pid: u32,
+        opener_comm: String,
+        opener_uid: u32,
+        opener_gid: u32,
+        // The most recent writer. Diverges from opener_* under
+        // sudo, su, or just any time another process exec's into
+        // the session.
         last_pid: u32,
         last_comm: String,
         last_uid: u32,
@@ -189,6 +204,10 @@ mod linux {
                 pty_index,
                 created_at: now,
                 last_activity: now,
+                opener_pid: pid,
+                opener_comm: comm.clone(),
+                opener_uid: uid,
+                opener_gid: gid,
                 last_pid: pid,
                 last_comm: comm,
                 last_uid: uid,
@@ -291,6 +310,11 @@ mod linux {
         fn to_session_info(&self) -> SessionInfo {
             SessionInfo {
                 pty_index: self.pty_index,
+                opener_pid: self.opener_pid,
+                opener_comm: self.opener_comm.clone(),
+                opener_uid: self.opener_uid,
+                opener_gid: self.opener_gid,
+                opener_username: lookup_username(self.opener_uid),
                 last_pid: self.last_pid,
                 last_comm: self.last_comm.clone(),
                 last_uid: self.last_uid,
