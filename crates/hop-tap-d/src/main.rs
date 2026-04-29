@@ -78,8 +78,11 @@ mod linux {
         event::VoidListener,
         grid::Dimensions,
         index::{Column, Line, Point},
-        term::{Config, Term},
-        vte::ansi::Processor,
+        term::{
+            cell::{Cell, Flags},
+            Config, Term,
+        },
+        vte::ansi::{Color, Processor},
     };
     use anyhow::{bail, Context, Result};
     use aya::{
@@ -93,7 +96,8 @@ mod linux {
     };
     use ipc_channel::ipc::{IpcOneShotServer, IpcSender};
     use std::{
-        collections::{HashMap, VecDeque},
+        collections::HashMap,
+        io::Write as _,
         path::PathBuf,
         sync::{
             atomic::{AtomicU64, Ordering},
@@ -105,12 +109,13 @@ mod linux {
     use tokio::{signal, task::JoinSet, time::interval};
     use tracing::{debug, info, warn};
 
-    /// Bound on the per-session replay ring buffer. 64 KiB is large
-    /// enough to capture a full screen's worth of recent activity
-    /// (a 200×80 terminal of fully-coloured output at the upper
-    /// bound is ~80 KiB, but typical replay only needs the most
-    /// recent few rows for the operator to orient).
-    const REPLAY_BYTES: usize = 64 * 1024;
+    // Phase 1.8g replaced the rolling-byte replay buffer with a
+    // deterministic grid walk in `render_grid_to_bytes`. The
+    // alacritty Term carries the canonical state; we synthesize
+    // escape sequences from it when a subscriber attaches. This
+    // is strictly better: the byte buffer could start mid-CSI and
+    // confuse a fresh terminal, while the grid render is always
+    // self-contained.
 
     /// Fallback dimensions used only until the first `pty_write`
     /// surfaces real ones. Most sessions will resize within
@@ -173,11 +178,6 @@ mod linux {
         processor: Processor,
         term: Term<VoidListener>,
         dims: FixedDims,
-        // Rolling slave→master byte history, capped at REPLAY_BYTES.
-        // Sent verbatim as the first frame of any new stream
-        // subscription so the subscriber catches up on whatever's
-        // already been written.
-        replay: VecDeque<u8>,
         // stream_ids currently subscribed to live updates from this
         // session. Most sessions have zero subscribers so the fan-out
         // hot path is just an `is_empty()` check.
@@ -219,27 +219,8 @@ mod linux {
                 processor: Processor::new(),
                 term,
                 dims,
-                replay: VecDeque::with_capacity(REPLAY_BYTES),
                 subscribers: Vec::new(),
             }
-        }
-
-        fn append_replay(&mut self, bytes: &[u8]) {
-            // If the chunk itself is bigger than our cap, keep only
-            // its tail (best-effort recent context).
-            let take = bytes.len().min(REPLAY_BYTES);
-            let start = bytes.len() - take;
-            for &b in &bytes[start..] {
-                if self.replay.len() == REPLAY_BYTES {
-                    self.replay.pop_front();
-                }
-                self.replay.push_back(b);
-            }
-        }
-
-        fn replay_snapshot(&self) -> Vec<u8> {
-            // VecDeque can be non-contiguous; flatten for the wire.
-            self.replay.iter().copied().collect()
         }
 
         /// Resize the off-screen terminal if the kernel-reported
@@ -326,6 +307,140 @@ mod linux {
                 input_events: self.input_events,
                 age_ms: self.created_at.elapsed().as_millis() as u64,
                 idle_ms: self.last_activity.elapsed().as_millis() as u64,
+            }
+        }
+    }
+
+    /// Render the alacritty Term's current grid as a self-contained
+    /// byte sequence that, when written to a fresh terminal,
+    /// reproduces the screen state with colors and basic attributes.
+    ///
+    /// Output shape:
+    ///   ESC [2J ESC [H ESC [0m              clear, home, reset
+    ///   ESC [<row>;1H                       per-row cursor placement
+    ///   ESC [0;<flags>;<fg>;<bg>m  <chars>  per-cell SGR + char
+    ///   ...
+    ///   ESC [0m                              final attribute reset
+    ///   ESC [<cy>;<cx>H                     final cursor position
+    ///
+    /// We emit a fresh `\x1b[0;...m` SGR per attribute change rather
+    /// than computing a true diff — slightly more bytes on the wire,
+    /// significantly simpler logic, and not on a hot path (only
+    /// fires when a subscriber attaches).
+    ///
+    /// Skips `WIDE_CHAR_SPACER` cells (the placeholder column after
+    /// a wide char) and steps the column cursor by 2 on the wide
+    /// char itself.
+    fn render_grid_to_bytes(state: &SessionState) -> Vec<u8> {
+        let mut out: Vec<u8> = Vec::with_capacity(state.dims.cols * state.dims.lines * 8);
+        out.extend_from_slice(b"\x1b[2J\x1b[H\x1b[0m");
+
+        let grid = state.term.grid();
+        let dims = state.dims;
+        let mut last_attrs: Option<(Color, Color, Flags)> = None;
+
+        for line_idx in 0..dims.lines as i32 {
+            let _ = write!(out, "\x1b[{};1H", line_idx + 1);
+            let mut col = 0usize;
+            while col < dims.cols {
+                let p = Point::new(Line(line_idx), Column(col));
+                let cell = &grid[p];
+
+                // Skip the placeholder column for a wide char; the
+                // wide char itself was already emitted in the prior
+                // iteration.
+                if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                    col += 1;
+                    continue;
+                }
+
+                let attrs = (cell.fg, cell.bg, cell.flags);
+                if last_attrs.as_ref() != Some(&attrs) {
+                    emit_sgr(&mut out, cell);
+                    last_attrs = Some(attrs);
+                }
+
+                let mut buf = [0u8; 4];
+                let s = cell.c.encode_utf8(&mut buf);
+                out.extend_from_slice(s.as_bytes());
+
+                col += if cell.flags.contains(Flags::WIDE_CHAR) { 2 } else { 1 };
+            }
+        }
+
+        // Final reset and cursor placement.
+        out.extend_from_slice(b"\x1b[0m");
+        let cursor_pt = grid.cursor.point;
+        let _ = write!(
+            out,
+            "\x1b[{};{}H",
+            cursor_pt.line.0 + 1,
+            cursor_pt.column.0 + 1
+        );
+
+        out
+    }
+
+    /// Emit an SGR sequence that establishes `cell`'s attributes
+    /// from a fully-reset state. Always starts with `\x1b[0` so the
+    /// receiver doesn't accumulate stale flags from prior cells.
+    fn emit_sgr(out: &mut Vec<u8>, cell: &Cell) {
+        out.extend_from_slice(b"\x1b[0");
+        if cell.flags.contains(Flags::BOLD) {
+            out.extend_from_slice(b";1");
+        }
+        if cell.flags.contains(Flags::DIM) {
+            out.extend_from_slice(b";2");
+        }
+        if cell.flags.contains(Flags::ITALIC) {
+            out.extend_from_slice(b";3");
+        }
+        if cell.flags.intersects(Flags::ALL_UNDERLINES) {
+            out.extend_from_slice(b";4");
+        }
+        if cell.flags.contains(Flags::INVERSE) {
+            out.extend_from_slice(b";7");
+        }
+        if cell.flags.contains(Flags::HIDDEN) {
+            out.extend_from_slice(b";8");
+        }
+        if cell.flags.contains(Flags::STRIKEOUT) {
+            out.extend_from_slice(b";9");
+        }
+        emit_color(out, cell.fg, /* fg = */ true);
+        emit_color(out, cell.bg, /* fg = */ false);
+        out.extend_from_slice(b"m");
+    }
+
+    fn emit_color(out: &mut Vec<u8>, color: Color, is_fg: bool) {
+        let base = if is_fg { 30 } else { 40 };
+        let bright_base = if is_fg { 90 } else { 100 };
+        let default_code = if is_fg { 39 } else { 49 };
+        let extended_lead = if is_fg { 38 } else { 48 };
+        match color {
+            Color::Named(named) => {
+                let n = named as u32;
+                if n < 8 {
+                    let _ = write!(out, ";{}", base + n);
+                } else if n < 16 {
+                    let _ = write!(out, ";{}", bright_base + (n - 8));
+                } else {
+                    // Foreground / Background / Cursor / Dim* / etc.
+                    // — fall back to "default" for unknown nameds.
+                    let _ = write!(out, ";{}", default_code);
+                }
+            }
+            Color::Indexed(idx) if idx < 8 => {
+                let _ = write!(out, ";{}", base + idx as u32);
+            }
+            Color::Indexed(idx) if idx < 16 => {
+                let _ = write!(out, ";{}", bright_base + (idx - 8) as u32);
+            }
+            Color::Indexed(idx) => {
+                let _ = write!(out, ";{};5;{}", extended_lead, idx);
+            }
+            Color::Spec(rgb) => {
+                let _ = write!(out, ";{};2;{};{};{}", extended_lead, rgb.r, rgb.g, rgb.b);
             }
         }
     }
@@ -633,7 +748,7 @@ mod linux {
             TapStreamFrame::Initial {
                 rows: state.dims.lines as u16,
                 cols: state.dims.cols as u16,
-                replay_bytes: state.replay_snapshot(),
+                replay_bytes: render_grid_to_bytes(state),
             }
         };
 
@@ -852,7 +967,6 @@ mod linux {
                     state.output_bytes += event.total_len as u64;
                     state.output_events += 1;
                     state.ingest_output(&event.data[..captured]);
-                    state.append_replay(&event.data[..captured]);
                     if state.subscribers.is_empty() {
                         None
                     } else {

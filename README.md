@@ -89,3 +89,4 @@ Not yet — see Phase 1.2.
 | 1.8d | Owner attribution (uid/gid → username via `getpwuid_r`) | done |
 | 1.8e | Sticky session-opener identity (separate from per-event writer) | done |
 | 1.8f | Probe REPL: multiple commands over one daemon connection | done |
+| 1.8g | SGR-aware grid replay (vim/htop fidelity on mid-session subscribe) | done |
