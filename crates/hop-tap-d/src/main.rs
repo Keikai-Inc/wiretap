@@ -445,6 +445,129 @@ mod linux {
         }
     }
 
+    /// One pre-existing session discovered by the /proc walk at
+    /// startup. Used to seed [`SessionTable`] so sessions opened
+    /// before the daemon got their accurate opener identity (the
+    /// actual session leader) rather than the "first writer the
+    /// daemon happened to observe" approximation.
+    struct SeedRow {
+        pty_index: i32,
+        pid: u32,
+        comm: String,
+        uid: u32,
+        gid: u32,
+    }
+
+    /// Walk `/proc/*/` and find session leaders attached to a pty.
+    /// A process is a session leader iff its sid (the 4th field
+    /// after the parenthesised comm in `/proc/<pid>/stat`) equals
+    /// its pid; that's the canonical way the kernel marks the
+    /// process that "owns" a pty for terminal-control purposes.
+    ///
+    /// We then walk the leader's fd table and report the first
+    /// `/dev/pts/N` symlink we find — that's the pts index our
+    /// kprobe-side `tty_struct.index` will match.
+    ///
+    /// Errors on individual processes are silently swallowed
+    /// (processes can vanish mid-walk; permission can deny reads
+    /// for other-uid procs even with CAP_SYS_PTRACE-less daemons).
+    /// Returns the rows we did manage to identify.
+    fn walk_proc_for_session_leaders() -> Vec<SeedRow> {
+        let mut out = Vec::new();
+        let Ok(dir) = std::fs::read_dir("/proc") else {
+            return out;
+        };
+        for entry in dir.flatten() {
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|s| s.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            let Some((sid, comm)) = parse_proc_stat(pid) else {
+                continue;
+            };
+            if sid != pid {
+                continue; // not a session leader
+            }
+            let Some(pty_index) = pty_index_for_pid(pid) else {
+                continue;
+            };
+            let Some((uid, gid)) = parse_proc_status_uid_gid(pid) else {
+                continue;
+            };
+            out.push(SeedRow {
+                pty_index,
+                pid,
+                comm,
+                uid,
+                gid,
+            });
+        }
+        out
+    }
+
+    /// Parse `/proc/<pid>/stat` for `(sid, comm)`. The comm field is
+    /// parenthesised; it can contain spaces, parens, or anything
+    /// else, so we locate it via the LAST `)` in the file (the
+    /// kernel prints it as `(${task->comm})` with the binary's
+    /// raw name).
+    fn parse_proc_stat(pid: u32) -> Option<(u32, String)> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let comm_start = stat.find('(')?;
+        let comm_end = stat.rfind(')')?;
+        if comm_end <= comm_start {
+            return None;
+        }
+        let comm = stat[comm_start + 1..comm_end].to_string();
+        // After "(comm) " the remaining fields are space-separated:
+        //   state, ppid, pgrp, session, tty_nr, ...
+        let after = stat.get(comm_end + 2..)?;
+        let fields: Vec<&str> = after.split_whitespace().collect();
+        // session is field index 3 (0=state, 1=ppid, 2=pgrp, 3=session)
+        let sid: u32 = fields.get(3)?.parse().ok()?;
+        Some((sid, comm))
+    }
+
+    fn parse_proc_status_uid_gid(pid: u32) -> Option<(u32, u32)> {
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+        let mut uid: Option<u32> = None;
+        let mut gid: Option<u32> = None;
+        for line in status.lines() {
+            // "Uid:	real	effective	saved	fs"
+            if let Some(rest) = line.strip_prefix("Uid:") {
+                uid = rest.split_whitespace().next().and_then(|s| s.parse().ok());
+            } else if let Some(rest) = line.strip_prefix("Gid:") {
+                gid = rest.split_whitespace().next().and_then(|s| s.parse().ok());
+            }
+            if uid.is_some() && gid.is_some() {
+                break;
+            }
+        }
+        Some((uid?, gid?))
+    }
+
+    /// Walk `/proc/<pid>/fd/*` and return the first `/dev/pts/N`
+    /// symlink target we find. None if the process has no pts fd
+    /// open or we can't read the directory (permissions / vanished
+    /// process).
+    fn pty_index_for_pid(pid: u32) -> Option<i32> {
+        let dir = std::fs::read_dir(format!("/proc/{pid}/fd")).ok()?;
+        for entry in dir.flatten() {
+            let Ok(target) = std::fs::read_link(entry.path()) else {
+                continue;
+            };
+            let Some(s) = target.to_str() else { continue };
+            if let Some(rest) = s.strip_prefix("/dev/pts/") {
+                if let Ok(n) = rest.parse::<i32>() {
+                    return Some(n);
+                }
+            }
+        }
+        None
+    }
+
     /// Best-effort uid → username resolution via `getpwuid_r`.
     /// Returns None if the uid isn't in the daemon's view of
     /// /etc/passwd. Container PID/user namespacing routinely makes
@@ -554,6 +677,31 @@ mod linux {
 
         let sessions: SessionTable = Arc::new(Mutex::new(HashMap::new()));
         let writer: WriterSlot = Arc::new(Mutex::new(None));
+
+        // Seed pre-existing sessions from /proc before readers start
+        // pulling events. This way sessions that opened before the
+        // daemon was launched get their actual session-leader
+        // identity recorded as `opener_*` rather than whichever
+        // sub-process happens to write first.
+        //
+        // Order matters: we do this AFTER kprobe attach (so events
+        // start queueing) but BEFORE spawning the per-CPU readers
+        // (so the live event drain doesn't race-create entries with
+        // wrong opener metadata). A live event for a pty we seeded
+        // will hit `entry().or_insert_with` as a no-op and just
+        // update `last_*` — exactly what we want.
+        let seeds = walk_proc_for_session_leaders();
+        if !seeds.is_empty() {
+            let now = Instant::now();
+            let mut table = sessions.lock().expect("session table mutex poisoned");
+            for s in seeds {
+                let comm = s.comm.clone();
+                table.entry(s.pty_index).or_insert_with(|| {
+                    SessionState::new(s.pty_index, now, s.pid, comm, s.uid, s.gid)
+                });
+            }
+            info!(seeded = table.len(), "seeded pre-existing sessions from /proc");
+        }
 
         let mut readers: JoinSet<()> = JoinSet::new();
         let cpus = online_cpus().map_err(|(_, e)| e).context("online_cpus")?;
