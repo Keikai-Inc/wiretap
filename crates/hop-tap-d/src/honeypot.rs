@@ -267,20 +267,33 @@ fn build_sandbox_root(spec: &SandboxSpec) -> Result<PathBuf> {
     // the impostor's bash, ls, cat, etc. are real bash, ls, cat.
     bind_mount_ro(Path::new("/usr"), &root.join("usr"))?;
 
-    // Some distros (Debian-style) keep libs in /lib + /lib64 instead
-    // of /usr/lib. Bind-mount them if they exist as real dirs (not
-    // symlinks to /usr/lib).
-    for lib in &["lib", "lib64", "lib32"] {
-        let host = PathBuf::from("/").join(lib);
-        if host.is_dir() && !host.is_symlink() {
-            bind_mount_ro(&host, &root.join(lib))?;
+    // /bin /sbin /lib /lib64 /lib32 — handle both layouts:
+    //   - usrmerge (modern Debian/Ubuntu/Arch/Fedora): host has these
+    //     as symlinks pointing at /usr/{bin,sbin,lib,...}. Replicate
+    //     the symlink in the sandbox so the same paths resolve via
+    //     our bind-mounted /usr. If we just bind-mounted the symlink
+    //     target as a directory, /usr/bin would shadow /bin's
+    //     symlink and the dynamic linker (which the kernel resolves
+    //     via the absolute path in the binary's PT_INTERP, e.g.
+    //     /lib/x86_64-linux-gnu/ld-linux-x86-64.so.2) would 404.
+    //   - non-usrmerge (older Debian, Alpine, NixOS-flavored): real
+    //     directories. Bind-mount them read-only.
+    //   - missing (e.g. /lib32 on a 64-bit-only host): skip.
+    for top in &["bin", "sbin", "lib", "lib64", "lib32"] {
+        let host = PathBuf::from("/").join(top);
+        if !host.exists() {
+            continue;
+        }
+        if host.is_symlink() {
+            // Preserve whatever the host points at — typically
+            // "usr/bin", "usr/lib", etc.
+            let target = std::fs::read_link(&host)
+                .with_context(|| format!("readlink {:?}", host))?;
+            create_symlink(&root.join(top), target.to_string_lossy().as_ref())?;
+        } else if host.is_dir() {
+            bind_mount_ro(&host, &root.join(top))?;
         }
     }
-
-    // /bin → /usr/bin and /sbin → /usr/sbin as symlinks (the
-    // usrmerge layout). PATH still expects /bin, /sbin to exist.
-    create_symlink(&root.join("bin"), "usr/bin")?;
-    create_symlink(&root.join("sbin"), "usr/sbin")?;
 
     // Synthesize /etc.
     let etc = root.join("etc");
