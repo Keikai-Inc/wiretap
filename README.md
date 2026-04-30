@@ -63,11 +63,16 @@ hop <host> tap list                       # active sessions, with opener vs writ
 hop <host> tap snapshot 0                 # 24x80 grid for pty=0
 ```
 
-`hop <host> tap watch <pty>` is wired but currently bails — it
-needs hop-core's extension-streaming dispatcher
-(`ExtMessage::StreamOpen` / `StreamFrame` / `StreamClosed`) which
-is marked "not yet implemented" upstream. For live byte streams
-today, run the bundled probe directly on the target host:
+`hop <host> tap watch <pty>` works end-to-end as of hop's
+extension-system commit `0cd6d09` (which implements the
+streaming dispatcher in hop-core). Multi-frame `PeerResponse`s
+flow back over the peer's QUIC stream until `StreamClosed`; the
+CLI decodes each `TapStreamFrame` and writes raw bytes to stdout,
+so the operator's terminal renders the captured session in real
+time without any client-side emulator round-trip.
+
+For local development you can also run the bundled probe directly
+against a daemon you control:
 
 ```bash
 hop-tap-probe --bootstrap /run/hop-tap/bootstrap watch --pty 0
@@ -121,3 +126,4 @@ Not yet — see Phase 1.2.
 | 1.8i | Per-peer scope check (creator sees all; others gated by `opener_username`) | done |
 | 1.8j | `/proc` walk to seed pre-existing sessions with their session leader's identity | done |
 | 1.8k | Alt-screen-aware replay (vim/htop/less subscribers land in the right mode) | done |
+| 1.8l | Extension streaming in hop-core: `hop &lt;host&gt; tap watch` end-to-end | done (in hop repo) |
