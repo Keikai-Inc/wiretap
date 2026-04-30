@@ -1625,28 +1625,65 @@ mod linux {
         }
     }
 
-    /// `ioctl(slave_fd, TIOCGPGRP)` — read the foreground process
-    /// group of pty_index. Opens /dev/pts/N for read (we have root +
-    /// the kernel allows non-controlling reads), pulls the pgrp,
-    /// closes.
+    /// Read the foreground process group of `pty_index` from /proc.
+    ///
+    /// We can't use `ioctl(fd, TIOCGPGRP)` here: that ioctl requires
+    /// the calling process's *own* controlling terminal to match the
+    /// fd, and the daemon (running under systemd) has no controlling
+    /// tty — the call returns ENOTTY.
+    ///
+    /// Instead: walk /proc looking for any process whose `tty_nr`
+    /// (field 7 of stat) matches our pty_index. Field 8 of that
+    /// process's stat is `tpgid` — the foreground pgrp of the tty
+    /// it's attached to — which is what we want. Multiple processes
+    /// in the same session share a controlling tty so they all
+    /// report the same tpgid; finding any one is enough.
     fn foreground_pgrp(pty_index: i32) -> std::io::Result<libc::pid_t> {
-        use std::ffi::CString;
-        let path = CString::new(format!("/dev/pts/{pty_index}")).unwrap();
-        // SAFETY: open(2) with a valid C string and standard flags.
-        let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK) };
-        if fd < 0 {
-            return Err(std::io::Error::last_os_error());
+        let proc_dir = std::fs::read_dir("/proc")?;
+        for entry in proc_dir.flatten() {
+            let name = entry.file_name();
+            let pid: i32 = match name.to_str().and_then(|s| s.parse().ok()) {
+                Some(p) => p,
+                None => continue,
+            };
+            let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            // Anchor on the rightmost ')' since field 2 (`comm`) can
+            // itself contain whitespace and parens.
+            let close = match stat.rfind(')') {
+                Some(c) => c,
+                None => continue,
+            };
+            let fields: Vec<&str> = stat
+                .get(close + 1..)
+                .map(|s| s.split_whitespace().collect())
+                .unwrap_or_default();
+            // After the closing paren of comm:
+            //   [0]=state, [1]=ppid, [2]=pgrp, [3]=session,
+            //   [4]=tty_nr, [5]=tpgid
+            let tty_nr: u32 = match fields.get(4).and_then(|s| s.parse().ok()) {
+                Some(n) => n,
+                None => continue,
+            };
+            let major = (tty_nr >> 8) & 0xff;
+            let minor = (tty_nr & 0xff) | ((tty_nr >> 12) & 0xfff00);
+            if !(136..=143).contains(&major) || (minor as i32) != pty_index {
+                continue;
+            }
+            let tpgid: libc::pid_t = match fields.get(5).and_then(|s| s.parse().ok()) {
+                Some(n) => n,
+                None => continue,
+            };
+            if tpgid > 0 {
+                return Ok(tpgid);
+            }
         }
-        let mut pgid: libc::pid_t = 0;
-        // SAFETY: ioctl(TIOCGPGRP) writes a pid_t through the pointer.
-        let r = unsafe { libc::ioctl(fd, libc::TIOCGPGRP, &mut pgid as *mut libc::pid_t) };
-        unsafe {
-            libc::close(fd);
-        }
-        if r < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok(pgid)
+        Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("no foreground process group found for pty_index={pty_index} in /proc"),
+        ))
     }
 
     /// `ioctl(slave_fd, TCFLSH, TCIFLUSH)` — discard everything in
