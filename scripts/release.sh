@@ -246,28 +246,34 @@ start_build() {
   BUILD_PIDS+=("$!:${label}:${logfile}")
 }
 
-# Linux aarch64: native arm64 Docker build (no QEMU emulation).
-# Reuses the cross images hop already has if present (hop-cross-aarch64-musl);
-# falls back to the public cross image otherwise.
-ARM64_IMAGE="${HOP_TAP_ARM64_IMAGE:-ghcr.io/cross-rs/aarch64-unknown-linux-musl:main}"
+# Both Linux targets use the `cross` wrapper. Direct `docker run`
+# bypasses cross-rs's image entrypoint and loses cargo from PATH.
+#
+# CROSS_CONTAINER_OPTS injects HOP_TAP_SKIP_EBPF_BUILD=1 into the
+# container's environment. Without it the eBPF build.rs runs *inside*
+# the cross container and can't find vlad's stage1 toolchain — the
+# cross image is a generic musl image, not a Rust nightly host.
+# We've already produced the `.bpf.o` on the host above and embedded
+# it via include_bytes_aligned!; we just need to tell the userspace
+# build to skip re-doing it.
+#
+# On Apple Silicon hosts cross runs the aarch64 image natively; the
+# x86_64 image is QEMU-emulated.
+CROSS_ENV='-e HOP_TAP_SKIP_EBPF_BUILD=1'
+
 start_build "hop-tap-linux-arm64" bash -c "
-  docker run --rm \
-    -e HOP_TAP_SKIP_EBPF_BUILD=1 \
-    -v '${PROJECT_ROOT}:/build' \
-    -v '${HOME}/.cargo/registry:/usr/local/cargo/registry' \
-    -v '${HOME}/.cargo/git:/usr/local/cargo/git' \
-    '${ARM64_IMAGE}' \
-    cargo build --release --target aarch64-unknown-linux-musl \
-      --manifest-path /build/Cargo.toml -p hop-tap-d --bins \
-  && cp '${PROJECT_ROOT}/target/aarch64-unknown-linux-musl/release/hop-tap-d'     '${DIST_DIR}/hop-tap-d-linux-arm64' \
+  CROSS_CONTAINER_OPTS='${CROSS_ENV}' \
+  HOP_TAP_SKIP_EBPF_BUILD=1 cross build --release --target aarch64-unknown-linux-musl \
+    --manifest-path '${PROJECT_ROOT}/Cargo.toml' -p hop-tap-d --bins \
+  && cp '${PROJECT_ROOT}/target/aarch64-unknown-linux-musl/release/hop-tap-d' '${DIST_DIR}/hop-tap-d-linux-arm64' \
   && cp '${PROJECT_ROOT}/target/aarch64-unknown-linux-musl/release/tap' '${DIST_DIR}/tap-linux-arm64'
 "
 
-# Linux x86_64: cross under QEMU
 start_build "hop-tap-linux-x86_64" bash -c "
+  CROSS_CONTAINER_OPTS='${CROSS_ENV}' \
   HOP_TAP_SKIP_EBPF_BUILD=1 cross build --release --target x86_64-unknown-linux-musl \
     --manifest-path '${PROJECT_ROOT}/Cargo.toml' -p hop-tap-d --bins \
-  && cp '${PROJECT_ROOT}/target/x86_64-unknown-linux-musl/release/hop-tap-d'     '${DIST_DIR}/hop-tap-d-linux-x86_64' \
+  && cp '${PROJECT_ROOT}/target/x86_64-unknown-linux-musl/release/hop-tap-d' '${DIST_DIR}/hop-tap-d-linux-x86_64' \
   && cp '${PROJECT_ROOT}/target/x86_64-unknown-linux-musl/release/tap' '${DIST_DIR}/tap-linux-x86_64'
 "
 
