@@ -234,6 +234,12 @@ mod linux {
         // re-clone next time". Closed in `Drop` so we don't leak fds
         // when sessions end.
         master_fd: RawFd,
+        // Admin-locked: the session's foreground pgrp has been
+        // SIGSTOPped. The user's keystrokes pile up in the kernel
+        // pty input buffer but the shell isn't reading. Cleared on
+        // SetLock(false), which also flushes the input queue and
+        // SIGCONTs.
+        locked: bool,
     }
 
     impl Drop for SessionState {
@@ -284,6 +290,7 @@ mod linux {
                 subscribers: Vec::new(),
                 master_holder_pid: 0,
                 master_fd: -1,
+                locked: false,
             }
         }
 
@@ -371,6 +378,7 @@ mod linux {
                 input_events: self.input_events,
                 age_ms: self.created_at.elapsed().as_millis() as u64,
                 idle_ms: self.last_activity.elapsed().as_millis() as u64,
+                locked: self.locked,
             }
         }
     }
@@ -1509,7 +1517,158 @@ mod linux {
                 message,
                 from,
             } => handle_admin_message(sessions, peer, pty_index, &message, &from),
+            TapRequest::SetLock { pty_index, locked } => {
+                handle_set_lock(sessions, peer, pty_index, locked)
+            }
         }
+    }
+
+    /// Lock or unlock a session by SIGSTOPping / SIGCONTing its
+    /// foreground process group.
+    ///
+    /// "Foreground process group" is the group whose processes are
+    /// currently allowed to read from / write to the controlling tty.
+    /// We get it via `ioctl(slave_fd, TIOCGPGRP)`. SIGSTOP'ing it
+    /// freezes whatever the user is interacting with (the shell at
+    /// an idle prompt, or vim, or whatever); other background jobs
+    /// in the session keep running.
+    ///
+    /// On unlock we **flush the pty's input queue first** via
+    /// `ioctl(slave_fd, TCFLSH, TCIFLUSH)`. Otherwise the keystrokes
+    /// the user hammered against the locked session are still sitting
+    /// in the kernel's tty buffer and the shell would replay them as
+    /// if they were a single line of input — potentially executing
+    /// commands they typed in frustration.
+    ///
+    /// Authorization: opener-or-creator (same as Inject and Kill).
+    /// Self-pty refused like the rest.
+    fn handle_set_lock(
+        sessions: &SessionTable,
+        peer: &PeerContext,
+        pty_index: i32,
+        locked: bool,
+    ) -> TapResponse {
+        if Some(pty_index) == peer.controlling_pty {
+            return TapResponse::Error(format!(
+                "no active session with pty_index={pty_index}"
+            ));
+        }
+        // Scope + write-permission check; bail before touching kernel
+        // state if the peer can't act on this session.
+        {
+            let table = sessions.lock().expect("session table mutex poisoned");
+            let Some(state) = table.get(&pty_index) else {
+                return TapResponse::Error(format!(
+                    "no active session with pty_index={pty_index}"
+                ));
+            };
+            if !peer.scope_allows(state) {
+                return TapResponse::Error(format!(
+                    "no active session with pty_index={pty_index}"
+                ));
+            }
+            if !peer_can_inject(peer, state) {
+                return TapResponse::Error(format!(
+                    "forbidden: only the session opener (or a creator-role peer) \
+                     may lock pty_index={pty_index}"
+                ));
+            }
+        }
+
+        let pgrp = match foreground_pgrp(pty_index) {
+            Ok(p) => p,
+            Err(e) => {
+                return TapResponse::Error(format!(
+                    "TIOCGPGRP for pty_index={pty_index}: {e}"
+                ));
+            }
+        };
+        if pgrp <= 0 {
+            return TapResponse::Error(format!(
+                "pty_index={pty_index} has no foreground process group (pgrp={pgrp})"
+            ));
+        }
+
+        if !locked {
+            // Drain the queued input bytes BEFORE thawing, so the user
+            // doesn't get their hammer-typing run as commands when the
+            // shell wakes up.
+            if let Err(e) = flush_pty_input(pty_index) {
+                warn!(pty_index, error = %e, "TCFLSH on unlock failed (continuing)");
+            }
+        }
+
+        let signal = if locked { libc::SIGSTOP } else { libc::SIGCONT };
+        // Negative pid → killpg(2) semantics (signal whole pgrp).
+        // SAFETY: kill(2) with a real pgrp and a valid signal.
+        let r = unsafe { libc::kill(-pgrp as libc::pid_t, signal) };
+        if r != 0 {
+            let err = std::io::Error::last_os_error();
+            return TapResponse::Error(format!(
+                "kill(-{pgrp}, {signal}) for pty_index={pty_index}: {err}"
+            ));
+        }
+
+        // Update bookkeeping under the sessions lock.
+        {
+            let mut table = sessions.lock().expect("session table mutex poisoned");
+            if let Some(state) = table.get_mut(&pty_index) {
+                state.locked = locked;
+            }
+        }
+
+        info!(pty_index, pgrp, locked, "lock state changed");
+        TapResponse::LockSet {
+            pty_index,
+            locked,
+            pgrp,
+        }
+    }
+
+    /// `ioctl(slave_fd, TIOCGPGRP)` — read the foreground process
+    /// group of pty_index. Opens /dev/pts/N for read (we have root +
+    /// the kernel allows non-controlling reads), pulls the pgrp,
+    /// closes.
+    fn foreground_pgrp(pty_index: i32) -> std::io::Result<libc::pid_t> {
+        use std::ffi::CString;
+        let path = CString::new(format!("/dev/pts/{pty_index}")).unwrap();
+        // SAFETY: open(2) with a valid C string and standard flags.
+        let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut pgid: libc::pid_t = 0;
+        // SAFETY: ioctl(TIOCGPGRP) writes a pid_t through the pointer.
+        let r = unsafe { libc::ioctl(fd, libc::TIOCGPGRP, &mut pgid as *mut libc::pid_t) };
+        unsafe {
+            libc::close(fd);
+        }
+        if r < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(pgid)
+    }
+
+    /// `ioctl(slave_fd, TCFLSH, TCIFLUSH)` — discard everything in
+    /// the pty's input queue. Used on unlock so accumulated keystrokes
+    /// don't replay into the shell.
+    fn flush_pty_input(pty_index: i32) -> std::io::Result<()> {
+        use std::ffi::CString;
+        let path = CString::new(format!("/dev/pts/{pty_index}")).unwrap();
+        // SAFETY: open(2) with a valid C string and standard flags.
+        let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: ioctl(TCFLSH) takes an int directly, not a pointer.
+        let r = unsafe { libc::ioctl(fd, libc::TCFLSH, libc::TCIFLUSH) };
+        unsafe {
+            libc::close(fd);
+        }
+        if r < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
     }
 
     /// Display an admin message to the user attached to `pty_index`.

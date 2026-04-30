@@ -63,6 +63,14 @@ pub enum TapRequest {
         /// the kernel-authoritative uid is on PeerContext separately).
         from: String,
     },
+    /// Freeze (or thaw) the captured session by SIGSTOPping its
+    /// foreground process group. While locked, anything the user
+    /// types into the session is queued in the kernel's pty input
+    /// buffer but never read by the shell. On unlock the daemon
+    /// flushes that buffer (so accumulated keystrokes don't suddenly
+    /// run as commands) and SIGCONTs the group. Same write-scope
+    /// authorization as Inject.
+    SetLock { pty_index: i32, locked: bool },
 }
 
 /// Daemon's reply. Carried inside `ExtMessage::Response.payload`.
@@ -96,6 +104,13 @@ pub enum TapResponse {
     MessageDelivered {
         pty_index: i32,
         bytes_written: usize,
+    },
+    /// Reply to a successful [`TapRequest::SetLock`]. `pgrp` is the
+    /// foreground process group we signaled; useful for diagnostics.
+    LockSet {
+        pty_index: i32,
+        locked: bool,
+        pgrp: i32,
     },
     Error(String),
 }
@@ -138,6 +153,12 @@ pub struct SessionInfo {
     pub age_ms: u64,
     /// Milliseconds since last observed activity.
     pub idle_ms: u64,
+    /// True if an admin has frozen this session via `TapRequest::SetLock`.
+    /// While set, the user's input is queued but never reaches the
+    /// shell. Lives in daemon memory only — survives reconnects but
+    /// not daemon restarts (the underlying SIGSTOP does, though).
+    #[serde(default)]
+    pub locked: bool,
 }
 
 /// Carried inside `ExtMessage::StreamOpen.payload`. The peer asks

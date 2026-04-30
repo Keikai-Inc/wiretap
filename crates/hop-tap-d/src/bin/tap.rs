@@ -259,6 +259,16 @@ fn print_response(resp: &TapResponse) {
         } => {
             println!("delivered admin message to pty={pty_index} ({bytes_written} bytes)");
         }
+        TapResponse::LockSet {
+            pty_index,
+            locked,
+            pgrp,
+        } => {
+            println!(
+                "{} pty={pty_index} (pgrp={pgrp})",
+                if *locked { "locked" } else { "unlocked" }
+            );
+        }
         TapResponse::Error(msg) => eprintln!("error: {msg}"),
     }
 }
@@ -956,6 +966,10 @@ async fn run_tui(socket: &std::path::Path) -> Result<Option<TuiAction>> {
     // keystroke either confirms ('y') and fires the Kill RPC, or
     // cancels (anything else).
     let mut pending_kill: Option<i32> = None;
+    // Pending lock confirmation: same pattern as pending_kill but for
+    // the 'l' key (locking only — unlocking is reversible and fires
+    // immediately).
+    let mut pending_lock: Option<i32> = None;
     // Brief flash message: shows above the status line for one render
     // cycle to confirm or report errors. Cleared on the next refresh.
     let mut flash: Option<String> = None;
@@ -976,7 +990,7 @@ async fn run_tui(socket: &std::path::Path) -> Result<Option<TuiAction>> {
                         state.select(Some(0));
                     }
                     status_line = format!(
-                        "{} session(s) — ↑/↓ select  Enter=connect  x=kill  q=quit",
+                        "{} session(s) — ↑/↓ select  Enter=connect  l=lock  x=kill  q=quit",
                         sessions.len()
                     );
                 }
@@ -1043,8 +1057,13 @@ async fn run_tui(socket: &std::path::Path) -> Result<Option<TuiAction>> {
                 .iter()
                 .map(|s| {
                     let opener = format_user(&s.opener_username, s.opener_uid);
+                    let pty_label = if s.locked {
+                        format!("🔒 {}", s.pty_index)
+                    } else {
+                        format!("   {}", s.pty_index)
+                    };
                     Row::new(vec![
-                        Cell::from(format!("{}", s.pty_index)),
+                        Cell::from(pty_label),
                         Cell::from(opener),
                         Cell::from(s.last_comm.clone()),
                         Cell::from(format!("{}ms", s.age_ms)),
@@ -1054,7 +1073,7 @@ async fn run_tui(socket: &std::path::Path) -> Result<Option<TuiAction>> {
                 .collect();
 
             let widths = [
-                Constraint::Length(5),
+                Constraint::Length(8),
                 Constraint::Length(20),
                 Constraint::Length(14),
                 Constraint::Length(10),
@@ -1143,11 +1162,15 @@ async fn run_tui(socket: &std::path::Path) -> Result<Option<TuiAction>> {
             let preview_para = Paragraph::new(Text::from(lines)).block(preview_block);
             f.render_widget(preview_para, body[1]);
 
-            // Status line: pending-kill prompt > flash > normal hint.
-            // Each takes precedence in that order.
+            // Status line: pending-kill / pending-lock prompt > flash
+            // > normal hint. Each takes precedence in that order.
             let status_text = if let Some(p) = pending_kill {
                 format!(
                     "kill pty {p}? press y to confirm (SIGHUP), X to force (SIGKILL), any other key to cancel"
+                )
+            } else if let Some(p) = pending_lock {
+                format!(
+                    "lock pty {p}? press y to confirm — user's input will be frozen until you unlock"
                 )
             } else if let Some(msg) = &flash {
                 msg.clone()
@@ -1194,6 +1217,21 @@ async fn run_tui(socket: &std::path::Path) -> Result<Option<TuiAction>> {
                     }
                     continue;
                 }
+                // If a lock confirmation is pending, same one-shot
+                // pattern.
+                if let Some(target) = pending_lock {
+                    pending_lock = None;
+                    if matches!(key.code, KeyCode::Char('y')) {
+                        flash = match send_set_lock(&mut conn, &mut next_id, target, true).await {
+                            Ok(()) => Some(format!("locked pty {target}")),
+                            Err(e) => Some(format!("lock failed: {e}")),
+                        };
+                        last_refresh = Instant::now() - refresh_interval;
+                    } else {
+                        flash = Some(format!("lock of pty {target} cancelled"));
+                    }
+                    continue;
+                }
                 // Any keystroke clears a stale flash so old messages
                 // don't linger.
                 flash = None;
@@ -1220,6 +1258,24 @@ async fn run_tui(socket: &std::path::Path) -> Result<Option<TuiAction>> {
                         // session. The next key decides.
                         if let Some(s) = state.selected().and_then(|i| sessions.get(i)) {
                             pending_kill = Some(s.pty_index);
+                        }
+                    }
+                    (KeyCode::Char('l'), _) => {
+                        // Toggle lock. Already-locked → unlock
+                        // immediately (reversible, no prompt). Not yet
+                        // locked → arm a confirmation, since locking
+                        // is observable from the user's side.
+                        if let Some(s) = state.selected().and_then(|i| sessions.get(i)) {
+                            if s.locked {
+                                let pty = s.pty_index;
+                                flash = match send_set_lock(&mut conn, &mut next_id, pty, false).await {
+                                    Ok(()) => Some(format!("unlocked pty {pty}")),
+                                    Err(e) => Some(format!("unlock failed: {e}")),
+                                };
+                                last_refresh = Instant::now() - refresh_interval;
+                            } else {
+                                pending_lock = Some(s.pty_index);
+                            }
                         }
                     }
                     (KeyCode::Char('r'), _) => {
@@ -1314,6 +1370,38 @@ async fn send_kill(
             } if rid == request_id => bail!("daemon: {msg}"),
             other => {
                 tracing::debug!(?other, "tui: ignoring unexpected message during kill");
+            }
+        }
+    }
+}
+
+/// Send a SetLock RPC for `pty` and await the matching reply. Used
+/// by the picker's `l` key (both lock and unlock paths).
+async fn send_set_lock(
+    conn: &mut Conn,
+    next_id: &mut u64,
+    pty: i32,
+    locked: bool,
+) -> Result<()> {
+    let request_id = *next_id;
+    *next_id += 1;
+    conn.send(LocalMessage::Call {
+        request_id,
+        payload: TapRequest::SetLock { pty_index: pty, locked },
+    })
+    .await?;
+    loop {
+        match conn.recv().await? {
+            LocalMessage::Reply {
+                request_id: rid,
+                payload: TapResponse::LockSet { .. },
+            } if rid == request_id => return Ok(()),
+            LocalMessage::Reply {
+                request_id: rid,
+                payload: TapResponse::Error(msg),
+            } if rid == request_id => bail!("daemon: {msg}"),
+            other => {
+                tracing::debug!(?other, "tui: ignoring unexpected message during set_lock");
             }
         }
     }
