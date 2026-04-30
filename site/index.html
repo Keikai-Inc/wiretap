@@ -3,8 +3,8 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>tap — the missing Linux administrator command</title>
-  <meta name="description" content="See every shell on a Linux host. Attach to any of them. Type into them. The multi-user Unix administrator tool that nobody shipped.">
+  <title>tap — system-wide tmux-like session management for Linux administrators</title>
+  <meta name="description" content="tap gives Linux administrators tmux-style control over every shell on the host — list them, peek into them, attach, lock, quarantine, message, kill. Not just the ones you started in tmux. Every shell.">
   <link rel="icon" type="image/x-icon" href="favicon.ico">
   <link rel="icon" type="image/png" sizes="32x32" href="favicon-32x32.png">
   <link rel="apple-touch-icon" sizes="180x180" href="apple-touch-icon.png">
@@ -29,29 +29,33 @@
     }
     .perms-info p {
       color: var(--color-text-secondary);
-      font-size: 0.9rem;
+      font-size: 0.95rem;
       line-height: 1.65;
       margin-bottom: 1.5rem;
     }
-    .perms-list {
-      list-style: none;
-      display: flex;
-      flex-direction: column;
-      gap: 0.75rem;
+
+    .scenarios {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 1.25rem;
     }
-    .perms-list li {
-      display: flex;
-      align-items: flex-start;
-      gap: 0.75rem;
-      color: var(--color-text-secondary);
-      font-size: 0.9rem;
+    .scenario {
+      background: var(--color-surface);
+      border: 1px solid var(--color-border);
+      border-radius: 0.75rem;
+      padding: 1.5rem;
     }
-    .perms-list li::before {
-      content: "\2713";
-      color: var(--color-accent-green);
+    .scenario h3 {
+      font-family: var(--font-display);
       font-weight: 700;
-      flex-shrink: 0;
-      margin-top: 0.1rem;
+      font-size: 1.1rem;
+      margin-bottom: 0.5rem;
+    }
+    .scenario p {
+      color: var(--color-text-secondary);
+      font-size: 0.95rem;
+      line-height: 1.6;
+      margin: 0;
     }
 
     .step-wide h3 {
@@ -68,6 +72,7 @@
 
     @media (max-width: 768px) {
       .perms-grid { grid-template-columns: 1fr; }
+      .scenarios { grid-template-columns: 1fr; }
     }
   </style>
 </head>
@@ -77,12 +82,12 @@
 
   <!-- Hero -->
   <div class="hero">
-    <div class="badge"><span class="dot"></span> The missing Linux administrator command</div>
-    <h1>See every shell. Attach to any.<br><span class="gradient">Type</span> into them.</h1>
-    <p>Linux ships <code>ps</code>, <code>ss</code>, <code>lsof</code>, <code>who</code> — none of them answer the obvious operator question: <em>what is each shell doing right now, and can I jump in?</em> <strong>tap</strong> does. Your sessions if you're you, every session on the host if you're root. <a href="remote.html" style="color: var(--color-primary); font-weight: 500; text-decoration: none;">Remote and AI access via hop &rarr;</a></p>
+    <div class="badge"><span class="dot"></span> System-wide tmux for Linux administrators</div>
+    <h1>Manage every shell<br>on the box. <span class="gradient">Not just yours.</span></h1>
+    <p><strong>tap</strong> is tmux-like session management for Linux sysadmins, except it works across the entire system — including shells nobody started in tmux. List every active session, look at any of them live, attach, type, lock, quarantine, send messages, kill. You don't have to set anything up beforehand. The shells were already running. <a href="remote.html" style="color: var(--color-primary); font-weight: 500; text-decoration: none;">Drive it remotely or hand it to an AI &rarr;</a></p>
     <div class="hero-actions">
       <a href="#install" class="btn btn-primary">Install</a>
-      <a href="#commands" class="btn btn-ghost">Commands</a>
+      <a href="#commands" class="btn btn-ghost">What it does</a>
     </div>
   </div>
 
@@ -90,23 +95,27 @@
   <section id="commands">
     <div class="container">
       <div class="section-header">
-        <h2>What you actually do with it</h2>
-        <p>Pick a session. Attach. Type. Or just look at what every shell is doing.</p>
+        <h2>tmux-style session control, system-wide</h2>
+        <p>Open one menu, see every shell, do what you need to it.</p>
       </div>
 
       <div class="step step-wide" style="margin-bottom: 2rem;">
         <h3>tap<span class="pill">(no args)</span></h3>
-        <p>Live-refreshing picker of every session you can see, with a side panel showing the highlighted session's current screen. Arrow keys to navigate, Enter to attach, <code>q</code> to leave. The tmux-style session switcher Unix has been missing for the shells the user didn't open in tmux.</p>
+        <p>Bring up a tmux-style picker that lists every shell on the host you're allowed to see. Live-refreshing. Side panel shows the highlighted session's screen as it updates. Arrows to navigate. Enter to attach. <code>q</code> to leave.</p>
       </div>
 
       <div class="steps">
         <div class="step">
-          <h3>tap connect N</h3>
-          <p>Attach to pty <code>N</code> like it's your own terminal. Live output to your screen, your keystrokes injected into the session. Detach with <code>Ctrl-T</code> — single keystroke, no tmux overlap. From the picker, <code>Ctrl-T</code> returns you to the menu; <code>q</code> in the menu exits.</p>
+          <h3>Attach to anyone's shell</h3>
+          <p>Press Enter on any session and you're in it like it's your own terminal. Live output, your keystrokes go through. Detach with one keystroke and you're back at the menu, picking the next one.</p>
         </div>
         <div class="step">
-          <h3>tap list</h3>
-          <p>Enumerate active sessions with sticky opener identity, current writer (sudo/setpriv visible inline), byte counters, age, and idle time. Scriptable companion for the picker.</p>
+          <h3>Lock, kill, or send a message</h3>
+          <p>One key freezes the session — the user's typing stops working until you say so. Another key kills it cleanly. Another sends them a visible admin message ("hey, what are you up to?") that lands as terminal output, not as commands their shell would run.</p>
+        </div>
+        <div class="step">
+          <h3>Quarantine and investigate</h3>
+          <p>Suspicious user on your box? One key drops them into a sandboxed honeypot shell that looks like a normal Linux. Their real shell stays frozen behind the scenes. You investigate calmly. If they're legitimate, swap them back. If not, you've stalled the damage while you decide.</p>
         </div>
       </div>
 
@@ -120,14 +129,13 @@
           </div>
           <div class="code-body">
 <span class="prompt">$</span> <span class="cmd">tap</span>
-<span class="comment"># live-refreshing picker, arrow keys to select, Enter to attach</span>
 <span class="output">┌── tap — terminal session picker ────────────────────────────┐</span>
 <span class="output">│ pty   user                comm        out (b/ev)   age      │</span>
 <span class="output">│   3   alice(1000)         bash        12384/421    82s      │</span>
 <span class="output">│ ▶ 4   alice(1000)         vim          2891/14     12s      │</span>
 <span class="output">│   5   bob(1001)           psql           830/9       4s      │</span>
 <span class="output">└─────────────────────────────────────────────────────────────┘</span>
-<span class="output">3 session(s) — ↑/↓ select  Enter=connect  q=quit</span>
+<span class="output">3 session(s) — ↑/↓ select  Enter=connect  l=lock  Q=quarantine  x=kill  q=quit</span>
 
 <span class="comment"># Enter on alice's vim session — bidirectional from here on:</span>
 <span class="output">[tap connect pty=4 — Ctrl-T to detach]</span>
@@ -145,59 +153,34 @@
   <section id="why">
     <div class="container">
       <div class="section-header">
-        <h2>The capability Unix forgot to ship</h2>
-        <p>Decades of admin tools, none of them answer the live-shell question.</p>
+        <h2>The thing you've been missing</h2>
+        <p>Real sysadmin scenarios where tap is the right tool — and the others aren't.</p>
       </div>
 
-      <div class="perms-grid">
-        <div class="perms-info">
-          <h3>What you have today</h3>
-          <p>Linux ships <code>ps</code> for processes, <code>ss</code> and <code>netstat</code> for sockets, <code>lsof</code> for open files, <code>who</code> and <code>w</code> for logged-in users. Each answers one slice of "what's happening on this host." None of them answers the most obvious operator question: <em>what is each shell doing right now, and can I get into one?</em></p>
-
-          <h3>What you've been doing instead</h3>
-          <p>screen and tmux work — but only for sessions you set up inside them ahead of time. They're invisible to a third party joining late. SSH'd-in sessions stay opaque. <code>strace</code>-on-bash works but is brittle, root-only, and breaks when the user reaches for tab completion. Audit logs land hours later and are usually incomplete.</p>
-
-          <h3>What tap does</h3>
-          <p>Every active TTY/PTY on the host, live, by default — including sessions that started before tap was installed (seeded from <code>/proc</code> at daemon start). Attach to any of them. Type into them. Or just look. Same authority model Unix already has: you see your own; root sees everything.</p>
-
-          <ul class="perms-list">
-            <li><strong>Every shell</strong> — including ones screen/tmux can't see</li>
-            <li><strong>Attach live</strong> — type into any session you're allowed to see</li>
-            <li><strong>Snapshot any session</strong> — full SGR-aware screen grab</li>
-            <li><strong>Pre-existing sessions</strong> seeded from <code>/proc</code> at startup</li>
-            <li><strong>Identity follows the opener</strong> — sudo can't sneak past it</li>
-          </ul>
+      <div class="scenarios">
+        <div class="scenario">
+          <h3>"Who's stuck where?"</h3>
+          <p>The build server's slow. Five engineers are SSH'd in. With tap you flip through their shells in seconds and see who's hung on which command. No "can you describe what you're seeing?" pingpong on Slack.</p>
         </div>
-
-        <div>
-          <div class="code-block">
-            <div class="code-header">
-              <span class="code-dot"></span>
-              <span class="code-dot"></span>
-              <span class="code-dot"></span>
-              <span class="code-title">Terminal — what other tools tell you vs. what tap does</span>
-            </div>
-            <div class="code-body">
-<span class="prompt">#</span> <span class="cmd">who</span>
-<span class="output">alice    pts/3        2026-04-29 09:41 (10.0.0.42)</span>
-<span class="output">bob      pts/4        2026-04-29 11:02 (10.0.0.18)</span>
-<span class="comment"># tells you who, not what.</span>
-
-<span class="prompt">#</span> <span class="cmd">ps -t pts/3 -o pid,comm</span>
-<span class="output">  3214 bash</span>
-<span class="output">  3812 vim</span>
-<span class="comment"># tells you the program, not the screen.</span>
-
-<span class="prompt">#</span> <span class="cmd">tap snapshot 3</span>
-<span class="output">snapshot pty=3 (24x80)</span>
-<span class="output">┌──────────────────────────────────────────────────┐</span>
-<span class="output">│alice@web-prod:~$ vim notes.md                    │</span>
-<span class="output">│  3 ## Next sprint — payments hardening           │</span>
-<span class="output">│  4   - rotate signing keys before EOM            │</span>
-<span class="output">└──────────────────────────────────────────────────┘</span>
-<span class="comment"># the actual screen.  followed by `tap connect 3` to type into it.</span>
-            </div>
-          </div>
+        <div class="scenario">
+          <h3>Pairing without screen-share</h3>
+          <p>A junior is debugging on a shared box. Drop into their shell, watch what they're doing, type a hint into their prompt when they get stuck. Like sitting next to them, except you don't have to.</p>
+        </div>
+        <div class="scenario">
+          <h3>Suspicious activity at 2am</h3>
+          <p>A login from a country you don't recognize. Quarantine them into a sandbox. They keep typing into a fake shell while you investigate — without tipping them off. If it was just the user on holiday, hand them back. If not, you've already stopped them from doing damage.</p>
+        </div>
+        <div class="scenario">
+          <h3>Compliance & audit</h3>
+          <p>"Show me what was on screen at 09:42 when the deploy went sideways." tap snapshots any session's current screen. Pair it with a logger and you have byte-faithful records of who saw what, when.</p>
+        </div>
+        <div class="scenario">
+          <h3>Training & onboarding</h3>
+          <p>Watch new hires work through their first real ticket. Type a correction into their shell when they're about to <code>rm</code> something they shouldn't. Send them a "good catch" message via tap when they don't.</p>
+        </div>
+        <div class="scenario">
+          <h3>Forgotten sessions</h3>
+          <p>You SSH in to fix something, forget to detach, walk away. Days later, "is that shell still open?" — yes, and tap will tell you, snapshot what's on it, and let you close it cleanly without having to find which terminal window you left it in.</p>
         </div>
       </div>
     </div>
@@ -208,7 +191,7 @@
     <div class="container">
       <div class="section-header">
         <h2>Install</h2>
-        <p>One curl. Linux-only — eBPF needs a Linux kernel.</p>
+        <p>One curl. Linux only.</p>
       </div>
 
       <div style="max-width: 44rem; margin: 0 auto;">
@@ -219,7 +202,7 @@
         <div id="tap-cast" style="border-radius: 0.5rem; overflow: hidden;"></div>
 
         <p style="text-align: center; color: var(--color-text-secondary); font-size: 0.875rem; margin-top: 1.5rem;">
-          The installer drops the daemon under systemd and the <code>tap</code> CLI in <code>/usr/local/bin</code>. Nothing to configure — <code>tap</code> works the moment install finishes.
+          Installs in seconds. Runs as a service. Nothing to configure — type <code>tap</code> and you're in.
         </p>
       </div>
     </div>
@@ -230,19 +213,19 @@
     <div class="container">
       <div class="section-header">
         <h2>Your shells, or all shells if you're root</h2>
-        <p>The same authority model Unix has had since 1969. No new ACLs, no key management.</p>
+        <p>The same authority model Linux has always had. No new ACLs, no new keys, no new accounts.</p>
       </div>
 
       <div class="perms-grid">
         <div class="perms-info">
-          <h3>The rule</h3>
-          <p>Root sees and acts on every session. Non-root users see and act on only the sessions they opened. The kernel tells the daemon who's connecting (<code>SO_PEERCRED</code> on the local socket) — there's no key management, no on-the-wire claim a client could lie about.</p>
+          <h3>You see what's yours</h3>
+          <p>If you're alice, <code>tap</code> shows alice's shells. You can attach, lock, message, kill the sessions you opened — but not anyone else's. They don't even appear in the list.</p>
 
-          <h3>Sticky opener identity</h3>
-          <p>Every session remembers who opened it. <code>sudo</code> in the middle of a session doesn't change ownership for tap's purposes — alice's session is alice's session even when she's running root commands inside it. So a user can't escape their scope by escalating mid-session, and root can still see exactly when the privilege transition happened.</p>
+          <h3>Root sees everything</h3>
+          <p>If you're root, you see every shell on the host and have every operation available against each of them. The same way root can read any file or signal any process. tap inherits that authority — it doesn't invent a new one.</p>
 
-          <h3>Same denial wording</h3>
-          <p>Probing a pty you can't see returns the same error as probing one that doesn't exist. So a non-root user can't enumerate other users' sessions by trying every pty number.</p>
+          <h3>Identity sticks to the session</h3>
+          <p>alice's session is alice's session even when she <code>sudo</code>'s. So a user can't escape your view by escalating privileges, and you always know whose terminal you're attached to.</p>
         </div>
 
         <div>
@@ -251,7 +234,7 @@
               <span class="code-dot"></span>
               <span class="code-dot"></span>
               <span class="code-dot"></span>
-              <span class="code-title">Terminal — same daemon, two callers</span>
+              <span class="code-title">Terminal — same machine, two callers</span>
             </div>
             <div class="code-body">
 <span class="comment"># root sees every session</span>
@@ -265,7 +248,7 @@
 <span class="output">1 active session(s):</span>
 <span class="output">  pty=3  user=alice(1000)  comm=vim   ...</span>
 
-<span class="comment"># probing bob's pty: same error as one that doesn't exist</span>
+<span class="comment"># trying to look at bob's: same response as one that doesn't exist.</span>
 <span class="prompt">alice$</span> <span class="cmd">tap snapshot 4</span>
 <span class="output">error: no active session with pty_index=4</span>
             </div>
@@ -280,7 +263,7 @@
     <div class="container">
       <div style="background: var(--color-surface); border: 1px solid var(--color-border); border-radius: 1rem; padding: 3rem; text-align: center;">
         <h2 style="font-family: var(--font-display); font-weight: 800; font-size: 1.5rem; margin-bottom: 0.75rem;">Linux only</h2>
-        <p style="color: var(--color-text-secondary); font-size: 0.95rem; line-height: 1.65; max-width: 36rem; margin: 0 auto 1.5rem;">tap rides Linux's pty subsystem via eBPF. macOS and Windows are out of scope for the daemon. Want to drive tap from another machine? <a href="remote.html" style="color: var(--color-primary); font-weight: 500;">Pair it with hop</a> for authenticated remote and AI-driven access from any client OS.</p>
+        <p style="color: var(--color-text-secondary); font-size: 0.95rem; line-height: 1.65; max-width: 36rem; margin: 0 auto 1.5rem;">tap runs on the host the shells live on. Linux for now — macOS and Windows aren't supported on the host side. You can drive tap from any OS, though: <a href="remote.html" style="color: var(--color-primary); font-weight: 500;">pair it with hop</a> for authenticated remote access and AI-driven session management from anywhere.</p>
         <div style="display: flex; gap: 1rem; justify-content: center; flex-wrap: wrap;">
           <a href="#install" class="btn btn-primary">Install</a>
           <a href="remote.html" class="btn btn-ghost">Remote / AI &rarr;</a>

@@ -3,8 +3,8 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>tap — Remote &amp; AI access via hop</title>
-  <meta name="description" content="Pair tap with hop to drive Linux session audit from anywhere — including from AI agents through hop's MCP integration.">
+  <title>tap — drive every shell on every box from anywhere</title>
+  <meta name="description" content="Pair tap with hop and run the same session-management commands across your whole Linux fleet — from your laptop, or hand them to an AI agent.">
   <link rel="icon" type="image/x-icon" href="favicon.ico">
   <link rel="icon" type="image/png" sizes="32x32" href="favicon-32x32.png">
   <link rel="apple-touch-icon" sizes="180x180" href="apple-touch-icon.png">
@@ -30,14 +30,39 @@
     }
     .relationship-info p {
       color: var(--color-text-secondary);
-      font-size: 0.9rem;
+      font-size: 0.95rem;
       line-height: 1.65;
       margin-bottom: 1.5rem;
+    }
+
+    .scenarios {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 1.25rem;
+    }
+    .scenario {
+      background: var(--color-surface);
+      border: 1px solid var(--color-border);
+      border-radius: 0.75rem;
+      padding: 1.5rem;
+    }
+    .scenario h3 {
+      font-family: var(--font-display);
+      font-weight: 700;
+      font-size: 1.1rem;
+      margin-bottom: 0.5rem;
+    }
+    .scenario p {
+      color: var(--color-text-secondary);
+      font-size: 0.95rem;
+      line-height: 1.6;
+      margin: 0;
     }
 
     @media (max-width: 768px) {
       .steps-3 { grid-template-columns: 1fr; }
       .relationship-grid { grid-template-columns: 1fr; }
+      .scenarios { grid-template-columns: 1fr; }
     }
   </style>
 </head>
@@ -47,12 +72,12 @@
 
   <!-- Hero -->
   <div class="hero">
-    <div class="badge"><span class="dot"></span> Remote &amp; Agentic Access · via hop</div>
-    <h1>Same tap,<br><span class="gradient">from anywhere</span></h1>
-    <p>Install <a href="https://hop.keik.ai" style="color: var(--color-primary); font-weight: 500;">hop</a> alongside tap and your Linux host's session inventory becomes available to authenticated peers — operators on a laptop, AI agents through MCP, fleet automation. Same kernel capture, same opener-attribution, same audit trail. tap stays a local-first Linux tool; hop adds the network layer.</p>
+    <div class="badge"><span class="dot"></span> Same tap, every box, every operator</div>
+    <h1>Run tap on your<br><span class="gradient">whole fleet</span></h1>
+    <p>tap on its own is for one machine. Install <a href="https://hop.keik.ai" style="color: var(--color-primary); font-weight: 500;">hop</a> alongside it and the same session-management commands work across every Linux host you operate — from your laptop, your phone, or an AI agent acting on your behalf. List shells across the fleet. Attach to one. Lock it. Quarantine it. Send a message. Same operations, just with a host name in front.</p>
     <div class="hero-actions">
       <a href="#setup" class="btn btn-primary">Setup</a>
-      <a href="#agents" class="btn btn-ghost">AI &amp; MCP</a>
+      <a href="#agents" class="btn btn-ghost">AI agents</a>
     </div>
   </div>
 
@@ -60,18 +85,18 @@
   <section id="relationship">
     <div class="container">
       <div class="section-header">
-        <h2>Where each tool fits</h2>
-        <p>tap is a Linux audit primitive. hop is a peer-to-peer fleet runtime. They're independent products that compose cleanly.</p>
+        <h2>What each tool does</h2>
+        <p>tap manages shells on a host. hop connects you to hosts. Together: shell management for your fleet.</p>
       </div>
 
       <div class="relationship-grid">
         <div class="relationship-info">
           <h3>tap, by itself</h3>
-          <p>A local Linux daemon plus a CLI. Captures every TTY/PTY via eBPF, exposes a permission-aware Unix socket, lets root and individual users audit the sessions they own. Doesn't reach off the host. Doesn't have a network stack at all.</p>
+          <p>Manages every shell on the machine it's installed on. You run it on the host you're standing on (or SSH'd into) and you operate against that host's sessions. No network involved.</p>
           <h3>hop, by itself</h3>
-          <p>A peer-to-peer remote-access daemon. QUIC over <a href="https://github.com/n0-computer/iroh">iroh</a>, Ed25519 identities, an extension protocol for plugins, an MCP server for AI agents, a JS runtime for capabilities. Doesn't know anything about your terminals.</p>
+          <p>Lets you reach your hosts from anywhere — laptop, phone, another server, AI agent — without setting up VPNs, port forwards, or static IPs. Your hosts and your devices recognize each other; the connection just works.</p>
           <h3>tap + hop</h3>
-          <p>tap registers with hop as an extension (manifest at <code>/etc/hop/extensions/tap-terminal.toml</code>). hop relays peer-authenticated requests to tap's daemon over a Unix-domain ipc-channel. tap applies hop's peer/role identity to its existing scope check — no new permission model, just the same opener-aware filtering keyed on the calling peer's identity.</p>
+          <p>tap's commands gain a host argument. <code>hop &lt;host&gt; tap list</code> shows that host's shells from your laptop. <code>hop &lt;host&gt; tap connect 4</code> drops you into a shell on the other side of the world. Multiply by every host on your fleet.</p>
         </div>
 
         <div>
@@ -80,30 +105,53 @@
               <span class="code-dot"></span>
               <span class="code-dot"></span>
               <span class="code-dot"></span>
-              <span class="code-title">Architecture — tap + hop</span>
+              <span class="code-title">From your laptop</span>
             </div>
-            <div class="code-body" style="font-family: var(--font-mono); font-size: 0.78rem; line-height: 1.5;">
-<span class="comment">  +-------------------- Laptop / agent host -----------------+</span>
-<span class="comment">  |                                                          |</span>
-<span class="comment">  |  hop &lt;target&gt; tap list / snapshot / watch                |</span>
-<span class="comment">  |  hop mcp        (Claude / Cursor / etc. via MCP)         |</span>
-<span class="comment">  +-----------------------|----------------------------------+</span>
-<span class="comment">                          | iroh QUIC, peer-authenticated</span>
-<span class="comment">                          v</span>
-<span class="comment">  +------------------ Linux host ----------------------------+</span>
-<span class="comment">  |                                                          |</span>
-<span class="comment">  |   hop host (systemd, listens for peer connections)       |</span>
-<span class="comment">  |    |                                                     |</span>
-<span class="comment">  |    | ipc-channel (manifest rendezvous)                   |</span>
-<span class="comment">  |    v                                                     |</span>
-<span class="comment">  |   hop-tap-d ────── /run/hop-tap/local.sock (SO_PEERCRED) |</span>
-<span class="comment">  |    |                ^                                    |</span>
-<span class="comment">  |    | eBPF kprobes   |                                    |</span>
-<span class="comment">  |    v                |                                    |</span>
-<span class="comment">  |   kernel pty subsystem    tap (local CLI)                |</span>
-<span class="comment">  +----------------------------------------------------------+</span>
+            <div class="code-body">
+<span class="comment"># list every shell across the fleet</span>
+<span class="prompt">$</span> <span class="cmd">hop</span> <span class="flag">prod-web-1</span> tap list
+<span class="output">  pty=3  alice(1000)  bash   ...</span>
+<span class="output">  pty=4  alice(1000)  vim    ...</span>
+
+<span class="prompt">$</span> <span class="cmd">hop</span> <span class="flag">prod-db-2</span> tap list
+<span class="output">  pty=2  bob(1001)    psql   ...</span>
+
+<span class="comment"># attach to alice's vim, halfway around the world</span>
+<span class="prompt">$</span> <span class="cmd">hop</span> <span class="flag">prod-web-1</span> tap connect <span class="flag">4</span>
+<span class="output">  1 # Project plan</span>
+<span class="output">  2 ## Next sprint</span>
+<span class="comment"># your keystrokes go straight in. Ctrl-T to detach.</span>
             </div>
           </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Why this is useful -->
+  <section id="scenarios">
+    <div class="container">
+      <div class="section-header">
+        <h2>Why an admin would want this</h2>
+        <p>The same scenarios as local tap, except now they work across every machine you run.</p>
+      </div>
+
+      <div class="scenarios">
+        <div class="scenario">
+          <h3>Triage from your couch</h3>
+          <p>PagerDuty fires at 2am. Open your laptop on the kitchen counter, list shells across the affected hosts, see who else is already on the box, jump in next to them. No VPN dance, no jumphost.</p>
+        </div>
+        <div class="scenario">
+          <h3>One pane for the whole fleet</h3>
+          <p>Pull up the picker for any host with a host name. The same keystrokes — Enter, lock, kill, quarantine — work everywhere. You don't learn a new tool per environment.</p>
+        </div>
+        <div class="scenario">
+          <h3>Help a junior across geographies</h3>
+          <p>An engineer in another timezone is stuck on a staging server. From your machine, attach to their shell, type a hint, send them an admin message. Like sitting next to them, except one of you is in Berlin.</p>
+        </div>
+        <div class="scenario">
+          <h3>Investigate without touching the box</h3>
+          <p>Suspicious activity on a production host. Watch the live shell from your laptop. If you decide to act, quarantine them — same one-key flow as local — without ever needing to be physically on the host.</p>
         </div>
       </div>
     </div>
@@ -114,24 +162,24 @@
     <div class="container">
       <div class="section-header">
         <h2>Setup — three steps</h2>
-        <p>Install order matters: bring up hop first so tap's installer registers the extension automatically.</p>
+        <p>Install hop on the host first, then tap. tap recognizes hop and wires itself in automatically.</p>
       </div>
 
       <div class="steps steps-3">
         <div class="step">
           <h3>Install hop</h3>
-          <p>One curl. Sets up the host daemon and prints a creator invite token for first-time pairing.</p>
+          <p>One curl. Sets up the host so it's reachable from your other devices and prints an invite token for first-time pairing.</p>
           <div style="margin-top: 0.75rem;"><code>curl -fsSL https://hop.keik.ai/install-daemon.sh | bash</code></div>
         </div>
         <div class="step">
           <h3>Install tap</h3>
-          <p>One curl. Detects the running hop daemon and registers itself as an extension automatically.</p>
+          <p>One curl. Detects hop and registers itself. Now tap is reachable from anywhere your hop is.</p>
           <div style="margin-top: 0.75rem;"><code>curl -fsSL https://tap.keik.ai/install.sh | bash</code></div>
         </div>
         <div class="step">
           <h3>Pair, then drive</h3>
-          <p>Redeem the invite from your laptop, then run any tap command remotely.</p>
-          <div style="margin-top: 0.75rem;"><code>hop connect &lt;invite-token&gt;<br>hop &lt;host&gt; tap list</code></div>
+          <p>Redeem the invite from your laptop, give the host a name, and run any tap command against it.</p>
+          <div style="margin-top: 0.75rem;"><code>hop connect &lt;invite-token&gt;<br>hop &lt;host&gt; tap</code></div>
         </div>
       </div>
 
@@ -141,24 +189,18 @@
             <span class="code-dot"></span>
             <span class="code-dot"></span>
             <span class="code-dot"></span>
-            <span class="code-title">Terminal — remote audit</span>
+            <span class="code-title">Terminal — managing a remote host's shells</span>
           </div>
           <div class="code-body">
-<span class="prompt">$</span> <span class="cmd">hop</span> <span class="flag">myserver</span> ext list
-<span class="output">  tap.terminal (active)  Terminal session capture via eBPF</span>
-
 <span class="prompt">$</span> <span class="cmd">hop</span> <span class="flag">myserver</span> tap list
 <span class="output">2 active session(s):</span>
-<span class="output">  pty=  3  user=alice(1000)    comm=bash      pid=  3214  ...</span>
-<span class="output">  pty=  4  opener=alice(1000)  writer=root(0)  comm=sudo  ...</span>
+<span class="output">  pty=3  user=alice(1000)    comm=bash    ...</span>
+<span class="output">  pty=4  opener=alice(1000)  writer=root  comm=sudo  ...</span>
 
-<span class="prompt">$</span> <span class="cmd">hop</span> <span class="flag">myserver</span> tap snapshot <span class="flag">3</span>
-<span class="output">snapshot pty=3 (24x80)</span>
-<span class="output">┌─...</span>
+<span class="prompt">$</span> <span class="cmd">hop</span> <span class="flag">myserver</span> tap connect <span class="flag">4</span>
+<span class="comment"># attach to a remote shell as if it were a local one</span>
 
-<span class="prompt">$</span> <span class="cmd">hop</span> <span class="flag">myserver</span> tap watch <span class="flag">3</span>
-<span class="output">(stream 1 opened)</span>
-<span class="comment"># Live byte stream over QUIC, rendered natively by your terminal.</span>
+<span class="prompt">$</span> <span class="cmd">hop</span> <span class="flag">myserver</span> tap     <span class="comment"># picker, but for the remote host</span>
           </div>
         </div>
       </div>
@@ -169,41 +211,36 @@
   <section id="hop-permissions">
     <div class="container">
       <div class="section-header">
-        <h2>The permission model, networked</h2>
-        <p>tap's local "root sees all, users see their own" model lifts to "<strong>creator role sees all, peer role sees their own opener_username</strong>" when called through hop.</p>
+        <h2>Authority follows you across hosts</h2>
+        <p>The same "your shells, or all shells if you're the admin" rule, just keyed on who you are to hop instead of who you are to that host's Unix.</p>
       </div>
 
-      <div class="grid grid-2">
-        <div class="card card-amber">
-          <div class="card-icon card-icon-amber">
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
-          </div>
-          <h3>creator role</h3>
-          <p>Admin tier. The peer who originally bootstrapped the host (and anyone they explicitly grant the role to). Sees every active session, can subscribe to any pty's live byte stream, can snapshot anything.</p>
+      <div class="relationship-grid">
+        <div class="relationship-info">
+          <h3>Admin operators see everything</h3>
+          <p>If you're the admin of the fleet (the person who set up the host, or someone you've explicitly given that role to), you see every shell on every host you can reach. Same as being root locally — just from your laptop.</p>
+          <h3>Scoped operators see their own</h3>
+          <p>If a teammate has access only as a regular user, they see only the shells they themselves opened on that host. They can manage their own work; they can't peek at anyone else's. You set the role when you invite them.</p>
+          <h3>You can't enumerate by guessing</h3>
+          <p>If a session isn't yours to see, tap responds the same way as if it didn't exist. So a curious peer can't just probe pty numbers to find out what other people are running.</p>
         </div>
 
-        <div class="card card-teal">
-          <div class="card-icon card-icon-teal">
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
+        <div class="grid grid-2" style="gap: 1rem;">
+          <div class="card card-amber">
+            <div class="card-icon card-icon-amber">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+            </div>
+            <h3>Admin role</h3>
+            <p>Full visibility. List, attach, lock, quarantine, kill, message — every shell on every host you can reach.</p>
           </div>
-          <h3>peer role</h3>
-          <p>Default for invited users. tap's scope check matches <code>peer_username</code> (forwarded from hop's authenticated dispatcher) against each session's <code>opener_username</code>. Same sticky-opener semantics as local — sudo can't escape your scope.</p>
-        </div>
 
-        <div class="card card-red">
-          <div class="card-icon card-icon-red">
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+          <div class="card card-teal">
+            <div class="card-icon card-icon-teal">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
+            </div>
+            <h3>User role</h3>
+            <p>Same operations, scoped to your own sessions. Useful for self-management or for letting a teammate manage their own work without giving them the keys to the box.</p>
           </div>
-          <h3>Same denial wording</h3>
-          <p>Forbidden snapshot/watch returns the same error as a non-existent pty. Peers can't enumerate other users' active sessions by probing — both tiers, locally and remote.</p>
-        </div>
-
-        <div class="card card-green">
-          <div class="card-icon card-icon-green">
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
-          </div>
-          <h3>Trust boundary</h3>
-          <p>tap trusts hop's peer authentication (Ed25519 + invite tokens) as forwarded in <code>ExtMessage::Request</code>'s <code>peer_role</code>. tap doesn't re-verify identity — that's hop's job, and tap inherits the verdict.</p>
         </div>
       </div>
     </div>
@@ -213,23 +250,18 @@
   <section id="agents">
     <div class="container">
       <div class="section-header">
-        <h2>AI agents, via hop's MCP</h2>
-        <p>hop ships an MCP server. Agents that speak <a href="https://modelcontextprotocol.io">Model Context Protocol</a> — Claude, Cursor, Code editors with MCP support — get tap as a tool.</p>
+        <h2>Hand it to an AI agent</h2>
+        <p>Anywhere a person can drive tap remotely, an AI agent can too. Same operations, same permissions, same audit.</p>
       </div>
 
       <div class="relationship-grid">
         <div class="relationship-info">
-          <h3>How agents see tap</h3>
-          <p>An AI agent connecting to <code>hop mcp</code> can list sessions, request snapshots, and subscribe to live streams the same way a human peer can. The MCP boundary is the same QUIC-authenticated boundary peers use; the agent's identity is the agent's hop peer.</p>
-          <h3>What you'd build with it</h3>
-          <p>A Claude agent watching production hosts for anomalies (long-running sudo, unexpected scrub of audit logs, unusual command patterns). A code-review bot that pulls the most recent shell session of an SRE for context when triaging. Auto-narrated incident timelines, generated from session-replay snapshots.</p>
+          <h3>What the agent can do</h3>
+          <p>List sessions across your fleet. Snapshot any of them. Subscribe to a live stream and summarize what's happening on a shell. Decide whether to alert you, lock the session, or quarantine it. Whatever a human admin can do, an agent with the same role can do.</p>
+          <h3>What you'd build</h3>
+          <p>An overnight watcher that scans for unusual command patterns and pages you only when something's worth waking up for. A code-review companion that pulls up the most recent shell session of an SRE for context. An onboarding bot that watches new hires' first session on prod and intervenes before <code>rm -rf</code> ever lands.</p>
           <h3>Same trust gradient</h3>
-          <p>An agent peer running with <code>creator</code> role sees everything, naturally. A scoped agent (peer role, pinned to a specific username) sees only that user's sessions — useful for self-audit agents the user runs against their own activity.</p>
-          <ul style="list-style: none; padding: 0; display: flex; flex-direction: column; gap: 0.5rem;">
-            <li style="color: var(--color-text-secondary); font-size: 0.9rem;">→ Agent observes; doesn't drive (no input injection in v1)</li>
-            <li style="color: var(--color-text-secondary); font-size: 0.9rem;">→ Snapshots are bytes, not LLM-summarized; agent runs its own model</li>
-            <li style="color: var(--color-text-secondary); font-size: 0.9rem;">→ Audit trail is hop's existing peer-event log; agent activity is logged like any other peer</li>
-          </ul>
+          <p>An agent gets a role just like a person does. Give it the admin role and it sees everything. Pin it to a single user and it sees only that user's shells — useful for self-audit agents the user runs against their own activity.</p>
         </div>
 
         <div>
@@ -238,27 +270,21 @@
               <span class="code-dot"></span>
               <span class="code-dot"></span>
               <span class="code-dot"></span>
-              <span class="code-title">MCP — agent calling tap through hop</span>
+              <span class="code-title">An AI agent monitoring shells across the fleet</span>
             </div>
             <div class="code-body">
-<span class="comment">// AI agent (Claude Code, etc.) starts an MCP session</span>
-<span class="comment">// against the local hop daemon. From the agent's POV:</span>
+<span class="comment">// Agent wakes every 5 minutes, scans every host's shells</span>
+<span class="comment">// for the things you taught it to care about.</span>
 
-agent.tools.call(<span class="flag">"hop_remote"</span>, {
-    target: <span class="flag">"prod-web-1"</span>,
-    cmd: <span class="flag">"tap list"</span>,
-});
-
-<span class="comment">// Agent can iterate. Watch a session for 30 seconds,</span>
-<span class="comment">// summarise what's happening, decide whether to alert.</span>
-
-<span class="cmd">var</span> sessions = JSON.parse(stream.list);
-<span class="cmd">for</span> (s of sessions.filter(s => s.opener_username === <span class="flag">"alice"</span>)) {
-    <span class="cmd">var</span> snap = agent.tools.call(<span class="flag">"hop_remote"</span>, {
-        target: <span class="flag">"prod-web-1"</span>,
-        cmd: `tap snapshot ${s.pty_index}`,
-    });
-    <span class="comment">// LLM analyses snap, decides if interesting</span>
+<span class="cmd">for</span> host of fleet {
+    sessions = hop[host].tap.list()
+    <span class="cmd">for</span> s of sessions {
+        screen = hop[host].tap.snapshot(s.pty)
+        <span class="cmd">if</span> looks_suspicious(screen) {
+            page_oncall(host, s, screen)
+            hop[host].tap.lock(s.pty)
+        }
+    }
 }
             </div>
           </div>
@@ -272,7 +298,7 @@ agent.tools.call(<span class="flag">"hop_remote"</span>, {
     <div class="container">
       <div style="background: var(--color-surface); border: 1px solid var(--color-border); border-radius: 1rem; padding: 3rem; text-align: center;">
         <h2 style="font-family: var(--font-display); font-weight: 800; font-size: 1.5rem; margin-bottom: 0.75rem;">Ready to wire it up?</h2>
-        <p style="color: var(--color-text-secondary); font-size: 0.95rem; line-height: 1.65; max-width: 32rem; margin: 0 auto 1.5rem;">Both tools are independent, single-binary installs. Bring up hop first, then tap; the extension wires itself in automatically. Same audit story, networked.</p>
+        <p style="color: var(--color-text-secondary); font-size: 0.95rem; line-height: 1.65; max-width: 32rem; margin: 0 auto 1.5rem;">Two single-curl installs. Bring up hop on your hosts first, then tap. Pair from your laptop, and the picker works for the whole fleet.</p>
         <div style="display: flex; gap: 1rem; justify-content: center; flex-wrap: wrap;">
           <a href="https://hop.keik.ai" class="btn btn-primary">hop &rarr;</a>
           <a href="index.html" class="btn btn-ghost">tap, locally</a>
