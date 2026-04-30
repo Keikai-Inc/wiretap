@@ -82,19 +82,16 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    // No subcommand → run the TUI picker. The picker may return a
-    // follow-up action (Connect/Watch/Snapshot a chosen pty) which
-    // we run after tearing down the TUI.
-    let cmd = match args.cmd {
-        Some(c) => c,
-        None => match run_tui(&args.socket).await? {
-            Some(TuiAction::Connect(pty)) => Cmd::Connect { pty },
-            Some(TuiAction::Watch(pty)) => Cmd::Watch { pty },
-            Some(TuiAction::Snapshot(pty)) => Cmd::Snapshot { pty },
-            None => return Ok(()),
-        },
-    };
+    // No subcommand → loop the picker: pick a session, run the
+    // chosen action, when it returns (Ctrl-B d / Esc / etc) re-enter
+    // the picker. The user only leaves by pressing q in the picker
+    // itself. Direct subcommands (`tap watch 3`) bypass the loop and
+    // dispatch once like before.
+    if args.cmd.is_none() {
+        return picker_loop(&args.socket).await;
+    }
 
+    let cmd = args.cmd.unwrap();
     let stream = UnixStream::connect(&args.socket).await.with_context(|| {
         format!(
             "connecting to {}\n(is hop-tap-d running?  `sudo systemctl status hop-tap`)",
@@ -104,9 +101,7 @@ async fn main() -> Result<()> {
 
     let mut next_id = 1u64;
     match cmd {
-        // Connect takes ownership of the stream so it can split it
-        // into owned read/write halves and run the bidirectional loop.
-        Cmd::Connect { pty } => connect(stream, &mut next_id, pty).await,
+        Cmd::Connect { pty } => connect(stream, &mut next_id, pty, false).await,
         cmd => {
             let mut conn = Conn::new(stream);
             match cmd {
@@ -123,6 +118,63 @@ async fn main() -> Result<()> {
                 Cmd::Repl => repl(&mut conn, &mut next_id).await,
                 Cmd::Connect { .. } => unreachable!(),
             }
+        }
+    }
+}
+
+/// Loop: pick a session in the TUI → run the action → re-enter the
+/// TUI. Exits cleanly when the user presses q in the picker. Errors
+/// from a single action (e.g. connect failed because pty went away
+/// mid-attach) are surfaced briefly and don't break the loop.
+async fn picker_loop(socket: &std::path::Path) -> Result<()> {
+    use std::io::Write as _;
+
+    loop {
+        let action = run_tui(socket).await?;
+        let action = match action {
+            Some(a) => a,
+            None => return Ok(()),
+        };
+
+        // Each action gets a fresh stream — the picker reuses one
+        // for List polling, but connect/watch/snapshot are
+        // self-contained and the daemon's per-connection auth is
+        // re-evaluated on each open.
+        let stream = match UnixStream::connect(socket).await {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("\r\n[connection error: {e}]\r");
+                continue;
+            }
+        };
+
+        let mut next_id = 1u64;
+        let result: Result<()> = match action {
+            TuiAction::Connect(pty) => connect(stream, &mut next_id, pty, false).await,
+            TuiAction::Watch(pty) => connect(stream, &mut next_id, pty, true).await,
+            TuiAction::Snapshot(pty) => {
+                let mut conn = Conn::new(stream);
+                let r = one_shot(
+                    &mut conn,
+                    &mut next_id,
+                    TapRequest::Snapshot { pty_index: pty },
+                )
+                .await;
+                // Pause so the user can read the snapshot before the
+                // picker re-enters and clears the screen with its
+                // alt-screen swap.
+                eprint!("\n[press enter to return to picker] ");
+                std::io::stderr().flush().ok();
+                let mut buf = String::new();
+                let _ = std::io::stdin().read_line(&mut buf);
+                r
+            }
+        };
+        if let Err(e) = result {
+            eprintln!("\r\n[action error: {e}]\r");
+            // Brief pause so the message isn't immediately wiped by
+            // the picker's redraw.
+            tokio::time::sleep(std::time::Duration::from_millis(800)).await;
         }
     }
 }
@@ -413,7 +465,8 @@ async fn recv_local(read: &mut OwnedReadHalf) -> Result<LocalMessage> {
     Ok(msg)
 }
 
-/// `tap connect <pty>` — bidirectional attach.
+/// `tap connect <pty>` (and the picker's Watch entry) — attach to a
+/// session in the local terminal.
 ///
 /// 1. Open a Subscribe stream so we receive Output frames just like
 ///    `watch`. The Initial frame gives us a render of the current
@@ -425,10 +478,18 @@ async fn recv_local(read: &mut OwnedReadHalf) -> Result<LocalMessage> {
 ///    machine (Ctrl-B then 'd' → Detach event; bare Ctrl-B held one
 ///    keystroke and emitted on the next non-'d' byte).
 /// 4. The main task selects between incoming server frames (write to
-///    stdout) and stdin events (send Inject Calls). Either side
-///    closing or a Detach event ends the loop; the RawModeGuard
-///    restores the terminal on the way out.
-async fn connect(stream: UnixStream, next_id: &mut u64, pty: i32) -> Result<()> {
+///    stdout) and stdin events. In read-write mode, stdin bytes go
+///    out as Inject Calls; in read_only mode they're dropped except
+///    for the detach trigger (and Ctrl-C also detaches in read-only,
+///    since there's nothing to forward it to).
+/// 5. Either side closing or a Detach event ends the loop; the
+///    RawModeGuard restores the terminal on the way out.
+async fn connect(
+    stream: UnixStream,
+    next_id: &mut u64,
+    pty: i32,
+    read_only: bool,
+) -> Result<()> {
     let (mut read_half, mut write_half) = stream.into_split();
 
     // 1. Subscribe to the watch stream and confirm the daemon
@@ -465,7 +526,12 @@ async fn connect(stream: UnixStream, next_id: &mut u64, pty: i32) -> Result<()> 
     // 2. Raw mode + Drop-guarded restore.
     crossterm::terminal::enable_raw_mode().context("enable raw mode")?;
     let _raw = RawModeGuard;
-    eprintln!("\r\n[tap connect pty={pty} — detach with Ctrl-B d]\r\n");
+    let mode_label = if read_only { "watch (read-only)" } else { "connect" };
+    let extra = if read_only { ", Ctrl-C also detaches" } else { "" };
+    eprintln!(
+        "\r\n[tap {mode_label} pty={pty} — Ctrl-B d to detach{extra}; \
+         Ctrl-B Ctrl-B sends a literal Ctrl-B (e.g. for inner tmux)]\r\n"
+    );
 
     // 3. Blocking stdin reader on a dedicated thread. tokio::io::stdin
     //    is blocking-on-a-thread under the hood anyway, and doing it
@@ -473,7 +539,7 @@ async fn connect(stream: UnixStream, next_id: &mut u64, pty: i32) -> Result<()> 
     //    state machine without an extra layer.
     let (stdin_tx, mut stdin_rx) = mpsc::unbounded_channel::<StdinEvent>();
     std::thread::spawn(move || {
-        stdin_reader_loop(stdin_tx);
+        stdin_reader_loop(stdin_tx, read_only);
     });
 
     // 4. Main multiplex loop. Use a separate request_id space for
@@ -488,6 +554,13 @@ async fn connect(stream: UnixStream, next_id: &mut u64, pty: i32) -> Result<()> 
             // chatty session — we want responsive typing.
             evt = stdin_rx.recv() => match evt {
                 Some(StdinEvent::Bytes(b)) => {
+                    if read_only {
+                        // In watch mode we drop typed bytes — there's no
+                        // session input channel. The detach hotkey still
+                        // works because the reader thread converts it to
+                        // a separate event before we ever see Bytes.
+                        continue;
+                    }
                     inject_id = inject_id.wrapping_add(1);
                     if let Err(e) = send_local(
                         &mut write_half,
@@ -817,14 +890,29 @@ async fn refresh_sessions(
 
 /// Blocking stdin-byte reader. Runs on its own OS thread.
 ///
-/// Reads raw bytes from FD 0 and forwards them as `StdinEvent::Bytes`,
-/// except for the detach sequence (Ctrl-B then 'd') which produces
-/// `StdinEvent::Detach`. A bare Ctrl-B is held back one keystroke; if
-/// the next byte isn't 'd', we emit Ctrl-B followed by that byte —
-/// so users who legitimately need Ctrl-B (rare in modern shells) only
-/// pay a one-keystroke latency.
-fn stdin_reader_loop(tx: mpsc::UnboundedSender<StdinEvent>) {
+/// State machine for the Ctrl-B prefix:
+///
+///   bare Ctrl-B → arm; hold the byte, peek at the next one
+///   armed + 'd'      → `StdinEvent::Detach` (and we're done)
+///   armed + Ctrl-B   → emit ONE literal Ctrl-B and disarm. This is
+///                      tmux's `send-prefix` convention: doubling the
+///                      prefix sends a single literal prefix byte to
+///                      the remote. So `Ctrl-B Ctrl-B d` sends
+///                      `Ctrl-B d` to the session, which is how the
+///                      user detaches an *inner* tmux without tap
+///                      eating the sequence.
+///   armed + other    → emit the held Ctrl-B followed by the byte,
+///                      disarm. Lets normal `Ctrl-B <key>` chords
+///                      reach the remote with one keystroke of latency.
+///
+/// In `read_only` mode (tap watch and the picker's "watch" entry), a
+/// bare Ctrl-C also produces `StdinEvent::Detach` — there's no remote
+/// to forward it to and users expect Ctrl-C to exit. In read-write
+/// mode Ctrl-C is forwarded to the session unchanged so the user can
+/// interrupt remote processes.
+fn stdin_reader_loop(tx: mpsc::UnboundedSender<StdinEvent>, read_only: bool) {
     const CTRL_B: u8 = 0x02;
+    const CTRL_C: u8 = 0x03;
     let mut buf = [0u8; 1024];
     let mut detach_armed = false;
     loop {
@@ -845,18 +933,37 @@ fn stdin_reader_loop(tx: mpsc::UnboundedSender<StdinEvent>) {
         for &b in &buf[..n as usize] {
             if detach_armed {
                 detach_armed = false;
-                if b == b'd' {
-                    if !out.is_empty() {
-                        let _ = tx.send(StdinEvent::Bytes(out));
+                match b {
+                    b'd' => {
+                        if !out.is_empty() {
+                            let _ = tx.send(StdinEvent::Bytes(out));
+                        }
+                        let _ = tx.send(StdinEvent::Detach);
+                        return;
                     }
-                    let _ = tx.send(StdinEvent::Detach);
-                    return;
+                    CTRL_B => {
+                        // Doubled prefix: send a single literal Ctrl-B.
+                        // Lets the user reach an inner tmux's prefix.
+                        out.push(CTRL_B);
+                    }
+                    other => {
+                        // Held Ctrl-B was the start of a normal chord
+                        // (e.g. Ctrl-B c in tmux to make a window).
+                        out.push(CTRL_B);
+                        out.push(other);
+                    }
                 }
-                // Held-back Ctrl-B was a real keystroke — emit it.
-                out.push(CTRL_B);
-                out.push(b);
             } else if b == CTRL_B {
                 detach_armed = true;
+            } else if read_only && b == CTRL_C {
+                // Watch mode: Ctrl-C is the natural "exit" key. There's
+                // no session input channel to forward it to, so use it
+                // as a synonym for detach.
+                if !out.is_empty() {
+                    let _ = tx.send(StdinEvent::Bytes(out));
+                }
+                let _ = tx.send(StdinEvent::Detach);
+                return;
             } else {
                 out.push(b);
             }
