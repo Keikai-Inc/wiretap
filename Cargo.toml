@@ -59,6 +59,10 @@ aya = "0.13"
 aya-log = "0.2"
 bytes = "1"
 
+# Phase 2 honeypot. Linux-only namespace + mount syscalls. Same target
+# gating as the eBPF stack — the workspace still resolves on macOS.
+nix = { version = "0.30", features = ["fs", "mount", "process", "sched", "user", "term", "hostname"] }
+
 # Phase 1.7 (Hop integration). Held back because hop-core's transitive
 # ed25519-dalek pre-release pulls in a buggy combination under workspace
 # feature unification:

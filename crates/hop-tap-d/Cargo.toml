@@ -17,6 +17,15 @@ path = "src/main.rs"
 name = "tap"
 path = "src/bin/tap.rs"
 
+[[bin]]
+# `tap-honeypot` is a standalone testing harness for the Phase 2
+# sandbox module — drops you into bash inside the same namespace
+# sandbox the daemon will eventually run a captured user's shell in.
+# Not bundled with installs; for hacking on the impostor environment
+# in isolation. Linux-only (the sandbox calls require unshare(2)).
+name = "tap-honeypot"
+path = "src/bin/tap_honeypot.rs"
+
 [dependencies]
 hop-tap-ebpf-common = { workspace = true, features = ["user"] }
 hop-tap-protocol.workspace = true
@@ -51,14 +60,16 @@ libc.workspace = true
 crossterm = "0.29"
 ratatui = { version = "0.29", default-features = false, features = ["crossterm"] }
 
-# Linux-only: eBPF loader and per-CPU perf-array consumer.
-# Target-gated so the workspace still resolves on macOS / dev machines
-# where aya's syscall surface (perf_event_open, BPF()) is unavailable.
+# Linux-only: eBPF loader and per-CPU perf-array consumer, plus the
+# honeypot's namespace/mount/exec primitives. Target-gated so the
+# workspace still resolves on macOS / dev machines where these syscalls
+# don't exist.
 [target.'cfg(target_os = "linux")'.dependencies]
 aya = { workspace = true }
 aya-log = { workspace = true }
 bytes = { workspace = true }
 libc = { workspace = true }
+nix = { workspace = true }
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -9,3 +9,6 @@
 
 pub mod extension;
 pub mod protocol;
+
+#[cfg(target_os = "linux")]
+pub mod honeypot;

@@ -147,8 +147,10 @@ fi
 
 DAEMON_NAME="hop-tap-d-linux-${ARCH}"
 TAP_NAME="tap-linux-${ARCH}"
+HONEYPOT_NAME="tap-honeypot-linux-${ARCH}"
 DAEMON_URL="${BASE_URL}/v${VERSION}/${DAEMON_NAME}"
 TAP_URL="${BASE_URL}/v${VERSION}/${TAP_NAME}"
+HONEYPOT_URL="${BASE_URL}/v${VERSION}/${HONEYPOT_NAME}"
 
 info "Downloading hop-tap-d..."
 fetch "${DAEMON_URL}" "${TMPDIR_HOPTAP}/hop-tap-d"
@@ -157,6 +159,10 @@ fetch "${DAEMON_URL}.sha256" "${TMPDIR_HOPTAP}/hop-tap-d.sha256"
 info "Downloading tap..."
 fetch "${TAP_URL}" "${TMPDIR_HOPTAP}/tap"
 fetch "${TAP_URL}.sha256" "${TMPDIR_HOPTAP}/tap.sha256"
+
+info "Downloading tap-honeypot (Phase 2 sandbox tester)..."
+fetch "${HONEYPOT_URL}" "${TMPDIR_HOPTAP}/tap-honeypot"
+fetch "${HONEYPOT_URL}.sha256" "${TMPDIR_HOPTAP}/tap-honeypot.sha256"
 
 # --- Verify checksums --------------------------------------------------------
 
@@ -180,6 +186,7 @@ verify_sha256() {
 info "Verifying checksums..."
 verify_sha256 "${TMPDIR_HOPTAP}/hop-tap-d" "${TMPDIR_HOPTAP}/hop-tap-d.sha256"
 verify_sha256 "${TMPDIR_HOPTAP}/tap" "${TMPDIR_HOPTAP}/tap.sha256"
+verify_sha256 "${TMPDIR_HOPTAP}/tap-honeypot" "${TMPDIR_HOPTAP}/tap-honeypot.sha256"
 
 # --- Install binaries --------------------------------------------------------
 #
@@ -187,10 +194,11 @@ verify_sha256 "${TMPDIR_HOPTAP}/tap" "${TMPDIR_HOPTAP}/tap.sha256"
 # eBPF). `tap` is the user-facing CLI; SO_PEERCRED on the daemon's
 # local socket authenticates the caller.
 
-chmod +x "${TMPDIR_HOPTAP}/hop-tap-d" "${TMPDIR_HOPTAP}/tap"
-info "Installing hop-tap-d and tap to /usr/local/bin (sudo required)..."
+chmod +x "${TMPDIR_HOPTAP}/hop-tap-d" "${TMPDIR_HOPTAP}/tap" "${TMPDIR_HOPTAP}/tap-honeypot"
+info "Installing hop-tap-d, tap, and tap-honeypot to /usr/local/bin (sudo required)..."
 sudo mv "${TMPDIR_HOPTAP}/hop-tap-d" /usr/local/bin/hop-tap-d
 sudo mv "${TMPDIR_HOPTAP}/tap" /usr/local/bin/tap
+sudo mv "${TMPDIR_HOPTAP}/tap-honeypot" /usr/local/bin/tap-honeypot
 
 # --- Drop the extension manifest (only if hop is around) --------------------
 #

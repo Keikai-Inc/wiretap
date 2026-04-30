@@ -275,7 +275,8 @@ start_build "hop-tap-linux-arm64" bash -c "
   HOP_TAP_SKIP_EBPF_BUILD=1 cross build --release --target aarch64-unknown-linux-musl \
     --manifest-path '${PROJECT_ROOT}/Cargo.toml' -p hop-tap-d --bins \
   && cp '${PROJECT_ROOT}/target/aarch64-unknown-linux-musl/release/hop-tap-d' '${DIST_DIR}/hop-tap-d-linux-arm64' \
-  && cp '${PROJECT_ROOT}/target/aarch64-unknown-linux-musl/release/tap' '${DIST_DIR}/tap-linux-arm64'
+  && cp '${PROJECT_ROOT}/target/aarch64-unknown-linux-musl/release/tap' '${DIST_DIR}/tap-linux-arm64' \
+  && cp '${PROJECT_ROOT}/target/aarch64-unknown-linux-musl/release/tap-honeypot' '${DIST_DIR}/tap-honeypot-linux-arm64'
 "
 
 start_build "hop-tap-linux-x86_64" bash -c "
@@ -283,7 +284,8 @@ start_build "hop-tap-linux-x86_64" bash -c "
   HOP_TAP_SKIP_EBPF_BUILD=1 cross build --release --target x86_64-unknown-linux-musl \
     --manifest-path '${PROJECT_ROOT}/Cargo.toml' -p hop-tap-d --bins \
   && cp '${PROJECT_ROOT}/target/x86_64-unknown-linux-musl/release/hop-tap-d' '${DIST_DIR}/hop-tap-d-linux-x86_64' \
-  && cp '${PROJECT_ROOT}/target/x86_64-unknown-linux-musl/release/tap' '${DIST_DIR}/tap-linux-x86_64'
+  && cp '${PROJECT_ROOT}/target/x86_64-unknown-linux-musl/release/tap' '${DIST_DIR}/tap-linux-x86_64' \
+  && cp '${PROJECT_ROOT}/target/x86_64-unknown-linux-musl/release/tap-honeypot' '${DIST_DIR}/tap-honeypot-linux-x86_64'
 "
 
 # Wait for builds
@@ -302,14 +304,19 @@ done
 [[ "${FAILED}" -eq 0 ]] || { echo "Error: build(s) failed"; exit 1; }
 rm -rf "${BUILD_LOG_DIR}"
 
-# Both binary names get stripped, summed, and uploaded:
-#   hop-tap-d-linux-{x86_64,arm64}   (the daemon)
-#   tap-linux-{x86_64,arm64}         (the local CLI)
+# Three binaries ship per arch:
+#   hop-tap-d-linux-{x86_64,arm64}      (the daemon)
+#   tap-linux-{x86_64,arm64}            (the local CLI)
+#   tap-honeypot-linux-{x86_64,arm64}   (Phase 2 sandbox tester)
 # An earlier version of this script only matched `hop-tap-*` and
 # silently skipped the `tap-*` binaries, leaving install.sh with
 # 403s in production.
 shopt -s nullglob
-RELEASE_BINS=("${DIST_DIR}"/hop-tap-d-linux-* "${DIST_DIR}"/tap-linux-*)
+RELEASE_BINS=(
+  "${DIST_DIR}"/hop-tap-d-linux-*
+  "${DIST_DIR}"/tap-linux-*
+  "${DIST_DIR}"/tap-honeypot-linux-*
+)
 shopt -u nullglob
 
 echo "==> Stripping binaries"
