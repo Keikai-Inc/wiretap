@@ -32,7 +32,12 @@ RestartSec=5
 ProtectSystem=strict
 ProtectHome=read-only
 PrivateTmp=true
-ReadWritePaths=/run/hop-tap /etc/hop
+# /run/hop-tap is created by RuntimeDirectory= above; it always
+# exists when this unit starts. /etc/hop is owned by hop and may
+# not exist on a standalone tap install — the leading `-` tells
+# systemd to ignore it if missing instead of failing namespace
+# setup with status=226/NAMESPACE.
+ReadWritePaths=/run/hop-tap -/etc/hop
 
 [Install]
 WantedBy=multi-user.target

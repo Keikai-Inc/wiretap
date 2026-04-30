@@ -220,6 +220,13 @@ fi
 
 # --- Install systemd unit ----------------------------------------------------
 
+# /etc/hop is referenced by the unit's ReadWritePaths so namespace
+# setup can succeed even when hop isn't installed. The unit uses a
+# `-` prefix to tolerate it being absent, but older copies of the
+# unit may already be installed on a re-run; create it
+# unconditionally to keep both new and old units happy.
+sudo mkdir -p /etc/hop
+
 info "Installing systemd unit hop-tap.service..."
 fetch "${BASE_URL}/hop-tap.service" "${TMPDIR_HOPTAP}/hop-tap.service"
 sudo mv "${TMPDIR_HOPTAP}/hop-tap.service" /etc/systemd/system/hop-tap.service
