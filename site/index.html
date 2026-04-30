@@ -97,14 +97,17 @@
       border-radius: 50%;
       flex-shrink: 0;
     }
-    .cast-pair .role-admin  { background: var(--color-accent-green, #22c55e); }
+    .cast-pair .role-admin   { background: var(--color-accent-green, #22c55e); }
     .cast-pair .role-suspect { background: var(--color-accent-red,   #ef4444); }
+    .cast-pair .role-senior  { background: #3b82f6; }
+    .cast-pair .role-junior  { background: #f59e0b; }
     .cast-pair .role-label {
       transition: color 0.25s ease;
       font-variant-numeric: tabular-nums;
     }
     .cast-pair .role-label.is-quarantine { color: #fbbf24; }
     .cast-pair .role-label.is-ended      { color: #94a3b8; }
+    .cast-pair .role-label.is-resolved   { color: #22c55e; }
     .cast-pair .cast-host {
       border-radius: 0.5rem;
       overflow: hidden;
@@ -257,6 +260,35 @@
     </div>
   </section>
 
+  <!-- Dual-cast pairing demo: senior helps junior. Sits next to the
+       "Pairing without screen-share" scenario above. Same primitive as
+       the takedown demo, opposite use. -->
+  <section id="pair">
+    <div class="container">
+      <div class="section-header">
+        <h2>What pairing looks like</h2>
+        <p>Same picker, opposite use. bob is stuck on a failing <code>nginx</code> reload and pings alice on slack. She sudoes, runs <code>tap</code>, finds bob's pty, attaches, watches him bounce off <code>journalctl</code>. One <code>Ctrl-G</code> message — "try <code>nginx -t</code>" — and he's unstuck. No screen-share, no "can you describe what you're seeing?"</p>
+      </div>
+
+      <div class="cast-pair">
+        <figure>
+          <figcaption>
+            <span class="role-dot role-senior"></span>
+            <span class="role-label" id="label-senior">Senior — alice@web-prod</span>
+          </figcaption>
+          <div id="cast-senior" class="cast-host"></div>
+        </figure>
+        <figure>
+          <figcaption>
+            <span class="role-dot role-junior"></span>
+            <span class="role-label" id="label-junior">Junior — bob@web-prod (nginx reload failing)</span>
+          </figcaption>
+          <div id="cast-junior" class="cast-host"></div>
+        </figure>
+      </div>
+    </div>
+  </section>
+
   <!-- Install -->
   <section id="install">
     <div class="container">
@@ -361,137 +393,193 @@
         });
       }
 
-      // Dual-cast takedown demo — two players in lockstep.
-      var adminEl  = document.getElementById('cast-admin');
-      var hackerEl = document.getElementById('cast-hacker');
-      if (!adminEl || !hackerEl) return;
+      // Reusable dual-cast setup: two synchronized players + label-state
+      // table + scroll-triggered playback. Each demo on the page calls
+      // this with its own cast urls, element ids, and state tables.
+      function setupDualCast(cfg) {
+        var leftEl  = document.getElementById(cfg.leftElId);
+        var rightEl = document.getElementById(cfg.rightElId);
+        if (!leftEl || !rightEl) return;
 
-      var common = {
-        cols: 80, rows: 24,
-        autoPlay: false,
-        loop: false,        // we handle the loop manually so we can pause between iterations
-        // No idleTimeLimit. Each player compresses cast-internal pauses
-        // independently, so different idle distributions on the two
-        // casts (admin sits idle while hacker is busy and vice versa)
-        // produce different wall-clock advancement and the demo
-        // visibly desyncs by several seconds. Real-time playback is
-        // perfectly synchronized.
-        theme: 'asciinema', fit: 'width',
-      };
-      var admin  = AsciinemaPlayer.create('admin.cast',  adminEl,  common);
-      var hacker = AsciinemaPlayer.create('hacker.cast', hackerEl, common);
+        // No idleTimeLimit — each cast's idle distribution is asymmetric
+        // (one side busy while the other waits, then flipped), so any
+        // compression diverges the two clocks. Real-time playback keeps
+        // them in lockstep.
+        var common = {
+          cols: 80, rows: 24,
+          autoPlay: false,
+          loop: false,
+          theme: 'asciinema', fit: 'width',
+        };
+        var left  = AsciinemaPlayer.create(cfg.leftCast,  leftEl,  common);
+        var right = AsciinemaPlayer.create(cfg.rightCast, rightEl, common);
 
-      // Labels above each player. They mirror the OSC 2 title real tap
-      // sets, plus extra cues for the demo viewer (🎭 quarantine, [ session
-      // ended ]). Driven from each player's currentTime against a state
-      // table — no markers needed in the casts themselves.
-      var adminLabel  = document.getElementById('label-admin');
-      var hackerLabel = document.getElementById('label-hacker');
+        var leftLabel  = document.getElementById(cfg.leftLabelId);
+        var rightLabel = document.getElementById(cfg.rightLabelId);
 
-      // Times below are pegged to the actual cast event timestamps. The
-      // suspect's web-prod session (pty 4) starts at T_INTRUSION = 4.5
-      // (see scripts/build-demo-casts.py), so all admin/suspect events
-      // are shifted relative to that anchor.
-      var ADMIN_STATES = [
-        { t: 0.0,  text: "Admin — alice@web-prod",                                                                klass: '' },
-        { t: 7.5,  text: "Admin — alice@web-prod (sudo'd to root)",                                               klass: '' },
-        { t: 9.0,  text: 'Admin — tap',                                                                           klass: '' },
-        { t: 15.0, text: 'Admin — tap pty=4 www-data→euid0 bash — Ctrl-T menu  Ctrl-G msg',                       klass: '' },
-        { t: 20.0, text: 'Admin — tap',                                                                           klass: '' },
-        { t: 25.8, text: 'Admin — 🎭 tap pty=4 www-data→euid0 bash (quarantined) — Ctrl-T menu  Ctrl-G msg',     klass: 'is-quarantine' },
-        { t: 41.3, text: 'Admin — tap',                                                                           klass: '' },
-      ];
-      var HACKER_STATES = [
-        { t: 0.0,  text: 'Suspect — kali@kali (running apache 0day)',               klass: '' },
-        { t: 4.5,  text: 'Suspect — www-data → euid 0 (foothold on web-prod)',      klass: '' },
-        { t: 25.8, text: 'Suspect — www-data (now talking to honeypot)',            klass: 'is-quarantine' },
-        { t: 44.3, text: 'Suspect — [ session ended ]',                             klass: 'is-ended' },
-      ];
-
-      function applyState(label, states, t) {
-        // Find the latest state whose threshold is <= t.
-        var pick = states[0];
-        for (var i = 0; i < states.length; i++) {
-          if (states[i].t <= t) pick = states[i];
-        }
-        if (label._lastText === pick.text) return;
-        label._lastText = pick.text;
-        label.textContent = pick.text;
-        label.classList.remove('is-quarantine', 'is-ended');
-        if (pick.klass) label.classList.add(pick.klass);
-      }
-
-      // Bridge play/pause in both directions so clicking either player's
-      // controls drives both. Don't bridge 'ended' here — restart logic
-      // owns that.
-      var bridging = false;
-      function bridge(src, dst) {
-        src.addEventListener('play',  function () {
-          if (bridging) return; bridging = true; dst.play();  bridging = false;
-        });
-        src.addEventListener('pause', function () {
-          if (bridging) return; bridging = true; dst.pause(); bridging = false;
-        });
-      }
-      bridge(admin, hacker);
-      bridge(hacker, admin);
-
-      // Restart with a pause: when either side ends, pause both, hold for
-      // 3s on the final frame, then seek both back to 0 and play. The
-      // debounce flag keeps two simultaneous 'ended' events from
-      // scheduling two restart loops.
-      var restartPending = false;
-      function scheduleRestart() {
-        if (restartPending) return;
-        restartPending = true;
-        try { admin.pause(); } catch (e) {}
-        try { hacker.pause(); } catch (e) {}
-        setTimeout(function () {
-          bridging = true;
-          try { admin.seek(0); hacker.seek(0); } catch (e) {}
-          Promise.all([admin.play(), hacker.play()]).catch(function () {});
-          bridging = false;
-          restartPending = false;
-        }, 3000);
-      }
-      admin.addEventListener('ended',  scheduleRestart);
-      hacker.addEventListener('ended', scheduleRestart);
-
-      // Unidirectional drift correction + label updates, on rAF (~60fps).
-      // Admin is the leader; hacker is the follower. Threshold is 5ms;
-      // any larger gap and we snap hacker forward to admin's clock.
-      // 200ms setInterval was visibly drifting between snaps — rAF is
-      // tight enough that the snap is invisible.
-      function syncFrame() {
-        try {
-          var a = admin.getCurrentTime();
-          var h = hacker.getCurrentTime();
-          if (typeof a === 'number' && typeof h === 'number') {
-            if (Math.abs(a - h) > 0.005 && !restartPending) {
-              bridging = true;
-              hacker.seek(a);
-              bridging = false;
-            }
-            applyState(adminLabel,  ADMIN_STATES,  a);
-            applyState(hackerLabel, HACKER_STATES, h);
+        var LABEL_CLASSES = ['is-quarantine', 'is-ended', 'is-resolved'];
+        function applyState(label, states, t) {
+          if (!label) return;
+          var pick = states[0];
+          for (var i = 0; i < states.length; i++) {
+            if (states[i].t <= t) pick = states[i];
           }
-        } catch (e) { /* player not ready yet */ }
-        requestAnimationFrame(syncFrame);
-      }
-      requestAnimationFrame(syncFrame);
+          if (label._lastText === pick.text) return;
+          label._lastText = pick.text;
+          label.textContent = pick.text;
+          for (var j = 0; j < LABEL_CLASSES.length; j++) {
+            label.classList.remove(LABEL_CLASSES[j]);
+          }
+          if (pick.klass) label.classList.add(pick.klass);
+        }
 
-      // Start them together. seek(0) on both before play guarantees the
-      // first event lands at the same wall-clock moment on both
-      // players (otherwise their internal clocks would have advanced
-      // by a few ms during construction).
-      bridging = true;
-      Promise.all([admin.seek(0), hacker.seek(0)]).then(function () {
-        bridging = false;
-        return Promise.all([admin.play(), hacker.play()]);
-      }).catch(function () {
-        bridging = false;
-        // Some browsers refuse autoplay without a user gesture; fall
-        // back to the viewer clicking either player.
+        // Bridge play/pause both ways so clicking either player drives
+        // both. 'ended' is owned by the restart loop, not bridged here.
+        var bridging = false;
+        function bridge(src, dst) {
+          src.addEventListener('play',  function () {
+            if (bridging) return; bridging = true; dst.play();  bridging = false;
+          });
+          src.addEventListener('pause', function () {
+            if (bridging) return; bridging = true; dst.pause(); bridging = false;
+          });
+        }
+        bridge(left, right);
+        bridge(right, left);
+
+        // When either side ends, pause both, hold the final frame for 3s,
+        // then seek both back to 0 and play (only if visible — see the
+        // IntersectionObserver below).
+        var restartPending = false;
+        function scheduleRestart() {
+          if (restartPending) return;
+          restartPending = true;
+          try { left.pause(); } catch (e) {}
+          try { right.pause(); } catch (e) {}
+          setTimeout(function () {
+            bridging = true;
+            try { left.seek(0); right.seek(0); } catch (e) {}
+            if (visible) {
+              Promise.all([left.play(), right.play()]).catch(function () {});
+            }
+            bridging = false;
+            restartPending = false;
+          }, 3000);
+        }
+        left.addEventListener('ended',  scheduleRestart);
+        right.addEventListener('ended', scheduleRestart);
+
+        // Drift correction + label updates on rAF. Left is leader, right
+        // is follower; >5ms gap snaps right to left's clock.
+        function syncFrame() {
+          try {
+            var a = left.getCurrentTime();
+            var b = right.getCurrentTime();
+            if (typeof a === 'number' && typeof b === 'number') {
+              if (Math.abs(a - b) > 0.005 && !restartPending) {
+                bridging = true;
+                right.seek(a);
+                bridging = false;
+              }
+              applyState(leftLabel,  cfg.leftStates,  a);
+              applyState(rightLabel, cfg.rightStates, b);
+            }
+          } catch (e) { /* player not ready yet */ }
+          requestAnimationFrame(syncFrame);
+        }
+        requestAnimationFrame(syncFrame);
+
+        // IntersectionObserver: only play while the section is on
+        // screen. Pause + reset when scrolled out of view, so the
+        // viewer always encounters the demo from the start. Without
+        // this, both demos would race each other at page-load and
+        // the takedown would already be half-over by the time the
+        // user scrolled to it.
+        var visible = false;
+        var hasStarted = false;
+        var section = leftEl.closest('section') || leftEl.parentElement;
+        function startFromBeginning() {
+          hasStarted = true;
+          bridging = true;
+          Promise.all([left.seek(0), right.seek(0)]).then(function () {
+            bridging = false;
+            return Promise.all([left.play(), right.play()]);
+          }).catch(function () { bridging = false; });
+        }
+        var io = new IntersectionObserver(function (entries) {
+          entries.forEach(function (entry) {
+            if (entry.isIntersecting && entry.intersectionRatio > 0.25) {
+              if (visible) return;
+              visible = true;
+              if (!hasStarted) {
+                startFromBeginning();
+              } else {
+                // Already started; resume from current position.
+                bridging = true;
+                Promise.all([left.play(), right.play()]).catch(function () {});
+                bridging = false;
+              }
+            } else if (!entry.isIntersecting) {
+              if (!visible) return;
+              visible = false;
+              try { left.pause();  } catch (e) {}
+              try { right.pause(); } catch (e) {}
+            }
+          });
+        }, { threshold: [0, 0.25, 0.5, 0.75] });
+        io.observe(section);
+      }
+
+      // Demo 1: takedown.
+      // States are pegged to actual cast event timestamps. The suspect's
+      // web-prod pty starts at T_INTRUSION = 4.5 in the cast generator
+      // (scripts/build-demo-casts.py), so all admin/suspect labels are
+      // shifted relative to that anchor.
+      setupDualCast({
+        leftCast:     'admin.cast',
+        rightCast:    'hacker.cast',
+        leftElId:     'cast-admin',
+        rightElId:    'cast-hacker',
+        leftLabelId:  'label-admin',
+        rightLabelId: 'label-hacker',
+        leftStates: [
+          { t: 0.0,  text: "Admin — alice@web-prod",                                                                klass: '' },
+          { t: 7.5,  text: "Admin — alice@web-prod (sudo'd to root)",                                               klass: '' },
+          { t: 9.0,  text: 'Admin — tap',                                                                           klass: '' },
+          { t: 15.0, text: 'Admin — tap pty=4 www-data→euid0 bash — Ctrl-T menu  Ctrl-G msg',                       klass: '' },
+          { t: 20.0, text: 'Admin — tap',                                                                           klass: '' },
+          { t: 25.8, text: 'Admin — 🎭 tap pty=4 www-data→euid0 bash (quarantined) — Ctrl-T menu  Ctrl-G msg',     klass: 'is-quarantine' },
+          { t: 41.3, text: 'Admin — tap',                                                                           klass: '' },
+        ],
+        rightStates: [
+          { t: 0.0,  text: 'Suspect — kali@kali (running apache 0day)',               klass: '' },
+          { t: 4.5,  text: 'Suspect — www-data → euid 0 (foothold on web-prod)',      klass: '' },
+          { t: 25.8, text: 'Suspect — www-data (now talking to honeypot)',            klass: 'is-quarantine' },
+          { t: 44.3, text: 'Suspect — [ session ended ]',                             klass: 'is-ended' },
+        ],
+      });
+
+      // Demo 2: pairing. Friendlier scenario: bob is stuck on a failing
+      // nginx reload, alice taps in and sends a hint via Ctrl-G.
+      setupDualCast({
+        leftCast:     'senior.cast',
+        rightCast:    'junior.cast',
+        leftElId:     'cast-senior',
+        rightElId:    'cast-junior',
+        leftLabelId:  'label-senior',
+        rightLabelId: 'label-junior',
+        leftStates: [
+          { t: 0.0,  text: 'Senior — alice@web-prod',                                                klass: '' },
+          { t: 6.0,  text: "Senior — alice@web-prod (sudo'd to root)",                               klass: '' },
+          { t: 7.0,  text: 'Senior — tap',                                                           klass: '' },
+          { t: 9.5,  text: 'Senior — tap pty=7 bob@web-prod — Ctrl-T detach  Ctrl-G msg',            klass: '' },
+          { t: 34.6, text: 'Senior — tap',                                                           klass: '' },
+        ],
+        rightStates: [
+          { t: 0.0,  text: 'Junior — bob@web-prod (nginx reload failing)',                           klass: '' },
+          { t: 16.5, text: 'Junior — bob@web-prod (alice sent a hint)',                              klass: '' },
+          { t: 28.0, text: 'Junior — bob@web-prod (✓ resolved)',                                     klass: 'is-resolved' },
+        ],
       });
     })();
   </script>
