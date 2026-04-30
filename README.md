@@ -50,33 +50,58 @@ hop-tap/
     └── tap-terminal.toml.example    # example Hop extension manifest
 ```
 
-## Production deployment
+## Install
 
-Once `hop-tap-d` is running on a host with the manifest installed
-under `/etc/hop/extensions/tap-terminal.toml` (or the user-local
-equivalent) and the hop daemon has been restarted, the extension
-shows up in the cli:
+One-liner for any Linux host (mirrors hop's installer style):
 
 ```bash
-hop <host> ext list                       # tap.terminal listed as available
+curl -fsSL https://hop-tap.keik.ai/install.sh | bash
+```
+
+What it does:
+
+- Refuses to run on non-Linux (eBPF-only); detects x86_64 / arm64.
+- If `hop` isn't installed, or its daemon isn't running, **first**
+  delegates to `https://hop.keik.ai/install-daemon.sh` — you get a
+  working hop daemon as a dependency, no separate step.
+- Downloads `hop-tap-d` and `hop-tap-probe` into `/usr/local/bin`,
+  drops a manifest at `/etc/hop/extensions/tap-terminal.toml`,
+  installs `hop-tap.service` as a systemd unit, enables and starts
+  it, then restarts hop so it picks up the new manifest.
+
+Verify:
+
+```bash
+sudo systemctl status hop-tap                    # daemon up
+sudo journalctl -u hop-tap -f                    # tailing logs
+hop <host> ext list                              # tap.terminal listed as available
+hop <host> tap list                              # active sessions
+```
+
+For local development on the same host (no hop network required),
+the bundled probe drives the daemon directly:
+
+```bash
+hop-tap-probe --bootstrap /run/hop-tap/bootstrap repl
+```
+
+## Production usage
+
+Once installed, peers can:
+
+```bash
 hop <host> tap list                       # active sessions, with opener vs writer
 hop <host> tap snapshot 0                 # 24x80 grid for pty=0
+hop <host> tap watch 0                    # live byte stream
 ```
 
 `hop <host> tap watch <pty>` works end-to-end as of hop's
-extension-system commit `0cd6d09` (which implements the
-streaming dispatcher in hop-core). Multi-frame `PeerResponse`s
-flow back over the peer's QUIC stream until `StreamClosed`; the
-CLI decodes each `TapStreamFrame` and writes raw bytes to stdout,
-so the operator's terminal renders the captured session in real
-time without any client-side emulator round-trip.
-
-For local development you can also run the bundled probe directly
-against a daemon you control:
-
-```bash
-hop-tap-probe --bootstrap /run/hop-tap/bootstrap watch --pty 0
-```
+extension-system commit `0cd6d09` (the streaming dispatcher in
+hop-core). Multi-frame `PeerResponse`s flow back over the peer's
+QUIC stream until `StreamClosed`; the CLI decodes each
+`TapStreamFrame` and writes raw bytes to stdout, so the operator's
+terminal renders the captured session in real time without any
+client-side emulator round-trip.
 
 The `hop-tap-ebpf` crate is intentionally **outside** the workspace
 because it must be cross-compiled for `bpfel-unknown-none` with

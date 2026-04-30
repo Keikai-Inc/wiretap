@@ -1,0 +1,38 @@
+[Unit]
+Description=hop-tap eBPF terminal capture daemon
+Documentation=https://hop.keik.ai/tap
+# Start after hop so the manifest is in place before we open the
+# bootstrap rendezvous; if hop comes back later (restart, upgrade)
+# we'll be re-read on its next start.
+After=hop.service network.target
+Wants=hop.service
+
+[Service]
+Type=simple
+# eBPF needs CAP_BPF / CAP_PERFMON / CAP_SYS_ADMIN. Easiest correct
+# path is just root; the daemon's threat model already assumes it
+# (it reads every byte of every TTY on the host).
+User=root
+ExecStart=/usr/local/bin/hop-tap-d --bootstrap /run/hop-tap/bootstrap
+
+# Auto-create /run/hop-tap with 0750 root:root so the bootstrap file
+# (which is itself a credential) lives in a directory that's not
+# world-traversable.
+RuntimeDirectory=hop-tap
+RuntimeDirectoryMode=0750
+
+# If we crash, restart — capture is "should always be on."
+Restart=on-failure
+RestartSec=5
+
+# Reasonable hardening. We deliberately do NOT set NoNewPrivileges
+# (BPF program load can interact with capability checks in surprising
+# ways) and we keep network access (the daemon doesn't need it
+# directly, but ipc-channel + future hop bootstrap may).
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+ReadWritePaths=/run/hop-tap /etc/hop
+
+[Install]
+WantedBy=multi-user.target
