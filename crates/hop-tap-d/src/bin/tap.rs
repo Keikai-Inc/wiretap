@@ -373,26 +373,30 @@ struct StatusInfo {
     comm: String,
 }
 
-/// `tap connect <pty>` — attach to a session bidirectionally with a
-/// tmux-style bottom status bar.
+/// `tap connect <pty>` — attach to a session bidirectionally.
 ///
-/// We deliberately *don't* set DECSTBM to reserve the bottom row.
-/// Absolute cursor positioning ignores the scroll region anyway, so
-/// it doesn't reliably protect the bar; worse, when the captured
-/// session's cursor lands on the bottom row, every Output byte
-/// arrived there and our re-paint clobbered it — so output looked
-/// like it wasn't refreshing. Instead: paint the bar once after the
-/// Initial replay, then refresh only on a 1s timer. Chatty sessions
-/// will overdraw the bar briefly, but the timer brings it back. In
-/// Compose mode we paint after every Output so the input prompt
-/// stays visible while the user types.
+/// Normal-mode UI: we set the **terminal window title** via OSC 2 to
+/// show "tap pty=N user comm" + the keybindings. The captured
+/// session's bytes flow straight to stdout and own the entire screen
+/// — no fight for screen real estate, no flicker from a bottom bar
+/// being clobbered by full-screen apps like top.
+///
+/// (To do tmux's actual approach we'd have to virtualize the captured
+/// session: parse every byte through a local alacritty Term, render
+/// into a smaller grid, compose with a status bar. That's a real
+/// chunk of work; OSC 2 gives us "always-visible session info" for
+/// almost no cost in the meantime.)
+///
+/// Compose-mode UI: temporary input prompt at the bottom row while
+/// the user is typing a message, then it's cleared on send/cancel.
+/// This is a transient state, not a persistent overlay, so it's OK
+/// to overpaint the bottom row briefly.
 ///
 /// Keys:
-///   Ctrl-T → detach
-///   Ctrl-G → compose admin message (replaces status bar with input
-///            prompt; Enter sends via TapRequest::AdminMessage, which
-///            the daemon writes to /dev/pts/N as terminal output;
-///            Esc cancels)
+///   Ctrl-T → detach (Compose: cancel compose first)
+///   Ctrl-G → compose admin message (input at bottom row; Enter
+///            sends via TapRequest::AdminMessage, which the daemon
+///            writes to /dev/pts/N as terminal output; Esc cancels)
 async fn connect(
     stream: UnixStream,
     next_id: &mut u64,
@@ -483,16 +487,24 @@ async fn connect(
     let mut stdout = std::io::stdout().lock();
     let mut mode = ConnectMode::Normal;
 
-    // Will become true once we've received the first Initial frame —
-    // we hold off on configuring DECSTBM and painting the status bar
-    // until the captured session's screen is rendered, otherwise the
-    // status bar gets immediately overwritten by the Initial replay.
+    // Push the existing window title onto xterm's title stack so we
+    // can pop it back on detach. Then set our own title with the
+    // session info + key hints. This is the "always-visible status"
+    // for normal mode — no screen real estate consumed.
+    let _ = stdout.write_all(b"\x1b[22;2t"); // CSI 22;2t = push title
+    set_window_title(&mut stdout, &info);
+    let _ = stdout.flush();
+
     let mut session_ready = false;
     let mut admin_id: u64 = sub_request_id.wrapping_add(1_000_000);
     let mut inject_id: u64 = sub_request_id.wrapping_add(1);
 
-    let mut status_timer = tokio::time::interval(std::time::Duration::from_secs(1));
-    status_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Periodic resize check + title refresh. No more status-bar
+    // repaint — the title sits in the terminal chrome and doesn't
+    // need maintenance — but we still want to react to terminal
+    // resizes so the Compose prompt is laid out correctly.
+    let mut housekeeping_timer = tokio::time::interval(std::time::Duration::from_secs(1));
+    housekeeping_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     let outcome = loop {
         tokio::select! {
@@ -511,7 +523,7 @@ async fn connect(
                         if matches!(mode, ConnectMode::Compose(_)) {
                             tracing::debug!("Ctrl-T in Compose: cancel compose");
                             mode = ConnectMode::Normal;
-                            paint_status_bar(&mut stdout, term_rows, term_cols, &info, &mode);
+                            erase_bottom_row(&mut stdout, term_rows);
                             let _ = stdout.flush();
                         } else {
                             tracing::debug!("Ctrl-T in Normal: detach");
@@ -525,7 +537,6 @@ async fn connect(
                             &mut stdout,
                             term_rows,
                             term_cols,
-                            &info,
                             &mut write_half,
                             &mut inject_id,
                             &mut admin_id,
@@ -561,21 +572,21 @@ async fn connect(
                                 tracing::debug!(rows, cols, len = replay_bytes.len(), "Initial frame");
                                 let _ = stdout.write_all(b"\x1b[2J\x1b[H");
                                 let _ = stdout.write_all(&replay_bytes);
-                                paint_status_bar(&mut stdout, term_rows, term_cols, &info, &mode);
                                 let _ = stdout.flush();
                                 session_ready = true;
                             }
                             TapStreamFrame::Output(b) => {
                                 tracing::trace!(len = b.len(), "Output frame");
                                 let _ = stdout.write_all(&b);
-                                // Only re-paint the status bar when the
-                                // user is actively composing — otherwise
-                                // we'd overwrite the captured session's
-                                // own bottom-row content on every frame.
-                                // The 1s timer below brings the bar back
-                                // for normal mode.
+                                // Compose mode owns the bottom row —
+                                // re-paint the input prompt after every
+                                // frame so the captured session's
+                                // output doesn't scroll the prompt away
+                                // mid-edit.
                                 if session_ready && matches!(mode, ConnectMode::Compose(_)) {
-                                    paint_status_bar(&mut stdout, term_rows, term_cols, &info, &mode);
+                                    if let ConnectMode::Compose(buf) = &mode {
+                                        paint_compose_prompt(&mut stdout, term_rows, term_cols, buf);
+                                    }
                                 }
                                 let _ = stdout.flush();
                             }
@@ -598,32 +609,51 @@ async fn connect(
                     _ => {}
                 }
             }
-            _ = status_timer.tick() => {
-                // Periodic re-paint brings the bar back if the captured
-                // session has scrolled / overwritten it since the last
-                // tick. Also re-fetches terminal size in case the user
-                // resized.
+            _ = housekeeping_timer.tick() => {
+                // Re-fetch terminal size in case the user resized.
+                // We don't repaint anything in normal mode — the
+                // window title is set once and lives in the chrome.
+                // In Compose mode, repaint the prompt so its
+                // dimensions track the new terminal size.
                 if let Ok((c, r)) = crossterm::terminal::size() {
                     if (c, r) != (term_cols, term_rows) {
                         term_cols = c;
                         term_rows = r;
+                        if let ConnectMode::Compose(buf) = &mode {
+                            paint_compose_prompt(&mut stdout, term_rows, term_cols, buf);
+                            let _ = stdout.flush();
+                        }
                     }
-                }
-                if session_ready {
-                    paint_status_bar(&mut stdout, term_rows, term_cols, &info, &mode);
-                    let _ = stdout.flush();
                 }
             }
         }
     };
 
-    // Tear down: erase the status row so it doesn't linger on the
-    // user's terminal once the picker (or shell prompt) takes over.
-    let _ = write!(stdout, "\x1b[{};1H\x1b[K", term_rows);
+    // Tear down. If we were composing, erase the prompt row. Pop the
+    // window title we pushed on attach, so the user's terminal title
+    // returns to whatever it was before tap took it over.
+    if matches!(mode, ConnectMode::Compose(_)) {
+        let _ = write!(stdout, "\x1b[{};1H\x1b[K", term_rows);
+    }
+    let _ = stdout.write_all(b"\x1b[23;2t"); // CSI 23;2t = pop title
     let _ = stdout.flush();
     drop(stdout);
     eprintln!("\r\n[detached]\r");
     Ok(outcome)
+}
+
+/// Set the local terminal's window title via OSC 2. The title shows
+/// the captured session's identity and the keybindings, so the user
+/// has a persistent reminder of where they are without consuming any
+/// screen real estate. ST terminator (`\x1b\\`) is the formally
+/// correct end-of-OSC for xterm; BEL (`\x07`) works on more terminals
+/// and is what many programs send. We use BEL for compat.
+fn set_window_title(stdout: &mut std::io::StdoutLock<'static>, info: &StatusInfo) {
+    let title = format!(
+        "tap pty={} {} {} — Ctrl-T menu  Ctrl-G msg",
+        info.pty, info.user, info.comm
+    );
+    let _ = write!(stdout, "\x1b]2;{}\x07", title);
 }
 
 /// One-shot `List` over the connect socket so we can fill in the
@@ -683,7 +713,6 @@ async fn handle_stdin_bytes(
     stdout: &mut std::io::StdoutLock<'static>,
     rows: u16,
     cols: u16,
-    info: &StatusInfo,
     write: &mut OwnedWriteHalf,
     inject_id: &mut u64,
     admin_id: &mut u64,
@@ -721,7 +750,7 @@ async fn handle_stdin_bytes(
                         // Send (if non-empty) and exit compose.
                         let msg = std::mem::take(buf);
                         *mode = ConnectMode::Normal;
-                        paint_status_bar(stdout, rows, cols, info, mode);
+                        erase_bottom_row(stdout, rows);
                         let _ = stdout.flush();
                         if !msg.trim().is_empty() {
                             *admin_id = admin_id.wrapping_add(1);
@@ -744,7 +773,7 @@ async fn handle_stdin_bytes(
                         // Cancel.
                         buf.clear();
                         *mode = ConnectMode::Normal;
-                        paint_status_bar(stdout, rows, cols, info, mode);
+                        erase_bottom_row(stdout, rows);
                         let _ = stdout.flush();
                     }
                     BACKSPACE_BS | BACKSPACE_DEL => {
@@ -791,52 +820,12 @@ async fn send_inject(
     .await
 }
 
-/// Paint the bottom-row status bar.
-///
-/// We deliberately do *not* use DECSC/DECRC (\x1b7 / \x1b8) or CSI
-/// save/restore (\x1b[s / \x1b[u) to bracket the paint. Those have a
-/// single shared "saved cursor" slot, and full-screen apps like
-/// `top` use the same slot for their own redraw bookkeeping — every
-/// status-bar repaint would clobber the application's saved state
-/// and the captured session's display would desync until something
-/// (`clear` or alt-screen exit) reset things.
-///
-/// Trade-off: after we paint, the cursor sits at the end of the
-/// status bar. The next Output frame from the captured session
-/// almost always begins with absolute cursor positioning (top, vim,
-/// htop all redraw via CUP), so the cursor lands back where the
-/// session expects it within one frame. Idle shells re-emit the
-/// prompt from a known position on the next keystroke.
-fn paint_status_bar(
-    stdout: &mut std::io::StdoutLock<'static>,
-    rows: u16,
-    cols: u16,
-    info: &StatusInfo,
-    mode: &ConnectMode,
-) {
-    if let ConnectMode::Compose(buf) = mode {
-        paint_compose_prompt(stdout, rows, cols, buf);
-        return;
-    }
-    let left = format!(" tap pty={} {} {} ", info.pty, info.user, info.comm);
-    let right = " Ctrl-T menu  Ctrl-G msg ";
-    let cols = cols as usize;
-    let mut bar = if left.len() + right.len() <= cols {
-        let pad = cols - left.len() - right.len();
-        format!("{}{}{}", left, " ".repeat(pad), right)
-    } else if left.len() <= cols {
-        let pad = cols - left.len();
-        format!("{}{}", left, " ".repeat(pad))
-    } else {
-        left.chars().take(cols).collect()
-    };
-    bar.truncate(bar.char_indices().nth(cols).map(|(i, _)| i).unwrap_or(bar.len()));
-
-    let _ = write!(
-        stdout,
-        "\x1b[{};1H\x1b[K\x1b[7m{}\x1b[0m",
-        rows, bar
-    );
+/// Erase the bottom row of the local terminal and leave the cursor
+/// at column 1 of that row. Used when leaving Compose mode so the
+/// transient input prompt is wiped — the captured session's next
+/// output will reposition the cursor wherever it actually wants.
+fn erase_bottom_row(stdout: &mut std::io::StdoutLock<'static>, rows: u16) {
+    let _ = write!(stdout, "\x1b[{};1H\x1b[K", rows);
 }
 
 /// Paint the Compose-mode input prompt on the bottom row. Cursor is
