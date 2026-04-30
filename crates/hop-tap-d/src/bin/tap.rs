@@ -318,13 +318,34 @@ async fn send_local(write: &mut OwnedWriteHalf, msg: &LocalMessage) -> Result<()
     Ok(())
 }
 
+/// Maximum frame size we'll accept from the daemon. Mirrors the
+/// daemon-side cap; defends against corrupted framing causing us to
+/// allocate huge buffers.
+const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
+
 /// Read one length-prefixed bincode `LocalMessage` from an owned
 /// read half.
+///
+/// **Cancel-safety: this function is NOT cancel-safe.** Dropping it
+/// mid-read corrupts the wire framing — `read_exact` may have
+/// consumed some bytes from the socket already and they're lost.
+/// Don't put a bare `recv_local(...)` inside a `tokio::select!` arm
+/// that races against another arm; spawn a dedicated reader task
+/// that calls it in a loop and forward messages over an mpsc channel
+/// (channel `recv` *is* cancel-safe). The connect main loop does
+/// this; `fetch_status_info` is fine because it runs sequentially
+/// before any concurrency.
 async fn recv_local(read: &mut OwnedReadHalf) -> Result<LocalMessage> {
     let cfg = bincode::config::standard();
     let mut len_buf = [0u8; 4];
     read.read_exact(&mut len_buf).await.context("read len")?;
     let len = u32::from_be_bytes(len_buf) as usize;
+    if len > MAX_FRAME_SIZE {
+        bail!(
+            "incoming frame size {len} exceeds MAX_FRAME_SIZE ({MAX_FRAME_SIZE}); \
+             likely a corrupted stream. Closing."
+        );
+    }
     let mut buf = vec![0u8; len];
     read.read_exact(&mut buf).await.context("read body")?;
     let (msg, _): (LocalMessage, _) =
@@ -382,6 +403,8 @@ async fn connect(
     // Fetch the session's identity for the status bar before we
     // subscribe — this keeps the Subscribe path symmetric with the
     // existing flow and the List call uses a separate request_id.
+    // (Sequential, no select! involved, so recv_local cancel-safety
+    // doesn't matter here.)
     let info = fetch_status_info(&mut read_half, &mut write_half, next_id, pty).await?;
 
     // 1. Subscribe to the watch stream and confirm the daemon
@@ -415,12 +438,35 @@ async fn connect(
         }
     };
 
-    // 2. Raw mode + Drop-guarded restore. The DECSTBM scroll-region
-    //    setup happens after the first Initial frame.
+    // 2. Raw mode + Drop-guarded restore.
     crossterm::terminal::enable_raw_mode().context("enable raw mode")?;
     let _raw = RawModeGuard;
 
-    // 3. Blocking stdin reader on a dedicated thread. Single hot key
+    // 3. Spawn a dedicated reader task. recv_local() uses
+    //    AsyncReadExt::read_exact, which is *not* cancel-safe — if we
+    //    awaited it directly inside the main loop's tokio::select!,
+    //    every keystroke (which wakes the stdin arm) would cancel an
+    //    in-flight read mid-frame. Half-consumed length prefixes
+    //    desync the wire and the next decode reads garbage, which
+    //    presents to the user as "frame frozen, no more updates"
+    //    (especially under heavy output like top).
+    //    Channel `recv` is cancel-safe, so we forward through one.
+    let (server_tx, mut server_rx) = mpsc::unbounded_channel::<Result<LocalMessage>>();
+    tokio::spawn(async move {
+        loop {
+            let msg = recv_local(&mut read_half).await;
+            let is_err = msg.is_err();
+            if server_tx.send(msg).is_err() {
+                // Main loop dropped — nothing more to do.
+                return;
+            }
+            if is_err {
+                return;
+            }
+        }
+    });
+
+    // 4. Blocking stdin reader on a dedicated thread. Single hot key
     //    is Ctrl-T (detach); other special handling — including
     //    Ctrl-G for compose mode — happens in the main loop where
     //    we have the mode state.
@@ -458,7 +504,19 @@ async fn connect(
                 };
                 match event {
                     StdinEvent::Detach => {
-                        break AttachOutcome::Detached;
+                        // Ctrl-T in Compose cancels compose instead of
+                        // detaching — otherwise the user can press
+                        // Ctrl-T expecting "go back" and silently lose
+                        // the message they were typing.
+                        if matches!(mode, ConnectMode::Compose(_)) {
+                            tracing::debug!("Ctrl-T in Compose: cancel compose");
+                            mode = ConnectMode::Normal;
+                            paint_status_bar(&mut stdout, term_rows, term_cols, &info, &mode);
+                            let _ = stdout.flush();
+                        } else {
+                            tracing::debug!("Ctrl-T in Normal: detach");
+                            break AttachOutcome::Detached;
+                        }
                     }
                     StdinEvent::Bytes(bytes) => {
                         match handle_stdin_bytes(
@@ -482,18 +540,25 @@ async fn connect(
                     }
                 }
             }
-            msg = recv_local(&mut read_half) => {
+            msg = server_rx.recv() => {
                 let msg = match msg {
-                    Ok(m) => m,
-                    Err(e) => {
+                    Some(Ok(m)) => m,
+                    Some(Err(e)) => {
+                        tracing::debug!(error = %e, "server stream error");
                         eprintln!("\r\n[connect: server closed: {e}]\r");
+                        break AttachOutcome::SessionClosed;
+                    }
+                    None => {
+                        // Reader task ended without sending an Err
+                        // (channel closed). Treat as session closed.
                         break AttachOutcome::SessionClosed;
                     }
                 };
                 match msg {
                     LocalMessage::StreamFrame { stream_id: sid, payload } if sid == stream_id => {
                         match payload {
-                            TapStreamFrame::Initial { replay_bytes, .. } => {
+                            TapStreamFrame::Initial { rows, cols, replay_bytes } => {
+                                tracing::debug!(rows, cols, len = replay_bytes.len(), "Initial frame");
                                 let _ = stdout.write_all(b"\x1b[2J\x1b[H");
                                 let _ = stdout.write_all(&replay_bytes);
                                 paint_status_bar(&mut stdout, term_rows, term_cols, &info, &mode);
@@ -501,6 +566,7 @@ async fn connect(
                                 session_ready = true;
                             }
                             TapStreamFrame::Output(b) => {
+                                tracing::trace!(len = b.len(), "Output frame");
                                 let _ = stdout.write_all(&b);
                                 // Only re-paint the status bar when the
                                 // user is actively composing — otherwise
@@ -513,10 +579,9 @@ async fn connect(
                                 }
                                 let _ = stdout.flush();
                             }
-                            // Captured session resized. Don't propagate
-                            // to the local terminal — the user's
-                            // terminal dims are what they care about.
-                            TapStreamFrame::Resize { .. } => {}
+                            TapStreamFrame::Resize { rows, cols } => {
+                                tracing::debug!(rows, cols, "captured-session resize");
+                            }
                         }
                     }
                     LocalMessage::StreamClosed { stream_id: sid, reason }
@@ -726,8 +791,22 @@ async fn send_inject(
     .await
 }
 
-/// Paint the bottom-row status bar. Saves and restores cursor so the
-/// captured session sees no apparent disturbance.
+/// Paint the bottom-row status bar.
+///
+/// We deliberately do *not* use DECSC/DECRC (\x1b7 / \x1b8) or CSI
+/// save/restore (\x1b[s / \x1b[u) to bracket the paint. Those have a
+/// single shared "saved cursor" slot, and full-screen apps like
+/// `top` use the same slot for their own redraw bookkeeping — every
+/// status-bar repaint would clobber the application's saved state
+/// and the captured session's display would desync until something
+/// (`clear` or alt-screen exit) reset things.
+///
+/// Trade-off: after we paint, the cursor sits at the end of the
+/// status bar. The next Output frame from the captured session
+/// almost always begins with absolute cursor positioning (top, vim,
+/// htop all redraw via CUP), so the cursor lands back where the
+/// session expects it within one frame. Idle shells re-emit the
+/// prompt from a known position on the next keystroke.
 fn paint_status_bar(
     stdout: &mut std::io::StdoutLock<'static>,
     rows: u16,
@@ -736,7 +815,6 @@ fn paint_status_bar(
     mode: &ConnectMode,
 ) {
     if let ConnectMode::Compose(buf) = mode {
-        // Compose mode owns the bottom row — skip status painting.
         paint_compose_prompt(stdout, rows, cols, buf);
         return;
     }
@@ -747,20 +825,16 @@ fn paint_status_bar(
         let pad = cols - left.len() - right.len();
         format!("{}{}{}", left, " ".repeat(pad), right)
     } else if left.len() <= cols {
-        // Fall back: just left side, truncate right to fit.
         let pad = cols - left.len();
         format!("{}{}", left, " ".repeat(pad))
     } else {
-        // Even the left side doesn't fit — chop it.
         left.chars().take(cols).collect()
     };
     bar.truncate(bar.char_indices().nth(cols).map(|(i, _)| i).unwrap_or(bar.len()));
 
-    // \x1b 7 = save cursor (incl. attrs); \x1b 8 = restore.
-    // \x1b[<rows>;1H positions to bottom-left.
     let _ = write!(
         stdout,
-        "\x1b7\x1b[{};1H\x1b[K\x1b[7m{}\x1b[0m\x1b8",
+        "\x1b[{};1H\x1b[K\x1b[7m{}\x1b[0m",
         rows, bar
     );
 }
