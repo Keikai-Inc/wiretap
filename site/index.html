@@ -370,7 +370,12 @@
         cols: 80, rows: 24,
         autoPlay: false,
         loop: false,        // we handle the loop manually so we can pause between iterations
-        idleTimeLimit: 1.5,
+        // No idleTimeLimit. Each player compresses cast-internal pauses
+        // independently, so different idle distributions on the two
+        // casts (admin sits idle while hacker is busy and vice versa)
+        // produce different wall-clock advancement and the demo
+        // visibly desyncs by several seconds. Real-time playback is
+        // perfectly synchronized.
         theme: 'asciinema', fit: 'width',
       };
       var admin  = AsciinemaPlayer.create('admin.cast',  adminEl,  common);
