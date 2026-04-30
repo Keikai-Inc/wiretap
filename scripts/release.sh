@@ -5,7 +5,7 @@
 # Usage:
 #   ./scripts/release.sh              # Release current version from Cargo.toml
 #   ./scripts/release.sh 0.2.0        # Bump to 0.2.0, commit, tag, and release
-#   ./scripts/release.sh --site-only  # (no site in this repo today; reserved)
+#   ./scripts/release.sh --site       # Upload site/ + install.sh only (no build)
 #
 # What it builds (Linux only — hop-tap is eBPF):
 #   - hop-tap-d-linux-x86_64,  hop-tap-d-linux-arm64
@@ -27,15 +27,17 @@ CF_DISTRIBUTION_ID="${HOP_TAP_CF_DISTRIBUTION_ID:-}"
 DIST_DIR="${PROJECT_ROOT}/target/release-dist"
 
 NEW_VERSION=""
+SITE_ONLY=0
 
 # --- Parse arguments --------------------------------------------------------
 
 for arg in "$@"; do
   case "${arg}" in
     --help|-h)
-      echo "Usage: $0 [VERSION]"
+      echo "Usage: $0 [VERSION] [--site]"
       echo ""
       echo "  VERSION   Bump to this version before releasing (e.g. 0.2.0)"
+      echo "  --site    Upload site/ + install.sh only (skip build, tag, push)"
       echo ""
       echo "Environment:"
       echo "  HOP_TAP_RELEASE_BUCKET     S3 bucket (default: hop-tap-releases)"
@@ -43,6 +45,9 @@ for arg in "$@"; do
       echo "  HOP_TAP_BPF_TOOLCHAIN      Rustc toolchain for eBPF build"
       echo "                             (default: stage1-vlad)"
       exit 0
+      ;;
+    --site|--site-only)
+      SITE_ONLY=1
       ;;
     *)
       if [[ "${arg}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
@@ -55,6 +60,92 @@ for arg in "$@"; do
       ;;
   esac
 done
+
+# --- Site upload helper -----------------------------------------------------
+#
+# Uploads site/*.html, *.css, *.js, icons, and install.sh with appropriate
+# Content-Type and Cache-Control. HTML/CSS/JS get a short cache (5 min) so
+# updates roll out fast; icons get 30 days. Used by both --site mode and
+# the normal full release.
+
+upload_site() {
+  local site_dir="${PROJECT_ROOT}/site"
+  if [[ ! -d "${site_dir}" ]]; then
+    echo "==> No site/ directory, skipping site upload"
+    return 0
+  fi
+
+  echo "==> Uploading site files to s3://${BUCKET}/"
+
+  local short_cache="public, max-age=300"
+  local long_cache="public, max-age=2592000"
+
+  for f in "${site_dir}"/*.html; do
+    [[ -e "$f" ]] || continue
+    aws s3 cp "$f" "s3://${BUCKET}/$(basename "$f")" \
+      --content-type "text/html; charset=utf-8" \
+      --cache-control "${short_cache}"
+  done
+
+  for f in "${site_dir}"/*.css; do
+    [[ -e "$f" ]] || continue
+    aws s3 cp "$f" "s3://${BUCKET}/$(basename "$f")" \
+      --content-type "text/css; charset=utf-8" \
+      --cache-control "${short_cache}"
+  done
+
+  for f in "${site_dir}"/*.js; do
+    [[ -e "$f" ]] || continue
+    aws s3 cp "$f" "s3://${BUCKET}/$(basename "$f")" \
+      --content-type "application/javascript; charset=utf-8" \
+      --cache-control "${short_cache}"
+  done
+
+  for f in "${site_dir}"/*.png; do
+    [[ -e "$f" ]] || continue
+    aws s3 cp "$f" "s3://${BUCKET}/$(basename "$f")" \
+      --content-type "image/png" \
+      --cache-control "${long_cache}"
+  done
+
+  for f in "${site_dir}"/*.ico; do
+    [[ -e "$f" ]] || continue
+    aws s3 cp "$f" "s3://${BUCKET}/$(basename "$f")" \
+      --content-type "image/x-icon" \
+      --cache-control "${long_cache}"
+  done
+
+  if [[ -f "${PROJECT_ROOT}/install.sh" ]]; then
+    aws s3 cp "${PROJECT_ROOT}/install.sh" "s3://${BUCKET}/install.sh" \
+      --content-type "text/x-shellscript; charset=utf-8" \
+      --cache-control "${short_cache}"
+  fi
+}
+
+invalidate_site_paths() {
+  if [[ -z "${CF_DISTRIBUTION_ID}" ]]; then
+    echo "==> Skipping CloudFront invalidation (HOP_TAP_CF_DISTRIBUTION_ID not set)"
+    return 0
+  fi
+  echo "==> Invalidating CloudFront site paths"
+  aws cloudfront create-invalidation \
+    --distribution-id "${CF_DISTRIBUTION_ID}" \
+    --paths "/" "/index.html" "/remote.html" "/shared.css" "/shared.js" "/install.sh" \
+    --output text --query 'Invalidation.Id'
+}
+
+if [[ "${SITE_ONLY}" -eq 1 ]]; then
+  echo "==> Site-only mode (skipping build/tag/push)"
+  if ! aws sts get-caller-identity >/dev/null 2>&1; then
+    echo "Error: AWS credentials not configured."
+    exit 1
+  fi
+  upload_site
+  invalidate_site_paths
+  echo ""
+  echo "Site updated: https://tap.keik.ai/"
+  exit 0
+fi
 
 # --- Preflight --------------------------------------------------------------
 
@@ -228,11 +319,12 @@ echo -n "${VERSION}" > "${DIST_DIR}/latest"
 aws s3 cp "${DIST_DIR}/latest" "s3://${BUCKET}/latest" \
   --content-type "text/plain"
 
-echo "==> Uploading install.sh + service unit"
-aws s3 cp "${PROJECT_ROOT}/install.sh" "s3://${BUCKET}/install.sh" \
-  --content-type "text/plain"
+echo "==> Uploading service unit"
 aws s3 cp "${PROJECT_ROOT}/hop-tap.service" "s3://${BUCKET}/hop-tap.service" \
   --content-type "text/plain"
+
+# Site files + install.sh use the shared helper (correct content-types + caching).
+upload_site
 
 # --- Git tag ----------------------------------------------------------------
 
@@ -253,7 +345,8 @@ if [[ -n "${CF_DISTRIBUTION_ID}" ]]; then
   echo "==> Invalidating CloudFront cache"
   aws cloudfront create-invalidation \
     --distribution-id "${CF_DISTRIBUTION_ID}" \
-    --paths "/" "/latest" "/install.sh" "/hop-tap.service" "/v${VERSION}/*" \
+    --paths "/" "/index.html" "/remote.html" "/shared.css" "/shared.js" \
+            "/latest" "/install.sh" "/hop-tap.service" "/v${VERSION}/*" \
     --output text --query 'Invalidation.Id'
 else
   echo "==> Skipping CloudFront invalidation (HOP_TAP_CF_DISTRIBUTION_ID not set)"
