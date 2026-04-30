@@ -115,14 +115,20 @@ impl SandboxSpec {
 /// configured command. Never returns on success — control transfers
 /// to the new program. Returns `Err` only on setup failure before
 /// the exec.
+///
+/// The flow is split across a `fork()` boundary: `unshare(2)` only
+/// puts the *children* of the calling process into the new PID
+/// namespace, not the caller itself. So mounting `/proc` (which the
+/// kernel binds to the calling process's PID namespace) has to
+/// happen on the child side. The parent waits on the child; if the
+/// parent is killed the child follows via `PR_SET_PDEATHSIG=SIGKILL`.
 pub fn enter_sandbox_and_exec(spec: SandboxSpec) -> Result<std::convert::Infallible> {
     let euid = nix::unistd::geteuid().as_raw();
     let egid = nix::unistd::getegid().as_raw();
 
-    // Step 1: namespace unshare. CLONE_NEWUSER lets us own the
-    // namespaces below without being real root; combined with the
-    // uid/gid map writes we do next, we get pseudo-root inside the
-    // sandbox while staying unprivileged on the host.
+    // Namespace unshare. Everything except CLONE_NEWPID takes effect
+    // on the calling process immediately; CLONE_NEWPID only affects
+    // future children (ours, after the fork below).
     unshare(
         CloneFlags::CLONE_NEWUSER
             | CloneFlags::CLONE_NEWNS
@@ -143,23 +149,52 @@ pub fn enter_sandbox_and_exec(spec: SandboxSpec) -> Result<std::convert::Infalli
     std::fs::write("/proc/self/setgroups", b"deny").context("setgroups deny")?;
     write_id_map("/proc/self/gid_map", spec.gid, egid).context("gid_map")?;
 
-    // Step 2: hostname for the new UTS namespace.
+    // Hostname for the new UTS namespace.
     sethostname(spec.hostname.as_str()).context("sethostname")?;
 
-    // Step 3: build the sandbox root and pivot in.
-    let root = build_sandbox_root(&spec).context("build sandbox root")?;
-    pivot_into(&root).context("pivot_root")?;
-
-    // Step 4: chdir to the user's home (now visible at the canonical
-    // /home/<user> path inside the sandbox).
-    chdir(&spec.home).with_context(|| format!("chdir {:?}", spec.home))?;
-
-    // Step 5: prevent privilege escalation in the impostor — the user
-    // can run setuid binaries but they won't actually elevate.
-    no_new_privs().context("PR_SET_NO_NEW_PRIVS")?;
-
-    // Step 6: exec.
-    exec_command(&spec.command, &spec.env)
+    // Fork. The child lands in the new PID namespace as PID 1 and
+    // does the rest of the sandbox work + exec; the parent stays in
+    // the old PID namespace and just waits.
+    use nix::sys::wait::{waitpid, WaitStatus};
+    use nix::unistd::{fork, ForkResult};
+    // SAFETY: tap-honeypot is single-threaded at this point (no
+    // tokio runtime, no spawned threads). fork(2) is sound.
+    match unsafe { fork() }.context("fork into new PID namespace")? {
+        ForkResult::Child => {
+            // SIGKILL me when the parent dies, so killing the
+            // tap-honeypot process the daemon spawned reliably tears
+            // the whole sandbox down.
+            // SAFETY: prctl with scalar args.
+            unsafe {
+                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0);
+            }
+            // If the parent died between the fork and the prctl,
+            // PR_SET_PDEATHSIG won't fire — bail out manually so we
+            // don't leak a sandbox process.
+            if unsafe { libc::getppid() } == 1 {
+                std::process::exit(1);
+            }
+            // Build sandbox root + pivot.
+            let root = build_sandbox_root(&spec).context("build sandbox root")?;
+            pivot_into(&root).context("pivot_root")?;
+            chdir(&spec.home).with_context(|| format!("chdir {:?}", spec.home))?;
+            no_new_privs().context("PR_SET_NO_NEW_PRIVS")?;
+            // Exec replaces this process. Never returns on success.
+            exec_command(&spec.command, &spec.env)
+        }
+        ForkResult::Parent { child } => {
+            // Wait for the child. If the child exits cleanly we
+            // exit with the same status; if it's killed by signal
+            // we propagate.
+            match waitpid(child, None).context("waitpid sandbox child")? {
+                WaitStatus::Exited(_, code) => std::process::exit(code),
+                WaitStatus::Signaled(_, sig, _) => {
+                    std::process::exit(128 + sig as i32);
+                }
+                _ => std::process::exit(1),
+            }
+        }
+    }
 }
 
 /// Write a single-line uid/gid map mapping the entire sandbox uid

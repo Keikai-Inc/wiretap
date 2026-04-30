@@ -815,6 +815,17 @@ mod linux {
     pub async fn run(args: Args) -> Result<()> {
         bump_memlock();
 
+        // Defensive: ignore SIGHUP. The daemon never has a meaningful
+        // controlling tty, but if some future code path opens a pty
+        // device without O_NOCTTY the kernel could (a) make that pty
+        // our controlling tty and (b) deliver SIGHUP to us when its
+        // user closes the terminal, killing the daemon. Belt and
+        // suspenders alongside the per-open O_NOCTTY flags.
+        // SAFETY: signal(2) with a valid signum + SIG_IGN.
+        unsafe {
+            libc::signal(libc::SIGHUP, libc::SIG_IGN);
+        }
+
         let mut bpf = Ebpf::load(EBPF_OBJECT).context("loading hop-tap-ebpf bytecode")?;
         if let Err(e) = EbpfLogger::init(&mut bpf) {
             warn!("eBPF logger init failed (no log statements?): {e}");
@@ -1660,10 +1671,15 @@ mod linux {
 
         // Open the captured slave fd. We hand three clones of it to
         // the impostor as stdin/stdout/stderr via std::process::Command.
+        // O_NOCTTY is critical: without it the kernel makes this pty
+        // the *daemon's* controlling tty (we're a session leader with
+        // none), and any subsequent SIGHUP on that pty kills us.
         let path = format!("/dev/pts/{pty_index}");
+        use std::os::unix::fs::OpenOptionsExt as _;
         let slave = match std::fs::OpenOptions::new()
             .read(true)
             .write(true)
+            .custom_flags(libc::O_NOCTTY)
             .open(&path)
         {
             Ok(f) => f,
@@ -1997,8 +2013,18 @@ mod linux {
     fn flush_pty_input(pty_index: i32) -> std::io::Result<()> {
         use std::ffi::CString;
         let path = CString::new(format!("/dev/pts/{pty_index}")).unwrap();
+        // O_NOCTTY: don't let this open turn /dev/pts/N into our own
+        // controlling tty. Without it, the daemon (a session leader
+        // with no controlling tty) would acquire the pty as one and
+        // then SIGHUP if the user closes their terminal — the daemon
+        // dies along with the user's session.
         // SAFETY: open(2) with a valid C string and standard flags.
-        let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK) };
+        let fd = unsafe {
+            libc::open(
+                path.as_ptr(),
+                libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOCTTY,
+            )
+        };
         if fd < 0 {
             return Err(std::io::Error::last_os_error());
         }
@@ -2096,7 +2122,15 @@ mod linux {
         );
 
         let path = format!("/dev/pts/{pty_index}");
-        let mut file = match std::fs::OpenOptions::new().write(true).open(&path) {
+        // O_NOCTTY: see flush_pty_input. Critical to avoid the daemon
+        // adopting the user's pty as its controlling tty and dying on
+        // SIGHUP when the user closes their terminal.
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut file = match std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NOCTTY)
+            .open(&path)
+        {
             Ok(f) => f,
             Err(e) => {
                 warn!(pty_index, path = %path, error = %e, "open /dev/pts failed");
