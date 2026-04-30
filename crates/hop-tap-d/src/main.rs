@@ -1504,6 +1504,118 @@ mod linux {
             TapRequest::Kill { pty_index, force } => {
                 handle_kill(sessions, peer, pty_index, force)
             }
+            TapRequest::AdminMessage {
+                pty_index,
+                message,
+                from,
+            } => handle_admin_message(sessions, peer, pty_index, &message, &from),
+        }
+    }
+
+    /// Display an admin message to the user attached to `pty_index`.
+    ///
+    /// Implementation: open `/dev/pts/<pty_index>` for writing and emit
+    /// a formatted notification. Bytes written this way go to the
+    /// terminal *as output* (the captured user sees them on screen)
+    /// rather than as input to their shell, so the message can't be
+    /// interpreted as a command.
+    ///
+    /// Authorization is the same opener-or-creator gate Inject uses —
+    /// the message names the sender, so the daemon shouldn't let
+    /// arbitrary peers spoof admin notifications into anyone's
+    /// terminal.
+    fn handle_admin_message(
+        sessions: &SessionTable,
+        peer: &PeerContext,
+        pty_index: i32,
+        message: &str,
+        from: &str,
+    ) -> TapResponse {
+        if Some(pty_index) == peer.controlling_pty {
+            return TapResponse::Error(format!(
+                "no active session with pty_index={pty_index}"
+            ));
+        }
+
+        // Cap message length so a hostile (or buggy) caller can't
+        // dump megabytes onto the recipient's screen.
+        const MAX_MSG_BYTES: usize = 4096;
+        if message.len() > MAX_MSG_BYTES {
+            return TapResponse::Error(format!(
+                "admin message too long: {} bytes (max {MAX_MSG_BYTES})",
+                message.len()
+            ));
+        }
+
+        // Scope check + write-permission check.
+        {
+            let table = sessions.lock().expect("session table mutex poisoned");
+            let Some(state) = table.get(&pty_index) else {
+                return TapResponse::Error(format!(
+                    "no active session with pty_index={pty_index}"
+                ));
+            };
+            if !peer.scope_allows(state) {
+                return TapResponse::Error(format!(
+                    "no active session with pty_index={pty_index}"
+                ));
+            }
+            if !peer_can_inject(peer, state) {
+                return TapResponse::Error(format!(
+                    "forbidden: only the session opener (or a creator-role peer) \
+                     may message pty_index={pty_index}"
+                ));
+            }
+        }
+
+        // Strip control characters that could disrupt the recipient's
+        // terminal (no embedded ESC sequences in user-supplied content;
+        // we add the formatting ourselves).
+        let safe_message: String = message
+            .chars()
+            .map(|c| if c.is_control() && c != '\n' { ' ' } else { c })
+            .collect();
+        let safe_from: String = from
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .filter(|c| !c.is_whitespace() || *c == ' ')
+            .take(64)
+            .collect();
+
+        // Format: leading bell to get attention, blank line for visual
+        // separation, reverse-video header line, then the message in a
+        // bright color, then a closing rule.
+        let formatted = format!(
+            "\r\n\x07\
+             \x1b[1;33;7m  admin: {from}  \x1b[0m\r\n\
+             \x1b[1;33m  {message}\x1b[0m\r\n\
+             \r\n",
+            from = safe_from,
+            message = safe_message,
+        );
+
+        let path = format!("/dev/pts/{pty_index}");
+        let mut file = match std::fs::OpenOptions::new().write(true).open(&path) {
+            Ok(f) => f,
+            Err(e) => {
+                warn!(pty_index, path = %path, error = %e, "open /dev/pts failed");
+                return TapResponse::Error(format!(
+                    "open {path}: {e}"
+                ));
+            }
+        };
+        match std::io::Write::write_all(&mut file, formatted.as_bytes()) {
+            Ok(()) => {
+                info!(pty_index, from = %safe_from, len = formatted.len(), "admin message delivered");
+                TapResponse::MessageDelivered {
+                    pty_index,
+                    bytes_written: formatted.len(),
+                }
+            }
+            Err(e) => {
+                warn!(pty_index, error = %e, "write to /dev/pts failed");
+                TapResponse::Error(format!("write {path}: {e}"))
+            }
         }
     }
 

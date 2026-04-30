@@ -49,6 +49,20 @@ pub enum TapRequest {
     /// If `force` is set we send SIGKILL instead.
     /// Same write-scope authorization as Inject.
     Kill { pty_index: i32, force: bool },
+    /// Display an admin message to the user attached to the captured
+    /// session. Unlike Inject, this is *terminal output* (written to
+    /// /dev/pts/N from the daemon) so the bytes don't get parsed as
+    /// shell input — they just appear on screen, formatted distinctly.
+    /// Same write-scope authorization as Inject.
+    AdminMessage {
+        pty_index: i32,
+        message: String,
+        /// Display name shown to the recipient as "[admin: <name>]".
+        /// The CLI fills it in with the local username; the daemon
+        /// trusts it (same trust model as the rest of the protocol —
+        /// the kernel-authoritative uid is on PeerContext separately).
+        from: String,
+    },
 }
 
 /// Daemon's reply. Carried inside `ExtMessage::Response.payload`.
@@ -77,6 +91,11 @@ pub enum TapResponse {
         pty_index: i32,
         pid: u32,
         signal: i32,
+    },
+    /// Reply to a successful [`TapRequest::AdminMessage`].
+    MessageDelivered {
+        pty_index: i32,
+        bytes_written: usize,
     },
     Error(String),
 }

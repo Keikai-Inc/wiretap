@@ -253,6 +253,12 @@ fn print_response(resp: &TapResponse) {
         } => {
             println!("sent signal {signal} to pid {pid} (pty={pty_index})");
         }
+        TapResponse::MessageDelivered {
+            pty_index,
+            bytes_written,
+        } => {
+            println!("delivered admin message to pty={pty_index} ({bytes_written} bytes)");
+        }
         TapResponse::Error(msg) => eprintln!("error: {msg}"),
     }
 }
@@ -326,26 +332,53 @@ async fn recv_local(read: &mut OwnedReadHalf) -> Result<LocalMessage> {
     Ok(msg)
 }
 
-/// `tap connect <pty>` — attach to a session bidirectionally.
+/// Modes the connect main loop alternates between based on user input.
+enum ConnectMode {
+    /// Default: forward bytes to the captured session via Inject.
+    Normal,
+    /// User pressed Ctrl-G — bytes are accumulated into a message and
+    /// rendered on the bottom row instead of forwarded. Enter sends,
+    /// Esc cancels.
+    Compose(String),
+}
+
+/// Snapshot of a session's identity that fits into the bottom status
+/// bar. Fetched once at connect time via `tap list`; we don't try to
+/// keep it live since the picker handles that.
+#[derive(Clone)]
+struct StatusInfo {
+    pty: i32,
+    user: String,
+    comm: String,
+}
+
+/// `tap connect <pty>` — attach to a session bidirectionally with a
+/// tmux-style bottom status bar.
 ///
-/// 1. Open a Subscribe stream so we receive Output frames. The Initial
-///    frame replays the current screen so the user joins mid-session
-///    without a blank terminal.
-/// 2. Put the local terminal into raw mode so keystrokes flow as
-///    bytes, not line-buffered.
-/// 3. Spawn a blocking thread that reads bytes from stdin. Single hot
-///    key: Ctrl-T detaches.
-/// 4. The main task selects between server frames (write to stdout)
-///    and stdin events (forward as Inject Calls).
-/// 5. Either side closing, a Ctrl-T, or a server StreamClosed ends
-///    the loop. The function returns an [`AttachOutcome`] so the
-///    caller can decide whether to re-enter the picker or exit.
+/// Layout: the local terminal's last row is reserved for the status
+/// bar via DECSTBM (set top/bottom margins to `1; rows-1`), so the
+/// captured session's content scrolls in the upper region without
+/// clobbering the bar. Most apps respect the scroll region;
+/// absolute-position writes to row N would still land on the bar,
+/// so we re-paint after every Output frame and on a 1s timer.
+///
+/// Keys:
+///   Ctrl-T → detach
+///   Ctrl-G → compose admin message (replaces status bar with input
+///            prompt; Enter sends via TapRequest::AdminMessage, which
+///            the daemon writes to /dev/pts/N as terminal output;
+///            Esc cancels)
 async fn connect(
     stream: UnixStream,
     next_id: &mut u64,
     pty: i32,
 ) -> Result<AttachOutcome> {
     let (mut read_half, mut write_half) = stream.into_split();
+
+    // Fetch the session's identity for the status bar before we
+    // subscribe — this keeps the Subscribe path symmetric with the
+    // existing flow and the List call uses a separate request_id.
+    let info = fetch_status_info(&mut read_half, &mut write_half, next_id, pty).await?;
 
     // 1. Subscribe to the watch stream and confirm the daemon
     //    accepted it before we touch the local terminal. If the
@@ -378,56 +411,79 @@ async fn connect(
         }
     };
 
-    // 2. Raw mode + Drop-guarded restore.
+    // 2. Raw mode + Drop-guarded restore. The DECSTBM scroll-region
+    //    setup happens after the first Initial frame.
     crossterm::terminal::enable_raw_mode().context("enable raw mode")?;
     let _raw = RawModeGuard;
-    eprintln!(
-        "\r\n[tap connect pty={pty} — Ctrl-T to detach (back to picker; q in picker exits)]\r\n"
-    );
 
-    // 3. Blocking stdin reader on a dedicated thread. We do raw read(2)
-    //    so we control buffering and can poll(2) with a timeout to
-    //    disambiguate bare Esc from the start of an escape sequence.
+    // 3. Blocking stdin reader on a dedicated thread. Single hot key
+    //    is Ctrl-T (detach); other special handling — including
+    //    Ctrl-G for compose mode — happens in the main loop where
+    //    we have the mode state.
     let (stdin_tx, mut stdin_rx) = mpsc::unbounded_channel::<StdinEvent>();
     std::thread::spawn(move || {
         stdin_reader_loop(stdin_tx);
     });
 
-    // 4. Main multiplex loop. Use a separate request_id space for
-    //    Injects so they don't collide with the Subscribe id.
-    let mut inject_id: u64 = sub_request_id.wrapping_add(1);
+    let (mut term_cols, mut term_rows) = match crossterm::terminal::size() {
+        Ok((c, r)) => (c, r),
+        Err(_) => (80, 24),
+    };
+
     let mut stdout = std::io::stdout().lock();
-    loop {
+    let mut mode = ConnectMode::Normal;
+
+    // Will become true once we've received the first Initial frame —
+    // we hold off on configuring DECSTBM and painting the status bar
+    // until the captured session's screen is rendered, otherwise the
+    // status bar gets immediately overwritten by the Initial replay.
+    let mut session_ready = false;
+    let mut admin_id: u64 = sub_request_id.wrapping_add(1_000_000);
+    let mut inject_id: u64 = sub_request_id.wrapping_add(1);
+
+    let mut status_timer = tokio::time::interval(std::time::Duration::from_secs(1));
+    status_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    let outcome = loop {
         tokio::select! {
             biased;
-            // Drain stdin first so user keystrokes don't queue up
-            // behind a flood of output. Important when watching a
-            // chatty session — we want responsive typing.
-            evt = stdin_rx.recv() => match evt {
-                Some(StdinEvent::Bytes(b)) => {
-                    inject_id = inject_id.wrapping_add(1);
-                    if let Err(e) = send_local(
-                        &mut write_half,
-                        &LocalMessage::Call {
-                            request_id: inject_id,
-                            payload: TapRequest::Inject { pty_index: pty, bytes: b },
-                        },
-                    ).await {
-                        eprintln!("\r\n[connect: send failed: {e}]\r");
-                        return Ok(AttachOutcome::SessionClosed);
+            evt = stdin_rx.recv() => {
+                let event = match evt {
+                    Some(e) => e,
+                    None => break AttachOutcome::Detached,
+                };
+                match event {
+                    StdinEvent::Detach => {
+                        break AttachOutcome::Detached;
+                    }
+                    StdinEvent::Bytes(bytes) => {
+                        match handle_stdin_bytes(
+                            bytes,
+                            &mut mode,
+                            &mut stdout,
+                            term_rows,
+                            term_cols,
+                            &info,
+                            &mut write_half,
+                            &mut inject_id,
+                            &mut admin_id,
+                            pty,
+                        ).await {
+                            Ok(()) => {}
+                            Err(e) => {
+                                eprintln!("\r\n[connect: send failed: {e}]\r");
+                                break AttachOutcome::SessionClosed;
+                            }
+                        }
                     }
                 }
-                Some(StdinEvent::Detach) | None => {
-                    eprintln!("\r\n[detached]\r");
-                    return Ok(AttachOutcome::Detached);
-                }
-            },
+            }
             msg = recv_local(&mut read_half) => {
                 let msg = match msg {
                     Ok(m) => m,
                     Err(e) => {
                         eprintln!("\r\n[connect: server closed: {e}]\r");
-                        return Ok(AttachOutcome::SessionClosed);
+                        break AttachOutcome::SessionClosed;
                     }
                 };
                 match msg {
@@ -435,16 +491,23 @@ async fn connect(
                         match payload {
                             TapStreamFrame::Initial { replay_bytes, .. } => {
                                 let _ = stdout.write_all(b"\x1b[2J\x1b[H");
+                                // Reserve the bottom row for our status bar.
+                                let _ = write!(stdout, "\x1b[1;{}r", term_rows.saturating_sub(1).max(1));
                                 let _ = stdout.write_all(&replay_bytes);
+                                paint_status_bar(&mut stdout, term_rows, term_cols, &info, &mode);
                                 let _ = stdout.flush();
+                                session_ready = true;
                             }
                             TapStreamFrame::Output(b) => {
                                 let _ = stdout.write_all(&b);
+                                if session_ready {
+                                    paint_status_bar(&mut stdout, term_rows, term_cols, &info, &mode);
+                                }
                                 let _ = stdout.flush();
                             }
-                            // Resize is informational — we don't propagate
-                            // to the local terminal. The user's terminal
-                            // size is already what they care about.
+                            // Captured session resized. Don't propagate
+                            // to the local terminal — the user's
+                            // terminal dims are what they care about.
                             TapStreamFrame::Resize { .. } => {}
                         }
                     }
@@ -455,17 +518,279 @@ async fn connect(
                             "\r\n[session ended: {}]\r",
                             reason.unwrap_or_else(|| "(no reason)".into())
                         );
-                        return Ok(AttachOutcome::SessionClosed);
+                        break AttachOutcome::SessionClosed;
                     }
-                    // Inject ack: TapResponse::Injected. Fire-and-forget;
-                    // we don't surface per-keystroke confirmations.
+                    // Inject / AdminMessage acks: fire-and-forget.
                     LocalMessage::Reply { .. } => {}
-                    // Stale frame from a previous stream id, etc.
                     _ => {}
+                }
+            }
+            _ = status_timer.tick() => {
+                // Periodic re-paint catches the case where the session
+                // wrote into our status row via absolute cursor
+                // positioning. Also re-fetches terminal size in case
+                // the user resized.
+                if let Ok((c, r)) = crossterm::terminal::size() {
+                    if (c, r) != (term_cols, term_rows) {
+                        term_cols = c;
+                        term_rows = r;
+                        let _ = write!(stdout, "\x1b[1;{}r", term_rows.saturating_sub(1).max(1));
+                    }
+                }
+                if session_ready {
+                    paint_status_bar(&mut stdout, term_rows, term_cols, &info, &mode);
+                    let _ = stdout.flush();
+                }
+            }
+        }
+    };
+
+    // Tear down: clear scroll region back to full screen and erase
+    // the status row so it doesn't linger on the user's terminal.
+    let _ = stdout.write_all(b"\x1b[r");
+    let _ = write!(stdout, "\x1b[{};1H\x1b[K", term_rows);
+    let _ = stdout.flush();
+    drop(stdout);
+    eprintln!("\r\n[detached]\r");
+    Ok(outcome)
+}
+
+/// One-shot `List` over the connect socket so we can fill in the
+/// status bar with the session's user/comm. Uses the same read/write
+/// halves the connect main loop will use afterward — we issue this
+/// before subscribing so there's no concurrent traffic to filter.
+async fn fetch_status_info(
+    read: &mut OwnedReadHalf,
+    write: &mut OwnedWriteHalf,
+    next_id: &mut u64,
+    pty: i32,
+) -> Result<StatusInfo> {
+    let request_id = *next_id;
+    *next_id += 1;
+    send_local(
+        write,
+        &LocalMessage::Call {
+            request_id,
+            payload: TapRequest::List,
+        },
+    )
+    .await?;
+    loop {
+        match recv_local(read).await? {
+            LocalMessage::Reply {
+                request_id: rid,
+                payload: TapResponse::SessionList(list),
+            } if rid == request_id => {
+                let info = list
+                    .into_iter()
+                    .find(|s| s.pty_index == pty)
+                    .map(|s| StatusInfo {
+                        pty,
+                        user: format_user(&s.opener_username, s.opener_uid),
+                        comm: s.last_comm,
+                    })
+                    .unwrap_or_else(|| StatusInfo {
+                        pty,
+                        user: String::from("?"),
+                        comm: String::from("?"),
+                    });
+                return Ok(info);
+            }
+            _ => continue,
+        }
+    }
+}
+
+/// Process bytes from stdin. In Normal mode, scan for Ctrl-G — if
+/// present, split: forward bytes-before via Inject, switch to Compose
+/// for what follows. In Compose mode, accumulate bytes into the
+/// message buffer, watching for Enter (send), Esc (cancel), and
+/// Backspace.
+async fn handle_stdin_bytes(
+    bytes: Vec<u8>,
+    mode: &mut ConnectMode,
+    stdout: &mut std::io::StdoutLock<'static>,
+    rows: u16,
+    cols: u16,
+    info: &StatusInfo,
+    write: &mut OwnedWriteHalf,
+    inject_id: &mut u64,
+    admin_id: &mut u64,
+    pty: i32,
+) -> Result<()> {
+    const CTRL_G: u8 = 0x07;
+    const ENTER_CR: u8 = 0x0D;
+    const ENTER_LF: u8 = 0x0A;
+    const ESC: u8 = 0x1B;
+    const BACKSPACE_DEL: u8 = 0x7F;
+    const BACKSPACE_BS: u8 = 0x08;
+
+    // Walk bytes one at a time, since each byte may transition modes.
+    // Buffer a "to inject" run and flush it when we hit a transition,
+    // so we don't issue an Inject RPC per keystroke.
+    let mut to_inject: Vec<u8> = Vec::with_capacity(bytes.len());
+
+    for &b in &bytes {
+        match mode {
+            ConnectMode::Normal => {
+                if b == CTRL_G {
+                    if !to_inject.is_empty() {
+                        send_inject(write, inject_id, pty, std::mem::take(&mut to_inject)).await?;
+                    }
+                    *mode = ConnectMode::Compose(String::new());
+                    paint_compose_prompt(stdout, rows, cols, "");
+                    let _ = stdout.flush();
+                } else {
+                    to_inject.push(b);
+                }
+            }
+            ConnectMode::Compose(buf) => {
+                match b {
+                    ENTER_CR | ENTER_LF => {
+                        // Send (if non-empty) and exit compose.
+                        let msg = std::mem::take(buf);
+                        *mode = ConnectMode::Normal;
+                        paint_status_bar(stdout, rows, cols, info, mode);
+                        let _ = stdout.flush();
+                        if !msg.trim().is_empty() {
+                            *admin_id = admin_id.wrapping_add(1);
+                            let from = local_username();
+                            send_local(
+                                write,
+                                &LocalMessage::Call {
+                                    request_id: *admin_id,
+                                    payload: TapRequest::AdminMessage {
+                                        pty_index: pty,
+                                        message: msg,
+                                        from,
+                                    },
+                                },
+                            )
+                            .await?;
+                        }
+                    }
+                    ESC | CTRL_G => {
+                        // Cancel.
+                        buf.clear();
+                        *mode = ConnectMode::Normal;
+                        paint_status_bar(stdout, rows, cols, info, mode);
+                        let _ = stdout.flush();
+                    }
+                    BACKSPACE_BS | BACKSPACE_DEL => {
+                        buf.pop();
+                        paint_compose_prompt(stdout, rows, cols, buf);
+                        let _ = stdout.flush();
+                    }
+                    b if b.is_ascii_control() => {
+                        // Drop other control bytes silently — keep
+                        // the buffer plain text.
+                    }
+                    b => {
+                        buf.push(b as char);
+                        paint_compose_prompt(stdout, rows, cols, buf);
+                        let _ = stdout.flush();
+                    }
                 }
             }
         }
     }
+    if !to_inject.is_empty() {
+        send_inject(write, inject_id, pty, to_inject).await?;
+    }
+    Ok(())
+}
+
+async fn send_inject(
+    write: &mut OwnedWriteHalf,
+    inject_id: &mut u64,
+    pty: i32,
+    bytes: Vec<u8>,
+) -> Result<()> {
+    *inject_id = inject_id.wrapping_add(1);
+    send_local(
+        write,
+        &LocalMessage::Call {
+            request_id: *inject_id,
+            payload: TapRequest::Inject {
+                pty_index: pty,
+                bytes,
+            },
+        },
+    )
+    .await
+}
+
+/// Paint the bottom-row status bar. Saves and restores cursor so the
+/// captured session sees no apparent disturbance.
+fn paint_status_bar(
+    stdout: &mut std::io::StdoutLock<'static>,
+    rows: u16,
+    cols: u16,
+    info: &StatusInfo,
+    mode: &ConnectMode,
+) {
+    if let ConnectMode::Compose(buf) = mode {
+        // Compose mode owns the bottom row — skip status painting.
+        paint_compose_prompt(stdout, rows, cols, buf);
+        return;
+    }
+    let left = format!(" tap pty={} {} {} ", info.pty, info.user, info.comm);
+    let right = " Ctrl-T menu  Ctrl-G msg ";
+    let cols = cols as usize;
+    let mut bar = if left.len() + right.len() <= cols {
+        let pad = cols - left.len() - right.len();
+        format!("{}{}{}", left, " ".repeat(pad), right)
+    } else if left.len() <= cols {
+        // Fall back: just left side, truncate right to fit.
+        let pad = cols - left.len();
+        format!("{}{}", left, " ".repeat(pad))
+    } else {
+        // Even the left side doesn't fit — chop it.
+        left.chars().take(cols).collect()
+    };
+    bar.truncate(bar.char_indices().nth(cols).map(|(i, _)| i).unwrap_or(bar.len()));
+
+    // \x1b 7 = save cursor (incl. attrs); \x1b 8 = restore.
+    // \x1b[<rows>;1H positions to bottom-left.
+    let _ = write!(
+        stdout,
+        "\x1b7\x1b[{};1H\x1b[K\x1b[7m{}\x1b[0m\x1b8",
+        rows, bar
+    );
+}
+
+/// Paint the Compose-mode input prompt on the bottom row. Cursor is
+/// left at the input position so the user sees what they're typing.
+fn paint_compose_prompt(
+    stdout: &mut std::io::StdoutLock<'static>,
+    rows: u16,
+    cols: u16,
+    buf: &str,
+) {
+    let prefix = " admin > ";
+    let suffix = "  [Enter=send Esc=cancel] ";
+    let cols = cols as usize;
+    let avail = cols.saturating_sub(prefix.len() + suffix.len());
+    let shown: String = buf.chars().rev().take(avail).collect::<String>().chars().rev().collect();
+    let pad = avail.saturating_sub(shown.chars().count());
+    let _ = write!(
+        stdout,
+        "\x1b[{rows};1H\x1b[K\x1b[1;33;7m{prefix}\x1b[0m\x1b[1;33m{shown}\x1b[0m{padding}\x1b[1;33;7m{suffix}\x1b[0m\x1b[{rows};{col}H",
+        rows = rows,
+        prefix = prefix,
+        shown = shown,
+        padding = " ".repeat(pad),
+        suffix = suffix,
+        col = prefix.len() + shown.chars().count() + 1,
+    );
+}
+
+/// Best-effort local username, used as the `from:` field on admin
+/// messages. Falls back to "admin" if the env doesn't have one.
+fn local_username() -> String {
+    std::env::var("USER")
+        .or_else(|_| std::env::var("LOGNAME"))
+        .unwrap_or_else(|_| "admin".into())
 }
 
 /// What the TUI picker returns to `main` after the user picks a
