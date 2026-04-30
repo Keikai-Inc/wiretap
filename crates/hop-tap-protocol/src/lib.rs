@@ -37,6 +37,12 @@ pub enum TapRequest {
     /// [`TapResponse::Snapshot`] on success or [`TapResponse::Error`]
     /// if the index isn't currently being captured.
     Snapshot { pty_index: i32 },
+    /// Write `bytes` into the captured session's pty master, as if
+    /// the user typed them. Authorized only for the session's opener
+    /// or a creator-role peer — read scope alone is not enough. The
+    /// daemon clones the master fd from whoever holds it (sshd, tmux,
+    /// the local terminal) via `pidfd_getfd` and writes through that.
+    Inject { pty_index: i32, bytes: Vec<u8> },
 }
 
 /// Daemon's reply. Carried inside `ExtMessage::Response.payload`.
@@ -51,6 +57,13 @@ pub enum TapResponse {
         /// Trailing whitespace is preserved so the caller can choose
         /// whether to display a 24-row block verbatim or trim.
         contents: Vec<String>,
+    },
+    /// Reply to a successful [`TapRequest::Inject`]. `bytes_written`
+    /// can be smaller than the requested length on a short write
+    /// (rare for ptys; the kernel buffer is typically large enough).
+    Injected {
+        pty_index: i32,
+        bytes_written: usize,
     },
     Error(String),
 }

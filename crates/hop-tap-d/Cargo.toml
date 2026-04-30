@@ -44,6 +44,13 @@ toml.workspace = true
 bincode.workspace = true
 libc.workspace = true
 
+# Used by the `tap` CLI for raw-mode stdin in `tap connect` and as
+# ratatui's backend for the no-args session picker. Cross-platform
+# (macOS dev builds compile too — the resulting `tap` binary is just
+# unused there since the daemon is Linux-only).
+crossterm = "0.29"
+ratatui = { version = "0.29", default-features = false, features = ["crossterm"] }
+
 # Linux-only: eBPF loader and per-CPU perf-array consumer.
 # Target-gated so the workspace still resolves on macOS / dev machines
 # where aya's syscall surface (perf_event_open, BPF()) is unavailable.

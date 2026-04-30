@@ -76,6 +76,7 @@ async fn main() -> Result<()> {
 #[cfg(target_os = "linux")]
 mod linux {
     mod local;
+    mod master_fd;
 
     use super::Args;
     use hop_tap_d::extension::{write_bootstrap_atomically, ExtMessage};
@@ -107,6 +108,7 @@ mod linux {
     use std::{
         collections::HashMap,
         io::Write as _,
+        os::fd::RawFd,
         path::PathBuf,
         sync::{
             atomic::{AtomicU64, Ordering},
@@ -210,6 +212,30 @@ mod linux {
         // session. Most sessions have zero subscribers so the fan-out
         // hot path is just an `is_empty()` check.
         subscribers: Vec<u64>,
+        // PID that most recently issued a master→slave (input)
+        // pty_write — i.e., the process holding a writable copy of
+        // the master fd (sshd, tmux server, local terminal emulator).
+        // Tracked separately from `last_pid` because `last_pid` is
+        // dominated by slave→master writes (the shell's output) and
+        // therefore points at the wrong process for fd cloning.
+        // 0 means we haven't observed an input event yet for this
+        // session — fall back to a /proc scan in that case.
+        master_holder_pid: u32,
+        // A daemon-owned writable fd cloned from the master holder
+        // via `pidfd_getfd`. -1 means "not yet captured" or "stale,
+        // re-clone next time". Closed in `Drop` so we don't leak fds
+        // when sessions end.
+        master_fd: RawFd,
+    }
+
+    impl Drop for SessionState {
+        fn drop(&mut self) {
+            if self.master_fd >= 0 {
+                unsafe {
+                    libc::close(self.master_fd);
+                }
+            }
+        }
     }
 
     impl SessionState {
@@ -248,6 +274,8 @@ mod linux {
                 term,
                 dims,
                 subscribers: Vec::new(),
+                master_holder_pid: 0,
+                master_fd: -1,
             }
         }
 
@@ -1214,7 +1242,12 @@ mod linux {
                         in_bytes = state.input_bytes,
                         "session ended"
                     );
-                    state.subscribers
+                    // SessionState now owns a cached master fd that
+                    // Drop closes — so we can't move `subscribers`
+                    // out of `state`. Clone the small Vec<u64> instead
+                    // and let `state` Drop normally as it goes out of
+                    // scope.
+                    state.subscribers.clone()
                 }
                 None => return,
             }
@@ -1338,6 +1371,129 @@ mod linux {
                     )),
                 }
             }
+            TapRequest::Inject { pty_index, bytes } => {
+                handle_inject(sessions, peer, pty_index, &bytes)
+            }
+        }
+    }
+
+    /// Handle an `Inject` request. Two-stage: first take the sessions
+    /// lock, validate scope and (re-)populate the cached master fd if
+    /// needed, then drop the lock and do the blocking write outside
+    /// it. Holding the lock across `write(2)` would let one slow
+    /// injection stall every other request handler.
+    ///
+    /// Authorization is **stricter** than `scope_allows`: read scope
+    /// gets you `tap watch` and `tap snapshot`, but injection is the
+    /// session's opener (matching uid) or a creator-role peer only. A
+    /// peer who can see a session shouldn't automatically be able to
+    /// type into it.
+    fn handle_inject(
+        sessions: &SessionTable,
+        peer: &PeerContext,
+        pty_index: i32,
+        bytes: &[u8],
+    ) -> TapResponse {
+        // Cap to a sane upper bound. 64 KiB is well above any realistic
+        // single keystroke or pasted line and far below the kernel's
+        // pty input buffer cap. Anything larger is almost certainly a
+        // bug or abuse.
+        const MAX_INJECT_BYTES: usize = 64 * 1024;
+        if bytes.len() > MAX_INJECT_BYTES {
+            return TapResponse::Error(format!(
+                "inject payload too large: {} bytes (max {MAX_INJECT_BYTES})",
+                bytes.len()
+            ));
+        }
+
+        // Stage 1: lock, validate, ensure we have a usable master_fd.
+        // Returns the fd to use for the actual write, plus the holder
+        // PID for diagnostics. We do NOT write under the lock.
+        let (fd, holder_pid) = {
+            let mut table = sessions.lock().expect("session table mutex poisoned");
+            let state = match table.get_mut(&pty_index) {
+                Some(s) => s,
+                None => {
+                    return TapResponse::Error(format!(
+                        "no active session with pty_index={pty_index}"
+                    ));
+                }
+            };
+
+            // Two checks. (a) Read scope — same masking as snapshot:
+            // surface a "doesn't exist" error so peers can't enumerate.
+            // (b) Write scope — must be opener-or-creator. Failure
+            // here is a real "forbidden" so the caller knows the
+            // session exists but isn't theirs to type into.
+            if !peer.scope_allows(state) {
+                return TapResponse::Error(format!(
+                    "no active session with pty_index={pty_index}"
+                ));
+            }
+            if !peer_can_inject(peer, state) {
+                return TapResponse::Error(format!(
+                    "forbidden: only the session opener (or a creator-role peer) \
+                     may inject into pty_index={pty_index}"
+                ));
+            }
+
+            if state.master_fd < 0 {
+                match master_fd::clone_master_fd(pty_index, state.master_holder_pid) {
+                    Ok(fd) => state.master_fd = fd,
+                    Err(e) => {
+                        return TapResponse::Error(format!(
+                            "cannot acquire master fd for pty_index={pty_index}: {e}"
+                        ));
+                    }
+                }
+            }
+            (state.master_fd, state.master_holder_pid)
+        };
+
+        // Stage 2: blocking write outside the lock. On EBADF/EIO we
+        // clear the cache so the next inject re-clones; the user can
+        // simply retry.
+        match master_fd::write_to_master(fd, bytes) {
+            Ok(n) => {
+                debug!(pty_index, holder_pid, written = n, "injected bytes");
+                TapResponse::Injected {
+                    pty_index,
+                    bytes_written: n,
+                }
+            }
+            Err(e) => {
+                let kind = e.kind();
+                let raw = e.raw_os_error();
+                let mut table = sessions.lock().expect("session table mutex poisoned");
+                if let Some(state) = table.get_mut(&pty_index) {
+                    if state.master_fd == fd {
+                        unsafe {
+                            libc::close(state.master_fd);
+                        }
+                        state.master_fd = -1;
+                    }
+                }
+                drop(table);
+                warn!(pty_index, ?kind, errno = ?raw, "inject write failed; cleared cached fd");
+                TapResponse::Error(format!(
+                    "inject write failed for pty_index={pty_index}: {e}"
+                ))
+            }
+        }
+    }
+
+    /// Tighter authorization for write-side operations (Inject). Read
+    /// scope (`scope_allows`) is necessary but not sufficient: a peer
+    /// must additionally be the session's opener or a creator-role
+    /// peer. Roles in between (e.g. some future "observer" role) get
+    /// to look but not type.
+    fn peer_can_inject(peer: &PeerContext, state: &SessionState) -> bool {
+        if peer.peer_role == "creator" {
+            return true;
+        }
+        match (&peer.peer_username, lookup_username(state.opener_uid)) {
+            (Some(p), Some(o)) => p == &o,
+            _ => false,
         }
     }
 
@@ -1398,6 +1554,19 @@ mod linux {
                 PTY_TYPE_MASTER => {
                     state.input_bytes += event.total_len as u64;
                     state.input_events += 1;
+                    // The PID writing in the master direction is whoever
+                    // holds the master fd — sshd, tmux, alacritty. That's
+                    // the process we want to clone an fd from for
+                    // injection. Update on every input event; if the
+                    // current cached fd belongs to a different process,
+                    // invalidate it so the next inject re-clones.
+                    if state.master_holder_pid != event.pid && state.master_fd >= 0 {
+                        unsafe {
+                            libc::close(state.master_fd);
+                        }
+                        state.master_fd = -1;
+                    }
+                    state.master_holder_pid = event.pid;
                     None
                 }
                 _ => None,
