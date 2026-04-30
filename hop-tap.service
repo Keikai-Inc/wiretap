@@ -15,11 +15,13 @@ Type=simple
 User=root
 ExecStart=/usr/local/bin/hop-tap-d --bootstrap /run/hop-tap/bootstrap
 
-# Auto-create /run/hop-tap with 0750 root:root so the bootstrap file
-# (which is itself a credential) lives in a directory that's not
-# world-traversable.
+# Auto-create /run/hop-tap with 0755 root:root. The directory has to
+# be traversable by non-root users so they can reach the standalone
+# `tap` CLI's local socket (/run/hop-tap/local.sock, mode 0666 with
+# SO_PEERCRED authentication). The bootstrap file inside stays 0600
+# root-only; directory listing is non-sensitive (just two entry names).
 RuntimeDirectory=hop-tap
-RuntimeDirectoryMode=0750
+RuntimeDirectoryMode=0755
 
 # If we crash, restart — capture is "should always be on."
 Restart=on-failure
