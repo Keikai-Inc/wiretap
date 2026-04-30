@@ -10,12 +10,10 @@
 //!   - non-root: sees only sessions opened by the same user
 //!
 //! Subcommands:
+//!   tap                      session picker (no args)
 //!   tap list                 active sessions visible to you
-//!   tap snapshot <pty>       current screen (24x80 grid)
-//!   tap watch <pty>          live byte stream → your terminal
 //!   tap connect <pty>        attach: live output + your stdin →
-//!                            session input. Detach with Ctrl-B d.
-//!   tap repl                 interactive multi-command session
+//!                            session input. Detach with Ctrl-T.
 //!
 //! For remote access (`<host> tap ...`), install the hop daemon
 //! and use the `hop` CLI instead — this binary is local-only.
@@ -52,25 +50,13 @@ struct Args {
 enum Cmd {
     /// List sessions you can see.
     List,
-    /// Print the current screen for a session.
-    Snapshot {
-        #[arg(value_name = "PTY")]
-        pty: i32,
-    },
-    /// Stream live byte updates from a session into your terminal.
-    Watch {
-        #[arg(value_name = "PTY")]
-        pty: i32,
-    },
     /// Attach to a session bidirectionally: live output to your
     /// terminal, your keystrokes injected into the session. Detach
-    /// with Ctrl-B then d (tmux-style); Ctrl-C is forwarded as input.
+    /// with Ctrl-T.
     Connect {
         #[arg(value_name = "PTY")]
         pty: i32,
     },
-    /// Interactive REPL: handshake once, accept multiple commands.
-    Repl,
 }
 
 #[tokio::main]
@@ -101,71 +87,28 @@ async fn main() -> Result<()> {
 
     let mut next_id = 1u64;
     match cmd {
-        // Connect returns AttachOutcome; for direct invocation (no
-        // picker to return to) every outcome collapses to clean exit.
-        Cmd::Connect { pty } => {
-            connect(stream, &mut next_id, pty, false).await.map(|_| ())
-        }
-        cmd => {
+        // For direct invocation (no picker to return to) every
+        // attach outcome collapses to clean exit.
+        Cmd::Connect { pty } => connect(stream, &mut next_id, pty).await.map(|_| ()),
+        Cmd::List => {
             let mut conn = Conn::new(stream);
-            match cmd {
-                Cmd::List => one_shot(&mut conn, &mut next_id, TapRequest::List).await,
-                Cmd::Snapshot { pty } => {
-                    one_shot(
-                        &mut conn,
-                        &mut next_id,
-                        TapRequest::Snapshot { pty_index: pty },
-                    )
-                    .await
-                }
-                Cmd::Watch { pty } => watch(&mut conn, &mut next_id, pty).await,
-                Cmd::Repl => repl(&mut conn, &mut next_id).await,
-                Cmd::Connect { .. } => unreachable!(),
-            }
+            one_shot(&mut conn, &mut next_id, TapRequest::List).await
         }
     }
 }
 
-/// After a snapshot is dumped to stdout, read one keystroke to decide
-/// where to go next: Esc → back to shell, anything else (Enter being
-/// the documented common choice) → back to picker. Briefly enables
-/// raw mode so we can read a single byte without waiting for a
-/// newline.
-fn read_post_snapshot_choice() -> AttachOutcome {
-    let _ = crossterm::terminal::enable_raw_mode();
-    let mut byte = [0u8; 1];
-    // SAFETY: read(2) on STDIN with our own buffer. Returns 0 on EOF
-    // or negative on signal interrupt — either way we treat it as
-    // "back to picker" (the conservative default).
-    let n = unsafe { libc::read(libc::STDIN_FILENO, byte.as_mut_ptr() as *mut _, 1) };
-    let _ = crossterm::terminal::disable_raw_mode();
-    eprintln!();
-    if n == 1 && byte[0] == 0x1B {
-        AttachOutcome::BackToShell
-    } else {
-        AttachOutcome::BackToPicker
-    }
-}
-
-/// Loop: pick a session in the TUI → run the action → re-enter the
-/// TUI. Exits cleanly when the user presses Esc/q in the picker, or
-/// when an attach action returns BackToShell. Errors from a single
-/// action (e.g. connect failed because the pty went away mid-attach)
-/// are surfaced briefly and don't break the loop.
+/// Loop: pick a session in the TUI → connect to it → on detach
+/// (Ctrl-T or session ended) re-enter the picker. Exits cleanly when
+/// the user presses q (or Esc) in the picker. Errors from a single
+/// connect (e.g. pty went away mid-attach) are surfaced briefly and
+/// don't break the loop.
 async fn picker_loop(socket: &std::path::Path) -> Result<()> {
-    use std::io::Write as _;
-
     loop {
-        let action = run_tui(socket).await?;
-        let action = match action {
-            Some(a) => a,
+        let pty = match run_tui(socket).await? {
+            Some(TuiAction::Connect(pty)) => pty,
             None => return Ok(()),
         };
 
-        // Each action gets a fresh stream — the picker reuses one
-        // for List polling, but connect/watch/snapshot are
-        // self-contained and the daemon's per-connection auth is
-        // re-evaluated on each open.
         let stream = match UnixStream::connect(socket).await {
             Ok(s) => s,
             Err(e) => {
@@ -175,36 +118,10 @@ async fn picker_loop(socket: &std::path::Path) -> Result<()> {
         };
 
         let mut next_id = 1u64;
-        // Each action returns either an AttachOutcome (connect/watch
-        // → key-driven exit) or a plain () (snapshot — fire and
-        // wait for Enter). We normalize to AttachOutcome so the loop
-        // can decide whether to re-enter the picker or exit.
-        let outcome: Result<AttachOutcome> = match action {
-            TuiAction::Connect(pty) => connect(stream, &mut next_id, pty, false).await,
-            TuiAction::Watch(pty) => connect(stream, &mut next_id, pty, true).await,
-            TuiAction::Snapshot(pty) => {
-                let mut conn = Conn::new(stream);
-                let r = one_shot(
-                    &mut conn,
-                    &mut next_id,
-                    TapRequest::Snapshot { pty_index: pty },
-                )
-                .await;
-                // Pause so the user can read the snapshot before the
-                // picker re-enters and clears the screen with its
-                // alt-screen swap.
-                eprint!("\n[Enter = back to picker, Esc = exit] ");
-                std::io::stderr().flush().ok();
-                r.and_then(|_| Ok(read_post_snapshot_choice()))
-            }
-        };
-        match outcome {
-            Ok(AttachOutcome::BackToShell) => return Ok(()),
-            Ok(AttachOutcome::BackToPicker) | Ok(AttachOutcome::SessionClosed) => {
-                // Loop back to the picker.
-            }
+        match connect(stream, &mut next_id, pty).await {
+            Ok(_) => {} // Detached or SessionClosed — both re-enter the picker.
             Err(e) => {
-                eprintln!("\r\n[action error: {e}]\r");
+                eprintln!("\r\n[connect error: {e}]\r");
                 tokio::time::sleep(std::time::Duration::from_millis(800)).await;
             }
         }
@@ -268,115 +185,6 @@ async fn one_shot(conn: &mut Conn, next_id: &mut u64, req: TapRequest) -> Result
                 return Ok(());
             }
             other => eprintln!("(ignored unexpected: {other:?})"),
-        }
-    }
-}
-
-async fn watch(conn: &mut Conn, next_id: &mut u64, pty: i32) -> Result<()> {
-    let request_id = *next_id;
-    *next_id += 1;
-    conn.send(LocalMessage::Subscribe {
-        request_id,
-        payload: TapStreamRequest::Subscribe { pty_index: pty },
-    })
-    .await?;
-    let mut stream_id: Option<u64> = None;
-    let mut stdout = std::io::stdout().lock();
-    loop {
-        match conn.recv().await? {
-            LocalMessage::StreamOpened {
-                request_id: rid,
-                stream_id: sid,
-            } if rid == request_id => {
-                eprintln!("(stream opened: stream_id={sid})");
-                stdout.write_all(b"\x1b[2J\x1b[H").ok();
-                stdout.flush().ok();
-                stream_id = Some(sid);
-            }
-            LocalMessage::StreamFrame {
-                stream_id: sid,
-                payload,
-            } if Some(sid) == stream_id => match payload {
-                TapStreamFrame::Initial {
-                    rows,
-                    cols,
-                    replay_bytes,
-                } => {
-                    eprintln!(
-                        "(initial frame: {rows}x{cols}, replay={} bytes)",
-                        replay_bytes.len()
-                    );
-                    stdout.write_all(&replay_bytes).ok();
-                    stdout.flush().ok();
-                }
-                TapStreamFrame::Output(bytes) => {
-                    stdout.write_all(&bytes).ok();
-                    stdout.flush().ok();
-                }
-                TapStreamFrame::Resize { rows, cols } => {
-                    eprintln!("(resize: {rows}x{cols})");
-                }
-            },
-            LocalMessage::StreamClosed {
-                stream_id: sid,
-                reason,
-            } if Some(sid) == stream_id || stream_id.is_none() => {
-                eprintln!("(stream closed: {reason:?})");
-                return Ok(());
-            }
-            other => eprintln!("(ignored: {other:?})"),
-        }
-    }
-}
-
-async fn repl(conn: &mut Conn, next_id: &mut u64) -> Result<()> {
-    use std::io::{BufRead, Write as _};
-    eprintln!("tap REPL — commands: list | snapshot N | watch N | exit");
-    let stdin = std::io::stdin();
-    let mut stdin = stdin.lock();
-    let mut line = String::new();
-    loop {
-        eprint!("> ");
-        std::io::stderr().flush().ok();
-        line.clear();
-        if stdin.read_line(&mut line).context("read stdin")? == 0 {
-            eprintln!();
-            return Ok(());
-        }
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let mut parts = trimmed.split_whitespace();
-        let cmd = parts.next().unwrap_or("");
-        let arg = parts.next();
-        match cmd {
-            "list" => {
-                if let Err(e) = one_shot(conn, next_id, TapRequest::List).await {
-                    eprintln!("error: {e}");
-                }
-            }
-            "snapshot" => match arg.and_then(|s| s.parse::<i32>().ok()) {
-                Some(pty) => {
-                    if let Err(e) =
-                        one_shot(conn, next_id, TapRequest::Snapshot { pty_index: pty }).await
-                    {
-                        eprintln!("error: {e}");
-                    }
-                }
-                None => eprintln!("usage: snapshot <pty>"),
-            },
-            "watch" => match arg.and_then(|s| s.parse::<i32>().ok()) {
-                Some(pty) => {
-                    if let Err(e) = watch(conn, next_id, pty).await {
-                        eprintln!("error: {e}");
-                    }
-                }
-                None => eprintln!("usage: watch <pty>"),
-            },
-            "exit" | "quit" => return Ok(()),
-            "help" | "?" => eprintln!("commands: list | snapshot N | watch N | exit"),
-            other => eprintln!("unknown command: {other}  (try `help`)"),
         }
     }
 }
@@ -453,26 +261,21 @@ fn format_user(username: &Option<String>, uid: u32) -> String {
 enum StdinEvent {
     /// User typed these bytes — forward to the session via Inject.
     Bytes(Vec<u8>),
-    /// User pressed Ctrl-T — return to the picker (or exit to shell
-    /// if connect was launched directly without a picker).
-    DetachToPicker,
-    /// User pressed Esc — exit all the way back to the shell, even
-    /// when launched from the picker.
-    DetachToShell,
+    /// User pressed Ctrl-T — leave the attach. The caller (picker
+    /// loop or direct dispatch) decides what to do next; from the
+    /// picker we re-enter the menu, from a direct `tap connect 3`
+    /// we just exit to the shell.
+    Detach,
 }
 
-/// Outcome of an attach (`tap connect` / picker → Watch). Tells the
-/// caller whether to re-enter the picker, fall back to the shell, or
-/// note that the session itself ended.
+/// Outcome of an attach. The caller (picker loop) re-enters the
+/// menu on Detached / SessionClosed; for a direct `tap connect`
+/// invocation both collapse to clean exit.
 #[derive(Debug)]
 enum AttachOutcome {
-    /// User pressed Ctrl-T — re-show the picker.
-    BackToPicker,
-    /// User pressed Esc — exit fully.
-    BackToShell,
+    /// User pressed Ctrl-T.
+    Detached,
     /// Server closed the stream (session ended, forbidden, etc.).
-    /// Treated like BackToPicker by the loop so the user can pick
-    /// another session.
     SessionClosed,
 }
 
@@ -516,31 +319,24 @@ async fn recv_local(read: &mut OwnedReadHalf) -> Result<LocalMessage> {
     Ok(msg)
 }
 
-/// `tap connect <pty>` (and the picker's Watch entry) — attach to a
-/// session in the local terminal.
+/// `tap connect <pty>` — attach to a session bidirectionally.
 ///
-/// 1. Open a Subscribe stream so we receive Output frames just like
-///    `watch`. The Initial frame gives us a render of the current
-///    screen as a "catch up" replay.
-/// 2. Put the local terminal into raw mode so keystrokes don't get
-///    line-buffered or interpreted by the local shell.
-/// 3. Spawn a blocking thread that reads bytes from stdin. Two hot
-///    keys: Ctrl-T returns to the picker, Esc returns to the shell.
-///    Esc detection uses a 50ms poll-timeout to disambiguate bare Esc
-///    from the start of an escape sequence (arrow keys, Alt-keys, F1
-///    etc. all begin with Esc).
-/// 4. The main task selects between incoming server frames (write to
-///    stdout) and stdin events. In read-write mode, stdin bytes go
-///    out as Inject Calls; in read-only mode they're dropped (the
-///    hot keys still work).
-/// 5. Either side closing, a hot key, or a server StreamClosed ends
+/// 1. Open a Subscribe stream so we receive Output frames. The Initial
+///    frame replays the current screen so the user joins mid-session
+///    without a blank terminal.
+/// 2. Put the local terminal into raw mode so keystrokes flow as
+///    bytes, not line-buffered.
+/// 3. Spawn a blocking thread that reads bytes from stdin. Single hot
+///    key: Ctrl-T detaches.
+/// 4. The main task selects between server frames (write to stdout)
+///    and stdin events (forward as Inject Calls).
+/// 5. Either side closing, a Ctrl-T, or a server StreamClosed ends
 ///    the loop. The function returns an [`AttachOutcome`] so the
 ///    caller can decide whether to re-enter the picker or exit.
 async fn connect(
     stream: UnixStream,
     next_id: &mut u64,
     pty: i32,
-    read_only: bool,
 ) -> Result<AttachOutcome> {
     let (mut read_half, mut write_half) = stream.into_split();
 
@@ -578,9 +374,8 @@ async fn connect(
     // 2. Raw mode + Drop-guarded restore.
     crossterm::terminal::enable_raw_mode().context("enable raw mode")?;
     let _raw = RawModeGuard;
-    let mode_label = if read_only { "watch (read-only)" } else { "connect" };
     eprintln!(
-        "\r\n[tap {mode_label} pty={pty} — Ctrl-T = back to picker, Esc = back to shell]\r\n"
+        "\r\n[tap connect pty={pty} — Ctrl-T to detach (back to picker; q in picker exits)]\r\n"
     );
 
     // 3. Blocking stdin reader on a dedicated thread. We do raw read(2)
@@ -603,13 +398,6 @@ async fn connect(
             // chatty session — we want responsive typing.
             evt = stdin_rx.recv() => match evt {
                 Some(StdinEvent::Bytes(b)) => {
-                    if read_only {
-                        // In watch mode we drop typed bytes — there's no
-                        // session input channel. The hot keys still work
-                        // because the reader thread converts them to
-                        // separate events before we ever see Bytes.
-                        continue;
-                    }
                     inject_id = inject_id.wrapping_add(1);
                     if let Err(e) = send_local(
                         &mut write_half,
@@ -622,13 +410,9 @@ async fn connect(
                         return Ok(AttachOutcome::SessionClosed);
                     }
                 }
-                Some(StdinEvent::DetachToPicker) => {
+                Some(StdinEvent::Detach) | None => {
                     eprintln!("\r\n[detached]\r");
-                    return Ok(AttachOutcome::BackToPicker);
-                }
-                Some(StdinEvent::DetachToShell) | None => {
-                    eprintln!("\r\n[exit]\r");
-                    return Ok(AttachOutcome::BackToShell);
+                    return Ok(AttachOutcome::Detached);
                 }
             },
             msg = recv_local(&mut read_half) => {
@@ -677,14 +461,12 @@ async fn connect(
     }
 }
 
-/// What the TUI picker returns to `main` so the caller knows which
-/// follow-up subcommand to run on a freshly-opened connection. The
-/// TUI cleans itself up first; the action is then dispatched through
-/// the same path as if the user had typed the subcommand directly.
+/// What the TUI picker returns to `main` after the user picks a
+/// session. Only one action today: connect. The wrapper enum keeps
+/// the call sites symmetric and leaves room for future picker-level
+/// actions without changing the run_tui signature.
 enum TuiAction {
     Connect(i32),
-    Watch(i32),
-    Snapshot(i32),
 }
 
 /// Run the no-args session picker: a ratatui table of active
@@ -774,7 +556,7 @@ async fn run_tui(socket: &std::path::Path) -> Result<Option<TuiAction>> {
                         state.select(Some(0));
                     }
                     status_line = format!(
-                        "{} session(s) — ↑/↓ select  enter=connect  w=watch  s=snapshot  Esc/q=quit",
+                        "{} session(s) — ↑/↓ select  Enter=connect  q=quit",
                         sessions.len()
                     );
                 }
@@ -932,16 +714,6 @@ async fn run_tui(socket: &std::path::Path) -> Result<Option<TuiAction>> {
                             return Ok(Some(TuiAction::Connect(s.pty_index)));
                         }
                     }
-                    (KeyCode::Char('w'), _) => {
-                        if let Some(s) = state.selected().and_then(|i| sessions.get(i)) {
-                            return Ok(Some(TuiAction::Watch(s.pty_index)));
-                        }
-                    }
-                    (KeyCode::Char('s'), _) => {
-                        if let Some(s) = state.selected().and_then(|i| sessions.get(i)) {
-                            return Ok(Some(TuiAction::Snapshot(s.pty_index)));
-                        }
-                    }
                     (KeyCode::Char('r'), _) => {
                         // Force-refresh on demand.
                         last_refresh = Instant::now() - refresh_interval;
@@ -1043,88 +815,37 @@ async fn refresh_sessions(
 
 /// Blocking stdin-byte reader. Runs on its own OS thread.
 ///
-/// Two hot keys:
-///   - **Ctrl-T** → `DetachToPicker`. Single keystroke, eaten on the
-///     spot. No tmux overlap (tmux's prefix is Ctrl-B), no doubling.
-///   - **Esc**    → `DetachToShell`. Hard because Esc is the prefix of
-///     every escape sequence (arrow keys, Alt-keys, F1+) — so we hold
-///     the Esc byte and `poll(2)` with a 50ms timeout. If more bytes
-///     arrive, it was a sequence: emit Esc + the bytes as Bytes. If
-///     the timeout expires with no more input, it was a bare Esc:
-///     emit DetachToShell.
+/// Single hot key: **Ctrl-T** detaches. Eaten on the spot — no tmux
+/// overlap (tmux uses Ctrl-B), no two-key sequence, no doubling. From
+/// the picker, the user reaches the shell with Ctrl-T then `q` in the
+/// menu; from a direct `tap connect 3` invocation, Ctrl-T just exits
+/// (no picker to fall back to).
 ///
-/// 50ms is the value most TUI libraries use; it's long enough that
-/// arrow-key follow-ups always make it within the window on local
-/// terminals, and short enough that bare Esc still feels instant.
+/// Other bytes — including escape sequences from arrow keys, Alt-*,
+/// function keys — pass through unchanged.
 fn stdin_reader_loop(tx: mpsc::UnboundedSender<StdinEvent>) {
     const CTRL_T: u8 = 0x14;
-    const ESC: u8 = 0x1B;
-    const ESC_TIMEOUT_MS: i32 = 50;
-
     let mut buf = [0u8; 1024];
-    // True between seeing an unaccompanied Esc and learning what comes
-    // next (more bytes → sequence, timeout → bare Esc).
-    let mut esc_pending = false;
-
     loop {
-        // Poll with a timeout iff we're holding a pending Esc; otherwise
-        // block forever waiting for input.
-        let timeout_ms = if esc_pending { ESC_TIMEOUT_MS } else { -1 };
-        let mut pfd = libc::pollfd {
-            fd: libc::STDIN_FILENO,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: pollfd struct is zeroed except the fields we set;
-        // a count of 1 matches the array length.
-        let pr = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
-        if pr < 0 {
-            // EINTR (signal) — retry. Anything else is also recoverable
-            // by retrying in our context.
-            continue;
-        }
-        if pr == 0 {
-            // Timeout. Only happens when we had a pending Esc.
-            debug_assert!(esc_pending);
-            let _ = tx.send(StdinEvent::DetachToShell);
-            return;
-        }
-
         // SAFETY: read(2) on STDIN with our owned buffer.
         let n = unsafe {
             libc::read(libc::STDIN_FILENO, buf.as_mut_ptr() as *mut _, buf.len())
         };
         if n <= 0 {
-            // EOF or error — let the channel drop signal the caller.
+            // EOF, error, or signal interrupt — let the channel drop
+            // signal the caller.
             return;
         }
-
-        let mut out: Vec<u8> = Vec::with_capacity(n as usize + 1);
+        let mut out: Vec<u8> = Vec::with_capacity(n as usize);
         for &b in &buf[..n as usize] {
-            if esc_pending {
-                // Esc had a follow-up within the timeout — it's a
-                // sequence. Forward Esc + this byte and clear the flag.
-                esc_pending = false;
-                out.push(ESC);
-                out.push(b);
-            } else if b == CTRL_T {
-                // Single-keystroke detach back to the picker.
+            if b == CTRL_T {
                 if !out.is_empty() {
                     let _ = tx.send(StdinEvent::Bytes(out));
                 }
-                let _ = tx.send(StdinEvent::DetachToPicker);
+                let _ = tx.send(StdinEvent::Detach);
                 return;
-            } else if b == ESC {
-                // Hold; the next iteration's poll will tell us bare or
-                // sequence. Flush anything we've already accumulated so
-                // there's no out-of-order delivery.
-                if !out.is_empty() {
-                    let _ = tx.send(StdinEvent::Bytes(std::mem::take(&mut out)));
-                }
-                esc_pending = true;
-            } else {
-                out.push(b);
             }
+            out.push(b);
         }
         if !out.is_empty() && tx.send(StdinEvent::Bytes(out)).is_err() {
             return;

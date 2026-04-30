@@ -95,21 +95,17 @@
 
       <div class="step step-wide" style="margin-bottom: 2rem;">
         <h3>tap<span class="pill">(no args)</span></h3>
-        <p>Live-refreshing picker of every session you can see. Arrow keys to select, Enter to attach, <code>w</code> for read-only watch, <code>s</code> for a screen snapshot, <code>q</code> to leave. The tmux-style session switcher Unix has been missing for the shells the user didn't open in tmux.</p>
+        <p>Live-refreshing picker of every session you can see, with a side panel showing the highlighted session's current screen. Arrow keys to navigate, Enter to attach, <code>q</code> to leave. The tmux-style session switcher Unix has been missing for the shells the user didn't open in tmux.</p>
       </div>
 
       <div class="steps">
         <div class="step">
           <h3>tap connect N</h3>
-          <p>Attach to pty <code>N</code> like it's your own terminal. Live output to your screen, your keystrokes injected into the session. Detach with <code>Ctrl-B d</code>; <code>Ctrl-B Ctrl-B</code> sends a literal <code>Ctrl-B</code> through to an inner tmux.</p>
+          <p>Attach to pty <code>N</code> like it's your own terminal. Live output to your screen, your keystrokes injected into the session. Detach with <code>Ctrl-T</code> — single keystroke, no tmux overlap. From the picker, <code>Ctrl-T</code> returns you to the menu; <code>q</code> in the menu exits.</p>
         </div>
         <div class="step">
-          <h3>tap watch N</h3>
-          <p>Read-only live byte stream. Watch a session without typing into it. Useful for shoulder-surfing a teammate's terminal during pairing or incident response.</p>
-        </div>
-        <div class="step">
-          <h3>tap list · tap snapshot N</h3>
-          <p>Enumerate active sessions with identity and byte counters, or grab a one-shot full-screen render of any session you can see.</p>
+          <h3>tap list</h3>
+          <p>Enumerate active sessions with sticky opener identity, current writer (sudo/setpriv visible inline), byte counters, age, and idle time. Scriptable companion for the picker.</p>
         </div>
       </div>
 
@@ -130,10 +126,10 @@
 <span class="output">│ ▶ 4   alice(1000)         vim          2891/14     12s      │</span>
 <span class="output">│   5   bob(1001)           psql           830/9       4s      │</span>
 <span class="output">└─────────────────────────────────────────────────────────────┘</span>
-<span class="output">3 session(s) — ↑/↓ select  enter=connect  w=watch  s=snapshot  q=quit</span>
+<span class="output">3 session(s) — ↑/↓ select  Enter=connect  q=quit</span>
 
 <span class="comment"># Enter on alice's vim session — bidirectional from here on:</span>
-<span class="output">[tap connect pty=4 — Ctrl-B d to detach]</span>
+<span class="output">[tap connect pty=4 — Ctrl-T to detach]</span>
 <span class="output">  1 # Project plan</span>
 <span class="output">  2</span>
 <span class="output">  3 ## Next sprint</span>
