@@ -2245,7 +2245,7 @@ mod linux {
                 "no active session with pty_index={pty_index}"
             ));
         }
-        let (target_pid, was_locked) = {
+        let (target_pid, was_locked, was_quarantined, impostor_pid) = {
             let table = sessions.lock().expect("session table mutex poisoned");
             let Some(state) = table.get(&pty_index) else {
                 return TapResponse::Error(format!(
@@ -2263,8 +2263,51 @@ mod linux {
                      may kill pty_index={pty_index}"
                 ));
             }
-            (state.opener_pid, state.locked)
+            (
+                state.opener_pid,
+                state.locked,
+                state.quarantined,
+                state.quarantine_impostor_pid,
+            )
         };
+
+        // If the session is quarantined, the impostor is holding
+        // /dev/pts/N open as its stdin/stdout/stderr. Killing only
+        // the original shell leaves the pty alive in the kernel
+        // (pty_close fires on the *last* slave-fd close), so the
+        // daemon never gets a session-end event and the entry
+        // hangs around in `tap list` forever. Take down the
+        // impostor first.
+        if was_quarantined {
+            if let Some(pid) = impostor_pid {
+                // SAFETY: kill on a real pid + valid signal.
+                unsafe {
+                    libc::kill(pid as libc::pid_t, libc::SIGTERM);
+                }
+                let mut status: libc::c_int = 0;
+                // SAFETY: waitpid with WNOHANG; if the impostor is
+                // slow to exit we just leave the kernel to reap it
+                // when the daemon eventually does.
+                unsafe {
+                    libc::waitpid(
+                        pid as libc::pid_t,
+                        &mut status as *mut _,
+                        libc::WNOHANG,
+                    );
+                }
+            }
+            // Clear the quarantine bookkeeping. The session itself
+            // is being killed; don't leave stale impostor PIDs.
+            if let Some(state) = sessions
+                .lock()
+                .expect("session table mutex poisoned")
+                .get_mut(&pty_index)
+            {
+                state.quarantined = false;
+                state.quarantine_impostor_pid = None;
+                state.quarantine_orig_pgrp = None;
+            }
+        }
 
         // If the session is currently locked (SIGSTOPped), SIGHUP would
         // queue but never get delivered — stopped processes only react
