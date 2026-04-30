@@ -293,9 +293,18 @@ done
 [[ "${FAILED}" -eq 0 ]] || { echo "Error: build(s) failed"; exit 1; }
 rm -rf "${BUILD_LOG_DIR}"
 
-# Strip
+# Both binary names get stripped, summed, and uploaded:
+#   hop-tap-d-linux-{x86_64,arm64}   (the daemon)
+#   tap-linux-{x86_64,arm64}         (the local CLI)
+# An earlier version of this script only matched `hop-tap-*` and
+# silently skipped the `tap-*` binaries, leaving install.sh with
+# 403s in production.
+shopt -s nullglob
+RELEASE_BINS=("${DIST_DIR}"/hop-tap-d-linux-* "${DIST_DIR}"/tap-linux-*)
+shopt -u nullglob
+
 echo "==> Stripping binaries"
-for f in "${DIST_DIR}"/hop-tap-*; do
+for f in "${RELEASE_BINS[@]}"; do
   # Note: strip on a foreign-arch binary needs llvm-strip or the
   # cross binutils. The release host typically has llvm-strip via
   # llvm-tools; if it's missing we just skip strip (binaries are
@@ -308,17 +317,17 @@ done
 # --- Checksums --------------------------------------------------------------
 
 echo "==> Generating checksums"
-cd "${DIST_DIR}"
-for f in hop-tap-*; do
+for f in "${RELEASE_BINS[@]}"; do
   shasum -a 256 "${f}" | awk '{print $1}' > "${f}.sha256"
 done
-cd "${PROJECT_ROOT}"
 
 # --- Upload to S3 -----------------------------------------------------------
 
 echo "==> Uploading binaries to s3://${BUCKET}/v${VERSION}/"
-aws s3 cp "${DIST_DIR}/" "s3://${BUCKET}/v${VERSION}/" \
-  --recursive --exclude '*' --include 'hop-tap-*'
+for f in "${RELEASE_BINS[@]}"; do
+  aws s3 cp "${f}"          "s3://${BUCKET}/v${VERSION}/$(basename "${f}")"
+  aws s3 cp "${f}.sha256"   "s3://${BUCKET}/v${VERSION}/$(basename "${f}").sha256"
+done
 
 echo "==> Uploading latest version marker"
 echo -n "${VERSION}" > "${DIST_DIR}/latest"
