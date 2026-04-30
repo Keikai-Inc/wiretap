@@ -19,10 +19,10 @@ daemon writes a TOML rendezvous file, accepts one hop daemon
 connection, performs the Hello/HelloAck handshake, and dispatches
 `ExtMessage::Request`s to a `TapRequest` handler. Subprotocol
 covers `List` (active sessions) and `Snapshot { pty_index }`
-(full 80×24 grid). A bundled `hop-tap-probe` simulates the hop
-side; verified end-to-end on Linux 6.8 — `probe list` returns the
-live session table, `probe snapshot --pty 0` reproduces the exact
-echoed lines on a fresh terminal grid.
+(full 80×24 grid). The bundled `tap` CLI talks to the daemon
+over a local Unix socket (SO_PEERCRED authenticates the caller's
+uid); `tap list / snapshot / watch` work standalone, no hop
+required.
 
 ExtMessage wire types are a local mirror of hop-core's; the dep
 on hop-core itself is deliberately avoided to keep hop-tap's
@@ -54,7 +54,7 @@ hop-tap/
 One-liner for any Linux host:
 
 ```bash
-curl -fsSL https://hop-tap.keik.ai/install.sh | bash
+curl -fsSL https://tap.keik.ai/install.sh | bash
 ```
 
 The installer auto-detects whether hop is on the host and picks one
@@ -111,14 +111,14 @@ other roles gated by `opener_username`).
 
 Modes are decided at install time, but switching is just re-running
 the installer. Install hop after the fact, then re-run
-`curl -fsSL https://hop-tap.keik.ai/install.sh | bash` — the
+`curl -fsSL https://tap.keik.ai/install.sh | bash` — the
 detector now sees hop, drops the manifest, and restarts hop.
 
 The installer never auto-installs hop. If you want hop too:
 
 ```bash
 curl -fsSL https://hop.keik.ai/install-daemon.sh | bash    # then:
-curl -fsSL https://hop-tap.keik.ai/install.sh | bash
+curl -fsSL https://tap.keik.ai/install.sh | bash
 ```
 
 ### Verify
@@ -131,8 +131,9 @@ sudo journalctl -u hop-tap -f                    # tailing logs
 hop <host> ext list                              # tap.terminal listed
 hop <host> tap list                              # active sessions
 
-# In any mode:
-hop-tap-probe --bootstrap /run/hop-tap/bootstrap repl
+# In any mode (local-only, no hop required):
+tap list
+tap repl
 ```
 
 ## Production usage

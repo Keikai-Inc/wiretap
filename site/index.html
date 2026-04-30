@@ -1,0 +1,299 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>tap — Terminal Session Audit for Linux</title>
+  <meta name="description" content="Full visibility, auditability, and control over every TTY/PTY session on a Linux host. eBPF capture, off-screen emulator per session, kernel-authoritative permission model — local-first, no daemon dependencies.">
+  <link rel="icon" type="image/x-icon" href="favicon.ico">
+  <link rel="icon" type="image/png" sizes="32x32" href="favicon-32x32.png">
+  <link rel="apple-touch-icon" sizes="180x180" href="apple-touch-icon.png">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Manrope:wght@600;700;800;900&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="shared.css">
+  <style>
+    .steps-4 { grid-template-columns: repeat(4, 1fr); }
+
+    .perms-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 2rem;
+      align-items: start;
+    }
+    .perms-grid > * { min-width: 0; }
+    .perms-info h3 {
+      font-family: var(--font-display);
+      font-weight: 700;
+      font-size: 1.25rem;
+      margin-bottom: 1rem;
+    }
+    .perms-info p {
+      color: var(--color-text-secondary);
+      font-size: 0.9rem;
+      line-height: 1.65;
+      margin-bottom: 1.5rem;
+    }
+    .perms-list {
+      list-style: none;
+      display: flex;
+      flex-direction: column;
+      gap: 0.75rem;
+    }
+    .perms-list li {
+      display: flex;
+      align-items: flex-start;
+      gap: 0.75rem;
+      color: var(--color-text-secondary);
+      font-size: 0.9rem;
+    }
+    .perms-list li::before {
+      content: "\2713";
+      color: var(--color-accent-green);
+      font-weight: 700;
+      flex-shrink: 0;
+      margin-top: 0.1rem;
+    }
+
+    @media (max-width: 768px) {
+      .steps-4 { grid-template-columns: 1fr; }
+      .perms-grid { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+
+  <nav id="site-nav"></nav>
+
+  <!-- Hero -->
+  <div class="hero">
+    <div class="badge"><span class="dot"></span> Terminal Session Audit · Linux · eBPF</div>
+    <h1>Full visibility, auditability,<br>and <span class="gradient">control</span> over every session</h1>
+    <p>tap captures every TTY/PTY session on a Linux host using eBPF. <strong>Local-first</strong> — install on a server, list and watch sessions immediately, no extra daemons, no network. Authentication is the kernel's own answer to "who's connecting": <code>SO_PEERCRED</code> on a Unix socket. <a href="remote.html" style="color: var(--color-primary); font-weight: 500; text-decoration: none;">Remote and AI access via hop &rarr;</a></p>
+    <div class="hero-actions">
+      <a href="#install" class="btn btn-primary">Install</a>
+      <a href="#what" class="btn btn-ghost">What It Does</a>
+    </div>
+  </div>
+
+  <!-- What it does -->
+  <section id="what">
+    <div class="container">
+      <div class="section-header">
+        <h2>Three commands, full session visibility</h2>
+        <p>From a fresh install to streaming a live session in seconds.</p>
+      </div>
+
+      <div class="steps">
+        <div class="step">
+          <h3>tap list</h3>
+          <p>Active sessions you can see. Sticky opener identity (who logged in) plus the current writer (sudo/setpriv visible inline). Byte counters, age, idle.</p>
+        </div>
+        <div class="step">
+          <h3>tap snapshot N</h3>
+          <p>Current screen of pty <code>N</code> as a row × column grid. Colors, attributes, alt-screen, cursor — full SGR-aware reproduction.</p>
+        </div>
+        <div class="step">
+          <h3>tap watch N</h3>
+          <p>Live byte stream into your terminal. Captured escape sequences flow through unchanged; what the original user sees, you see.</p>
+        </div>
+      </div>
+
+      <div style="margin-top: 3rem;">
+        <div class="code-block">
+          <div class="code-header">
+            <span class="code-dot"></span>
+            <span class="code-dot"></span>
+            <span class="code-dot"></span>
+            <span class="code-title">Terminal — local audit</span>
+          </div>
+          <div class="code-body">
+<span class="prompt">$</span> <span class="cmd">tap list</span>
+<span class="output">2 active session(s):</span>
+<span class="output">  pty=  3  user=alice(1000)    comm=bash      pid=  3214  out=12384b/421ev  in=83b/12ev   age=82s idle=0ms</span>
+<span class="output">  pty=  4  opener=alice(1000)  writer=root(0)  comm=sudo      out=2891b/14ev   in=4b/1ev    age=12s idle=0ms</span>
+
+<span class="comment"># `opener=alice writer=root` flags the privilege escalation —</span>
+<span class="comment"># alice opened the session, currently sudo is writing.</span>
+
+<span class="prompt">$</span> <span class="cmd">tap snapshot 3</span>
+<span class="output">snapshot pty=3 (24x80)</span>
+<span class="output">┌────────────────────────────────────────────────────────────────────────────────┐</span>
+<span class="output">│alice@myserver:~$ vim notes.md                                                  │</span>
+<span class="output">│  1 # Project plan                                                              │</span>
+<span class="output">│  2                                                                             │</span>
+<span class="output">│  3 ## Next sprint                                                              │</span>
+<span class="output">│  ...                                                                           │</span>
+
+<span class="prompt">$</span> <span class="cmd">tap watch 3</span>
+<span class="output">(stream opened: stream_id=1)</span>
+<span class="output">(initial frame: 24x80, replay=1342 bytes)</span>
+<span class="comment"># Live byte stream renders alice's session in real time.</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Install -->
+  <section id="install">
+    <div class="container">
+      <div class="section-header">
+        <h2>Install</h2>
+        <p>One curl. Linux-only — eBPF requires a Linux kernel.</p>
+      </div>
+
+      <div style="max-width: 36rem; margin: 0 auto 3rem;">
+        <div class="code-block">
+          <div class="code-header">
+            <span class="code-dot"></span>
+            <span class="code-dot"></span>
+            <span class="code-dot"></span>
+            <span class="code-title">Install (Linux x86_64 / arm64)</span>
+          </div>
+          <div class="code-body">
+<span class="prompt">$</span> <span class="cmd">curl -fsSL https://tap.keik.ai/install.sh | bash</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="steps steps-4">
+        <div class="step">
+          <h3>Daemon installs as root</h3>
+          <p><code>hop-tap-d</code> via systemd, eBPF needs CAP_BPF/CAP_PERFMON/CAP_SYS_ADMIN.</p>
+        </div>
+        <div class="step">
+          <h3>tap installs to /usr/local/bin</h3>
+          <p>The CLI you actually run. Connects to the daemon's local Unix socket.</p>
+        </div>
+        <div class="step">
+          <h3>Run any session</h3>
+          <p>tap captures every TTY/PTY automatically. Existing sessions are seeded from <code>/proc</code>.</p>
+        </div>
+        <div class="step">
+          <h3>Audit</h3>
+          <p><code>tap list</code> immediately. No keys, no peers, no setup beyond the install.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Permissions -->
+  <section id="perms">
+    <div class="container">
+      <div class="section-header">
+        <h2>Permission model</h2>
+        <p>Authentication is the kernel's authoritative answer to "who's connecting" — not a claim on the wire.</p>
+      </div>
+
+      <div class="perms-grid">
+        <div class="perms-info">
+          <h3>SO_PEERCRED on a Unix socket</h3>
+          <p>The daemon listens on <code>/run/hop-tap/local.sock</code> mode 0666 — any local user can connect. On each accept, the daemon reads <code>SO_PEERCRED</code> from the kernel; that's the caller's real uid. The wire carries no identity claims, and there's no way for a client to lie.</p>
+          <h3>Two tiers, one rule</h3>
+          <p>Root (uid 0) gets the <code>creator</code> role and sees every active session. Non-root users get the <code>peer</code> role and see only sessions whose <strong>opener</strong> matches their username. Sticky opener identity (captured at session creation) means a user can't escape their scope by escalating privileges mid-session.</p>
+          <h3>Why this shape</h3>
+          <p>Local audit on a single host has a natural authority gradient: root is the OS administrator. Anything more complex (ACLs, named groups, capabilities) wouldn't survive contact with the actual deployments, where root is what you have. tap embraces it.</p>
+          <ul class="perms-list">
+            <li><strong>Kernel-authoritative</strong> identity via SO_PEERCRED</li>
+            <li><strong>uid 0</strong> sees everything</li>
+            <li><strong>non-root</strong> sees only sessions they opened</li>
+            <li><strong>Sticky opener</strong> survives sudo / setpriv mid-session</li>
+            <li><strong>Same denial wording</strong> as missing-pty for non-enumeration</li>
+          </ul>
+        </div>
+
+        <div>
+          <div class="code-block">
+            <div class="code-header">
+              <span class="code-dot"></span>
+              <span class="code-dot"></span>
+              <span class="code-dot"></span>
+              <span class="code-title">Terminal — same daemon, two callers</span>
+            </div>
+            <div class="code-body">
+<span class="comment"># root sees every session</span>
+<span class="prompt">root#</span> <span class="cmd">tap list</span>
+<span class="output">2 active session(s):</span>
+<span class="output">  pty=0  user=root(0)      comm=script  ...</span>
+<span class="output">  pty=1  user=alice(1000)  comm=script  ...</span>
+
+<span class="comment"># alice sees only her own</span>
+<span class="prompt">alice$</span> <span class="cmd">tap list</span>
+<span class="output">1 active session(s):</span>
+<span class="output">  pty=1  user=alice(1000)  comm=script  ...</span>
+
+<span class="comment"># forbidden snapshot — same error as a missing pty,</span>
+<span class="comment"># so non-root can't enumerate other users by probing</span>
+<span class="prompt">alice$</span> <span class="cmd">tap snapshot 0</span>
+<span class="output">error: no active session with pty_index=0</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- How it works -->
+  <section id="how">
+    <div class="container">
+      <div class="section-header">
+        <h2>How it works</h2>
+        <p>Pure-Rust eBPF on a CO-RE-aware rustc fork. Same <code>.bpf.o</code> works on every kernel that has the right field names.</p>
+      </div>
+
+      <div class="grid grid-2">
+        <div class="card card-green">
+          <div class="card-icon card-icon-green">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12h18M3 6h18M3 18h18"/></svg>
+          </div>
+          <h3>kprobe on pty_write</h3>
+          <p>The kernel flattens iov_iter into a contiguous buffer before dispatching to <code>tty-&gt;ops-&gt;write</code>. One <code>bpf_probe_read_kernel</code> in the kprobe gets the bytes — no segment walking, no union discriminants, no signature drift between kernels.</p>
+        </div>
+
+        <div class="card card-teal">
+          <div class="card-icon card-icon-teal">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>
+          </div>
+          <h3>CO-RE in pure Rust</h3>
+          <p>Field offsets are patched by aya at load time against the running kernel's BTF. We've validated the same binary on Linux 5.4 and 6.8 (256-byte offset drift in <code>task_struct</code>) without a recompile.</p>
+        </div>
+
+        <div class="card card-amber">
+          <div class="card-icon card-icon-amber">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
+          </div>
+          <h3>alacritty as the off-screen emulator</h3>
+          <p>Each session drives an <code>alacritty_terminal::Term</code> on the daemon side — full CSI / OSC / SGR semantics, alt-screen tracking, cursor, the works. <code>tap snapshot</code> walks that grid; <code>tap watch</code> streams the raw kernel-captured byte stream.</p>
+        </div>
+
+        <div class="card card-red">
+          <div class="card-icon card-icon-red">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
+          </div>
+          <h3>Sticky opener identity</h3>
+          <p><code>opener_*</code> is captured at session creation (or seeded from <code>/proc</code> for sessions that pre-existed the daemon). <code>last_*</code> updates on every event — sudo's privilege transitions surface inline without changing who owns the session.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Linux only banner -->
+  <section style="padding-top: 0; padding-bottom: 8rem;">
+    <div class="container">
+      <div style="background: var(--color-surface); border: 1px solid var(--color-border); border-radius: 1rem; padding: 3rem; text-align: center;">
+        <h2 style="font-family: var(--font-display); font-weight: 800; font-size: 1.5rem; margin-bottom: 0.75rem;">Linux only — eBPF inside</h2>
+        <p style="color: var(--color-text-secondary); font-size: 0.95rem; line-height: 1.65; max-width: 36rem; margin: 0 auto 1.5rem;">tap captures via kernel-side BPF programs that ride on Linux's pty subsystem. macOS/Windows are out of scope for the daemon. The CLI naturally only runs where the daemon does.</p>
+        <p style="color: var(--color-text-secondary); font-size: 0.95rem; line-height: 1.65; max-width: 36rem; margin: 0 auto 1.5rem;">Need to drive tap from another machine? <a href="remote.html" style="color: var(--color-primary); font-weight: 500;">Pair it with hop</a> — same eBPF capture, but accessible over an authenticated QUIC peer connection from any client OS.</p>
+        <div style="display: flex; gap: 1rem; justify-content: center; flex-wrap: wrap;">
+          <a href="#install" class="btn btn-primary">Install</a>
+          <a href="remote.html" class="btn btn-ghost">Remote / AI &rarr;</a>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <footer id="site-footer"></footer>
+  <script src="shared.js"></script>
+</body>
+</html>

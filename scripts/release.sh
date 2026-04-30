@@ -9,7 +9,7 @@
 #
 # What it builds (Linux only — hop-tap is eBPF):
 #   - hop-tap-d-linux-x86_64,  hop-tap-d-linux-arm64
-#   - hop-tap-probe-linux-x86_64, hop-tap-probe-linux-arm64
+#   - tap-linux-x86_64, tap-linux-arm64
 #   + matching .sha256 files
 #
 # eBPF wrinkle: the kernel-side crate builds with vlad's stage1-vlad
@@ -169,7 +169,7 @@ start_build "hop-tap-linux-arm64" bash -c "
     cargo build --release --target aarch64-unknown-linux-musl \
       --manifest-path /build/Cargo.toml -p hop-tap-d --bins \
   && cp '${PROJECT_ROOT}/target/aarch64-unknown-linux-musl/release/hop-tap-d'     '${DIST_DIR}/hop-tap-d-linux-arm64' \
-  && cp '${PROJECT_ROOT}/target/aarch64-unknown-linux-musl/release/hop-tap-probe' '${DIST_DIR}/hop-tap-probe-linux-arm64'
+  && cp '${PROJECT_ROOT}/target/aarch64-unknown-linux-musl/release/tap' '${DIST_DIR}/tap-linux-arm64'
 "
 
 # Linux x86_64: cross under QEMU
@@ -177,7 +177,7 @@ start_build "hop-tap-linux-x86_64" bash -c "
   HOP_TAP_SKIP_EBPF_BUILD=1 cross build --release --target x86_64-unknown-linux-musl \
     --manifest-path '${PROJECT_ROOT}/Cargo.toml' -p hop-tap-d --bins \
   && cp '${PROJECT_ROOT}/target/x86_64-unknown-linux-musl/release/hop-tap-d'     '${DIST_DIR}/hop-tap-d-linux-x86_64' \
-  && cp '${PROJECT_ROOT}/target/x86_64-unknown-linux-musl/release/hop-tap-probe' '${DIST_DIR}/hop-tap-probe-linux-x86_64'
+  && cp '${PROJECT_ROOT}/target/x86_64-unknown-linux-musl/release/tap' '${DIST_DIR}/tap-linux-x86_64'
 "
 
 # Wait for builds
@@ -269,4 +269,4 @@ echo ""
 echo "Binaries:"
 ls -lh "${DIST_DIR}"/hop-tap-* | grep -v sha256
 echo ""
-echo "Install: curl -fsSL https://hop-tap.keik.ai/install.sh | bash"
+echo "Install: curl -fsSL https://tap.keik.ai/install.sh | bash"

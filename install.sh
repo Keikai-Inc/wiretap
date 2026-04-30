@@ -2,8 +2,8 @@
 # Installer for hop-tap (the terminal-capture extension for hop).
 #
 # Usage:
-#   curl -fsSL https://hop-tap.keik.ai/install.sh | bash
-#   curl -fsSL https://hop-tap.keik.ai/install.sh | bash -s -- --version 0.1.0
+#   curl -fsSL https://tap.keik.ai/install.sh | bash
+#   curl -fsSL https://tap.keik.ai/install.sh | bash -s -- --version 0.1.0
 #
 # Behavior:
 #   - Linux-only (eBPF). On macOS/other this exits with a clear error.
@@ -24,7 +24,7 @@
 
 set -euo pipefail
 
-BASE_URL="${HOP_TAP_CDN_URL:-https://hop-tap.keik.ai}"
+BASE_URL="${HOP_TAP_CDN_URL:-https://tap.keik.ai}"
 HOP_BASE_URL="${HOP_CDN_URL:-https://hop.keik.ai}"
 
 # --- Colour helpers (disabled when piped) ------------------------------------
