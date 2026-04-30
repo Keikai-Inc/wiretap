@@ -662,39 +662,59 @@ async fn run_tui(socket: &std::path::Path) -> Result<Option<TuiAction>> {
             let inner_h = preview_inner.height as usize;
             let lines: Vec<Line> = match (&preview, inner_w, inner_h) {
                 (Some((_, _, contents)), w, h) if w > 0 && h > 0 => {
-                    // The daemon's grid is only populated by output bytes
-                    // it has captured *while running*. A session that's
-                    // been sitting at an idle prompt since before the
-                    // daemon started has nothing in its grid yet — every
-                    // row is whitespace. Render a clearer placeholder
-                    // so the user knows it's an idle session, not a UI
-                    // bug, and what to do about it.
-                    let all_blank = contents
+                    // Find the last non-blank row. That's typically where
+                    // the action is — the active prompt for a shell, the
+                    // last line of output for `ps aux`, etc. Anchoring on
+                    // this row (instead of the literal bottom of the
+                    // grid) means a fresh shell with its prompt at row 0
+                    // shows that prompt, not the empty rows below it.
+                    let last_meaningful = contents
                         .iter()
-                        .all(|row| row.chars().all(|c| c.is_whitespace()));
-                    if all_blank {
-                        vec![
-                            Line::from(""),
-                            Line::from("  (no captured output yet)"),
-                            Line::from(""),
-                            Line::from("  This session has been idle since"),
-                            Line::from("  hop-tap-d started — its screen"),
-                            Line::from("  populates as soon as it produces"),
-                            Line::from("  output. Press Enter to attach"),
-                            Line::from("  and interact with it."),
-                        ]
-                    } else {
-                        let start = contents.len().saturating_sub(h);
-                        contents[start..]
-                            .iter()
-                            .map(|row| {
+                        .rposition(|row| !row.chars().all(|c| c.is_whitespace()));
+
+                    match last_meaningful {
+                        None => {
+                            // Whole grid is whitespace — daemon has nothing
+                            // captured for this session yet. Tell the user
+                            // explicitly so a blank pane doesn't look like
+                            // a UI bug.
+                            vec![
+                                Line::from(""),
+                                Line::from("  (no captured output yet)"),
+                                Line::from(""),
+                                Line::from("  This session has been idle since"),
+                                Line::from("  hop-tap-d started — its screen"),
+                                Line::from("  populates as soon as it produces"),
+                                Line::from("  output. Press Enter to attach"),
+                                Line::from("  and interact with it."),
+                            ]
+                        }
+                        Some(last_row) => {
+                            // Slice from (last_row - h + 1) to last_row+1,
+                            // bounded by the grid. Then bottom-align inside
+                            // the preview pane: pad above with empty Lines
+                            // if the slice is shorter than h, so content
+                            // sits where it actually appears on the
+                            // captured terminal (vs. ratatui's default
+                            // top-aligned Paragraph rendering).
+                            let last = last_row + 1;
+                            let start = last.saturating_sub(h);
+                            let visible_rows = &contents[start..last];
+
+                            let mut out: Vec<Line> = Vec::with_capacity(h);
+                            let pad = h.saturating_sub(visible_rows.len());
+                            for _ in 0..pad {
+                                out.push(Line::from(""));
+                            }
+                            for row in visible_rows {
                                 let trimmed = row.trim_end_matches(' ');
                                 // Truncate by chars (not bytes) to avoid
                                 // splitting multi-byte UTF-8.
                                 let truncated: String = trimmed.chars().take(w).collect();
-                                Line::from(truncated)
-                            })
-                            .collect()
+                                out.push(Line::from(truncated));
+                            }
+                            out
+                        }
                     }
                 }
                 _ if preview_pty.is_some() => vec![Line::from("(loading…)")],
