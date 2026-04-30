@@ -101,7 +101,11 @@ async fn main() -> Result<()> {
 
     let mut next_id = 1u64;
     match cmd {
-        Cmd::Connect { pty } => connect(stream, &mut next_id, pty, false).await,
+        // Connect returns AttachOutcome; for direct invocation (no
+        // picker to return to) every outcome collapses to clean exit.
+        Cmd::Connect { pty } => {
+            connect(stream, &mut next_id, pty, false).await.map(|_| ())
+        }
         cmd => {
             let mut conn = Conn::new(stream);
             match cmd {
@@ -122,10 +126,32 @@ async fn main() -> Result<()> {
     }
 }
 
+/// After a snapshot is dumped to stdout, read one keystroke to decide
+/// where to go next: Esc → back to shell, anything else (Enter being
+/// the documented common choice) → back to picker. Briefly enables
+/// raw mode so we can read a single byte without waiting for a
+/// newline.
+fn read_post_snapshot_choice() -> AttachOutcome {
+    let _ = crossterm::terminal::enable_raw_mode();
+    let mut byte = [0u8; 1];
+    // SAFETY: read(2) on STDIN with our own buffer. Returns 0 on EOF
+    // or negative on signal interrupt — either way we treat it as
+    // "back to picker" (the conservative default).
+    let n = unsafe { libc::read(libc::STDIN_FILENO, byte.as_mut_ptr() as *mut _, 1) };
+    let _ = crossterm::terminal::disable_raw_mode();
+    eprintln!();
+    if n == 1 && byte[0] == 0x1B {
+        AttachOutcome::BackToShell
+    } else {
+        AttachOutcome::BackToPicker
+    }
+}
+
 /// Loop: pick a session in the TUI → run the action → re-enter the
-/// TUI. Exits cleanly when the user presses q in the picker. Errors
-/// from a single action (e.g. connect failed because pty went away
-/// mid-attach) are surfaced briefly and don't break the loop.
+/// TUI. Exits cleanly when the user presses Esc/q in the picker, or
+/// when an attach action returns BackToShell. Errors from a single
+/// action (e.g. connect failed because the pty went away mid-attach)
+/// are surfaced briefly and don't break the loop.
 async fn picker_loop(socket: &std::path::Path) -> Result<()> {
     use std::io::Write as _;
 
@@ -149,7 +175,11 @@ async fn picker_loop(socket: &std::path::Path) -> Result<()> {
         };
 
         let mut next_id = 1u64;
-        let result: Result<()> = match action {
+        // Each action returns either an AttachOutcome (connect/watch
+        // → key-driven exit) or a plain () (snapshot — fire and
+        // wait for Enter). We normalize to AttachOutcome so the loop
+        // can decide whether to re-enter the picker or exit.
+        let outcome: Result<AttachOutcome> = match action {
             TuiAction::Connect(pty) => connect(stream, &mut next_id, pty, false).await,
             TuiAction::Watch(pty) => connect(stream, &mut next_id, pty, true).await,
             TuiAction::Snapshot(pty) => {
@@ -163,18 +193,20 @@ async fn picker_loop(socket: &std::path::Path) -> Result<()> {
                 // Pause so the user can read the snapshot before the
                 // picker re-enters and clears the screen with its
                 // alt-screen swap.
-                eprint!("\n[press enter to return to picker] ");
+                eprint!("\n[Enter = back to picker, Esc = exit] ");
                 std::io::stderr().flush().ok();
-                let mut buf = String::new();
-                let _ = std::io::stdin().read_line(&mut buf);
-                r
+                r.and_then(|_| Ok(read_post_snapshot_choice()))
             }
         };
-        if let Err(e) = result {
-            eprintln!("\r\n[action error: {e}]\r");
-            // Brief pause so the message isn't immediately wiped by
-            // the picker's redraw.
-            tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+        match outcome {
+            Ok(AttachOutcome::BackToShell) => return Ok(()),
+            Ok(AttachOutcome::BackToPicker) | Ok(AttachOutcome::SessionClosed) => {
+                // Loop back to the picker.
+            }
+            Err(e) => {
+                eprintln!("\r\n[action error: {e}]\r");
+                tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+            }
         }
     }
 }
@@ -421,8 +453,27 @@ fn format_user(username: &Option<String>, uid: u32) -> String {
 enum StdinEvent {
     /// User typed these bytes — forward to the session via Inject.
     Bytes(Vec<u8>),
-    /// User pressed the detach hotkey (Ctrl-B then 'd'). Tear down.
-    Detach,
+    /// User pressed Ctrl-T — return to the picker (or exit to shell
+    /// if connect was launched directly without a picker).
+    DetachToPicker,
+    /// User pressed Esc — exit all the way back to the shell, even
+    /// when launched from the picker.
+    DetachToShell,
+}
+
+/// Outcome of an attach (`tap connect` / picker → Watch). Tells the
+/// caller whether to re-enter the picker, fall back to the shell, or
+/// note that the session itself ended.
+#[derive(Debug)]
+enum AttachOutcome {
+    /// User pressed Ctrl-T — re-show the picker.
+    BackToPicker,
+    /// User pressed Esc — exit fully.
+    BackToShell,
+    /// Server closed the stream (session ended, forbidden, etc.).
+    /// Treated like BackToPicker by the loop so the user can pick
+    /// another session.
+    SessionClosed,
 }
 
 /// RAII guard that disables raw mode when dropped. Ensures the
@@ -473,23 +524,24 @@ async fn recv_local(read: &mut OwnedReadHalf) -> Result<LocalMessage> {
 ///    screen as a "catch up" replay.
 /// 2. Put the local terminal into raw mode so keystrokes don't get
 ///    line-buffered or interpreted by the local shell.
-/// 3. Spawn a blocking thread that reads bytes from stdin and pushes
-///    them on a channel. The thread also runs the detach state
-///    machine (Ctrl-B then 'd' → Detach event; bare Ctrl-B held one
-///    keystroke and emitted on the next non-'d' byte).
+/// 3. Spawn a blocking thread that reads bytes from stdin. Two hot
+///    keys: Ctrl-T returns to the picker, Esc returns to the shell.
+///    Esc detection uses a 50ms poll-timeout to disambiguate bare Esc
+///    from the start of an escape sequence (arrow keys, Alt-keys, F1
+///    etc. all begin with Esc).
 /// 4. The main task selects between incoming server frames (write to
 ///    stdout) and stdin events. In read-write mode, stdin bytes go
-///    out as Inject Calls; in read_only mode they're dropped except
-///    for the detach trigger (and Ctrl-C also detaches in read-only,
-///    since there's nothing to forward it to).
-/// 5. Either side closing or a Detach event ends the loop; the
-///    RawModeGuard restores the terminal on the way out.
+///    out as Inject Calls; in read-only mode they're dropped (the
+///    hot keys still work).
+/// 5. Either side closing, a hot key, or a server StreamClosed ends
+///    the loop. The function returns an [`AttachOutcome`] so the
+///    caller can decide whether to re-enter the picker or exit.
 async fn connect(
     stream: UnixStream,
     next_id: &mut u64,
     pty: i32,
     read_only: bool,
-) -> Result<()> {
+) -> Result<AttachOutcome> {
     let (mut read_half, mut write_half) = stream.into_split();
 
     // 1. Subscribe to the watch stream and confirm the daemon
@@ -527,19 +579,16 @@ async fn connect(
     crossterm::terminal::enable_raw_mode().context("enable raw mode")?;
     let _raw = RawModeGuard;
     let mode_label = if read_only { "watch (read-only)" } else { "connect" };
-    let extra = if read_only { ", Ctrl-C also detaches" } else { "" };
     eprintln!(
-        "\r\n[tap {mode_label} pty={pty} — Ctrl-B d to detach{extra}; \
-         Ctrl-B Ctrl-B sends a literal Ctrl-B (e.g. for inner tmux)]\r\n"
+        "\r\n[tap {mode_label} pty={pty} — Ctrl-T = back to picker, Esc = back to shell]\r\n"
     );
 
-    // 3. Blocking stdin reader on a dedicated thread. tokio::io::stdin
-    //    is blocking-on-a-thread under the hood anyway, and doing it
-    //    ourselves means we control the read buffer and the detach
-    //    state machine without an extra layer.
+    // 3. Blocking stdin reader on a dedicated thread. We do raw read(2)
+    //    so we control buffering and can poll(2) with a timeout to
+    //    disambiguate bare Esc from the start of an escape sequence.
     let (stdin_tx, mut stdin_rx) = mpsc::unbounded_channel::<StdinEvent>();
     std::thread::spawn(move || {
-        stdin_reader_loop(stdin_tx, read_only);
+        stdin_reader_loop(stdin_tx);
     });
 
     // 4. Main multiplex loop. Use a separate request_id space for
@@ -556,9 +605,9 @@ async fn connect(
                 Some(StdinEvent::Bytes(b)) => {
                     if read_only {
                         // In watch mode we drop typed bytes — there's no
-                        // session input channel. The detach hotkey still
-                        // works because the reader thread converts it to
-                        // a separate event before we ever see Bytes.
+                        // session input channel. The hot keys still work
+                        // because the reader thread converts them to
+                        // separate events before we ever see Bytes.
                         continue;
                     }
                     inject_id = inject_id.wrapping_add(1);
@@ -569,14 +618,17 @@ async fn connect(
                             payload: TapRequest::Inject { pty_index: pty, bytes: b },
                         },
                     ).await {
-                        // Connection is gone — break and let the guard restore.
                         eprintln!("\r\n[connect: send failed: {e}]\r");
-                        return Ok(());
+                        return Ok(AttachOutcome::SessionClosed);
                     }
                 }
-                Some(StdinEvent::Detach) | None => {
+                Some(StdinEvent::DetachToPicker) => {
                     eprintln!("\r\n[detached]\r");
-                    return Ok(());
+                    return Ok(AttachOutcome::BackToPicker);
+                }
+                Some(StdinEvent::DetachToShell) | None => {
+                    eprintln!("\r\n[exit]\r");
+                    return Ok(AttachOutcome::BackToShell);
                 }
             },
             msg = recv_local(&mut read_half) => {
@@ -584,7 +636,7 @@ async fn connect(
                     Ok(m) => m,
                     Err(e) => {
                         eprintln!("\r\n[connect: server closed: {e}]\r");
-                        return Ok(());
+                        return Ok(AttachOutcome::SessionClosed);
                     }
                 };
                 match msg {
@@ -612,7 +664,7 @@ async fn connect(
                             "\r\n[session ended: {}]\r",
                             reason.unwrap_or_else(|| "(no reason)".into())
                         );
-                        return Ok(());
+                        return Ok(AttachOutcome::SessionClosed);
                     }
                     // Inject ack: TapResponse::Injected. Fire-and-forget;
                     // we don't surface per-keystroke confirmations.
@@ -650,6 +702,7 @@ async fn run_tui(socket: &std::path::Path) -> Result<Option<TuiAction>> {
     use ratatui::backend::CrosstermBackend;
     use ratatui::layout::{Constraint, Direction, Layout};
     use ratatui::style::{Modifier, Style};
+    use ratatui::text::{Line, Text};
     use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState};
     use ratatui::Terminal;
     use std::io::stdout;
@@ -697,10 +750,16 @@ async fn run_tui(socket: &std::path::Path) -> Result<Option<TuiAction>> {
     let mut last_refresh = Instant::now() - Duration::from_secs(10);
     let refresh_interval = Duration::from_millis(1500);
 
+    // Live preview cache: which pty's screen we're currently showing,
+    // plus the (rows, cols, contents) of its last fetched snapshot. We
+    // refetch when the highlighted pty changes (so navigation feels
+    // instant) and again on every periodic refresh so a still-selected
+    // session updates as it produces output.
+    let mut preview_pty: Option<i32> = None;
+    let mut preview: Option<(u16, u16, Vec<String>)> = None;
+
     loop {
-        // Refresh if it's been long enough. Errors are surfaced into
-        // the status line so the picker keeps working with stale data
-        // rather than dying.
+        // Periodic refresh of the session list.
         if last_refresh.elapsed() >= refresh_interval {
             match refresh_sessions(&mut conn, &mut next_id).await {
                 Ok(s) => {
@@ -715,7 +774,7 @@ async fn run_tui(socket: &std::path::Path) -> Result<Option<TuiAction>> {
                         state.select(Some(0));
                     }
                     status_line = format!(
-                        "{} session(s) — ↑/↓ select  enter=connect  w=watch  s=snapshot  q=quit",
+                        "{} session(s) — ↑/↓ select  enter=connect  w=watch  s=snapshot  Esc/q=quit",
                         sessions.len()
                     );
                 }
@@ -723,13 +782,31 @@ async fn run_tui(socket: &std::path::Path) -> Result<Option<TuiAction>> {
                     status_line = format!("refresh error: {e}");
                 }
             }
+            // Drop the cached preview so the periodic refresh below
+            // grabs a fresh one for the current selection. This is what
+            // makes the preview feel "live."
+            preview_pty = None;
             last_refresh = Instant::now();
+        }
+
+        // Refresh the preview if our cache doesn't match the current
+        // selection (highlight changed, or we just invalidated it).
+        let target_pty = state.selected().and_then(|i| sessions.get(i)).map(|s| s.pty_index);
+        if target_pty != preview_pty {
+            preview_pty = target_pty;
+            preview = match target_pty {
+                Some(pty) => match refresh_snapshot(&mut conn, &mut next_id, pty).await {
+                    Ok(p) => Some(p),
+                    Err(_) => None,
+                },
+                None => None,
+            };
         }
 
         // Render.
         term.draw(|f| {
             let area = f.area();
-            let chunks = Layout::default()
+            let outer = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
                     Constraint::Length(3),
@@ -740,14 +817,21 @@ async fn run_tui(socket: &std::path::Path) -> Result<Option<TuiAction>> {
 
             let header = Paragraph::new("tap — terminal session picker")
                 .block(Block::default().borders(Borders::ALL).title("hop-tap"));
-            f.render_widget(header, chunks[0]);
+            f.render_widget(header, outer[0]);
+
+            // Split the middle region: session table on the left, live
+            // preview of the highlighted session on the right. 60/40
+            // split is roomy enough for the table at ~80 cols and gives
+            // the preview enough width to be useful.
+            let body = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+                .split(outer[1]);
 
             let header_row = Row::new(vec![
                 Cell::from("pty"),
                 Cell::from("user"),
                 Cell::from("comm"),
-                Cell::from("out (b/ev)"),
-                Cell::from("in (b/ev)"),
                 Cell::from("age"),
                 Cell::from("idle"),
             ])
@@ -761,8 +845,6 @@ async fn run_tui(socket: &std::path::Path) -> Result<Option<TuiAction>> {
                         Cell::from(format!("{}", s.pty_index)),
                         Cell::from(opener),
                         Cell::from(s.last_comm.clone()),
-                        Cell::from(format!("{}/{}", s.output_bytes, s.output_events)),
-                        Cell::from(format!("{}/{}", s.input_bytes, s.input_events)),
                         Cell::from(format!("{}ms", s.age_ms)),
                         Cell::from(format!("{}ms", s.idle_ms)),
                     ])
@@ -773,8 +855,6 @@ async fn run_tui(socket: &std::path::Path) -> Result<Option<TuiAction>> {
                 Constraint::Length(5),
                 Constraint::Length(20),
                 Constraint::Length(14),
-                Constraint::Length(14),
-                Constraint::Length(14),
                 Constraint::Length(10),
                 Constraint::Length(10),
             ];
@@ -782,10 +862,44 @@ async fn run_tui(socket: &std::path::Path) -> Result<Option<TuiAction>> {
                 .header(header_row)
                 .block(Block::default().borders(Borders::ALL).title("sessions"))
                 .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED));
-            f.render_stateful_widget(table, chunks[1], &mut state);
+            f.render_stateful_widget(table, body[0], &mut state);
+
+            // Preview pane: render the cached snapshot rows. Truncate
+            // each row to fit the inner width (the Block borders eat
+            // 2 cols), and show the bottom-most rows that fit (most
+            // recent activity is at the bottom of a terminal). If we
+            // don't have a snapshot yet, show a placeholder.
+            let preview_block = Block::default()
+                .borders(Borders::ALL)
+                .title(match preview_pty {
+                    Some(pty) => format!("preview (pty {pty})"),
+                    None => "preview".into(),
+                });
+            let preview_inner = preview_block.inner(body[1]);
+            let inner_w = preview_inner.width as usize;
+            let inner_h = preview_inner.height as usize;
+            let lines: Vec<Line> = match (&preview, inner_w, inner_h) {
+                (Some((_, _, contents)), w, h) if w > 0 && h > 0 => {
+                    let start = contents.len().saturating_sub(h);
+                    contents[start..]
+                        .iter()
+                        .map(|row| {
+                            let trimmed = row.trim_end_matches(' ');
+                            // Truncate by chars (not bytes) to avoid
+                            // splitting multi-byte UTF-8.
+                            let truncated: String = trimmed.chars().take(w).collect();
+                            Line::from(truncated)
+                        })
+                        .collect()
+                }
+                _ if preview_pty.is_some() => vec![Line::from("(loading…)")],
+                _ => vec![Line::from("(no session selected)")],
+            };
+            let preview_para = Paragraph::new(Text::from(lines)).block(preview_block);
+            f.render_widget(preview_para, body[1]);
 
             let status = Paragraph::new(status_line.clone());
-            f.render_widget(status, chunks[2]);
+            f.render_widget(status, outer[2]);
         })
         .context("ratatui draw")?;
 
@@ -854,6 +968,45 @@ impl Drop for TuiGuard {
     }
 }
 
+/// Fetch a Snapshot for `pty` and return (rows, cols, contents). Used
+/// by the TUI's preview pane. Returns Err if the daemon doesn't have
+/// (or won't surface) the session — callers should clear the cache
+/// and show a placeholder.
+async fn refresh_snapshot(
+    conn: &mut Conn,
+    next_id: &mut u64,
+    pty: i32,
+) -> Result<(u16, u16, Vec<String>)> {
+    let request_id = *next_id;
+    *next_id += 1;
+    conn.send(LocalMessage::Call {
+        request_id,
+        payload: TapRequest::Snapshot { pty_index: pty },
+    })
+    .await?;
+    loop {
+        match conn.recv().await? {
+            LocalMessage::Reply {
+                request_id: rid,
+                payload:
+                    TapResponse::Snapshot {
+                        rows,
+                        cols,
+                        contents,
+                        ..
+                    },
+            } if rid == request_id => return Ok((rows, cols, contents)),
+            LocalMessage::Reply {
+                request_id: rid,
+                payload: TapResponse::Error(msg),
+            } if rid == request_id => bail!("daemon: {msg}"),
+            other => {
+                tracing::debug!(?other, "tui: ignoring unexpected message during snapshot");
+            }
+        }
+    }
+}
+
 /// Issue a `List` request and wait for the matching `Reply`. Used by
 /// the TUI's periodic poll. Other (e.g. unrelated stream) messages on
 /// the same connection would be unexpected here — the TUI's `Conn` is
@@ -890,80 +1043,85 @@ async fn refresh_sessions(
 
 /// Blocking stdin-byte reader. Runs on its own OS thread.
 ///
-/// State machine for the Ctrl-B prefix:
+/// Two hot keys:
+///   - **Ctrl-T** → `DetachToPicker`. Single keystroke, eaten on the
+///     spot. No tmux overlap (tmux's prefix is Ctrl-B), no doubling.
+///   - **Esc**    → `DetachToShell`. Hard because Esc is the prefix of
+///     every escape sequence (arrow keys, Alt-keys, F1+) — so we hold
+///     the Esc byte and `poll(2)` with a 50ms timeout. If more bytes
+///     arrive, it was a sequence: emit Esc + the bytes as Bytes. If
+///     the timeout expires with no more input, it was a bare Esc:
+///     emit DetachToShell.
 ///
-///   bare Ctrl-B → arm; hold the byte, peek at the next one
-///   armed + 'd'      → `StdinEvent::Detach` (and we're done)
-///   armed + Ctrl-B   → emit ONE literal Ctrl-B and disarm. This is
-///                      tmux's `send-prefix` convention: doubling the
-///                      prefix sends a single literal prefix byte to
-///                      the remote. So `Ctrl-B Ctrl-B d` sends
-///                      `Ctrl-B d` to the session, which is how the
-///                      user detaches an *inner* tmux without tap
-///                      eating the sequence.
-///   armed + other    → emit the held Ctrl-B followed by the byte,
-///                      disarm. Lets normal `Ctrl-B <key>` chords
-///                      reach the remote with one keystroke of latency.
-///
-/// In `read_only` mode (tap watch and the picker's "watch" entry), a
-/// bare Ctrl-C also produces `StdinEvent::Detach` — there's no remote
-/// to forward it to and users expect Ctrl-C to exit. In read-write
-/// mode Ctrl-C is forwarded to the session unchanged so the user can
-/// interrupt remote processes.
-fn stdin_reader_loop(tx: mpsc::UnboundedSender<StdinEvent>, read_only: bool) {
-    const CTRL_B: u8 = 0x02;
-    const CTRL_C: u8 = 0x03;
+/// 50ms is the value most TUI libraries use; it's long enough that
+/// arrow-key follow-ups always make it within the window on local
+/// terminals, and short enough that bare Esc still feels instant.
+fn stdin_reader_loop(tx: mpsc::UnboundedSender<StdinEvent>) {
+    const CTRL_T: u8 = 0x14;
+    const ESC: u8 = 0x1B;
+    const ESC_TIMEOUT_MS: i32 = 50;
+
     let mut buf = [0u8; 1024];
-    let mut detach_armed = false;
+    // True between seeing an unaccompanied Esc and learning what comes
+    // next (more bytes → sequence, timeout → bare Esc).
+    let mut esc_pending = false;
+
     loop {
-        // SAFETY: read(2) on a valid fd, into our owned buffer.
-        let n = unsafe {
-            libc::read(
-                libc::STDIN_FILENO,
-                buf.as_mut_ptr() as *mut _,
-                buf.len(),
-            )
+        // Poll with a timeout iff we're holding a pending Esc; otherwise
+        // block forever waiting for input.
+        let timeout_ms = if esc_pending { ESC_TIMEOUT_MS } else { -1 };
+        let mut pfd = libc::pollfd {
+            fd: libc::STDIN_FILENO,
+            events: libc::POLLIN,
+            revents: 0,
         };
-        if n <= 0 {
-            // EOF, error, or signal interrupt — let the channel drop
-            // signal the connect task.
+        // SAFETY: pollfd struct is zeroed except the fields we set;
+        // a count of 1 matches the array length.
+        let pr = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+        if pr < 0 {
+            // EINTR (signal) — retry. Anything else is also recoverable
+            // by retrying in our context.
+            continue;
+        }
+        if pr == 0 {
+            // Timeout. Only happens when we had a pending Esc.
+            debug_assert!(esc_pending);
+            let _ = tx.send(StdinEvent::DetachToShell);
             return;
         }
-        let mut out: Vec<u8> = Vec::with_capacity(n as usize);
+
+        // SAFETY: read(2) on STDIN with our owned buffer.
+        let n = unsafe {
+            libc::read(libc::STDIN_FILENO, buf.as_mut_ptr() as *mut _, buf.len())
+        };
+        if n <= 0 {
+            // EOF or error — let the channel drop signal the caller.
+            return;
+        }
+
+        let mut out: Vec<u8> = Vec::with_capacity(n as usize + 1);
         for &b in &buf[..n as usize] {
-            if detach_armed {
-                detach_armed = false;
-                match b {
-                    b'd' => {
-                        if !out.is_empty() {
-                            let _ = tx.send(StdinEvent::Bytes(out));
-                        }
-                        let _ = tx.send(StdinEvent::Detach);
-                        return;
-                    }
-                    CTRL_B => {
-                        // Doubled prefix: send a single literal Ctrl-B.
-                        // Lets the user reach an inner tmux's prefix.
-                        out.push(CTRL_B);
-                    }
-                    other => {
-                        // Held Ctrl-B was the start of a normal chord
-                        // (e.g. Ctrl-B c in tmux to make a window).
-                        out.push(CTRL_B);
-                        out.push(other);
-                    }
-                }
-            } else if b == CTRL_B {
-                detach_armed = true;
-            } else if read_only && b == CTRL_C {
-                // Watch mode: Ctrl-C is the natural "exit" key. There's
-                // no session input channel to forward it to, so use it
-                // as a synonym for detach.
+            if esc_pending {
+                // Esc had a follow-up within the timeout — it's a
+                // sequence. Forward Esc + this byte and clear the flag.
+                esc_pending = false;
+                out.push(ESC);
+                out.push(b);
+            } else if b == CTRL_T {
+                // Single-keystroke detach back to the picker.
                 if !out.is_empty() {
                     let _ = tx.send(StdinEvent::Bytes(out));
                 }
-                let _ = tx.send(StdinEvent::Detach);
+                let _ = tx.send(StdinEvent::DetachToPicker);
                 return;
+            } else if b == ESC {
+                // Hold; the next iteration's poll will tell us bare or
+                // sequence. Flush anything we've already accumulated so
+                // there's no out-of-order delivery.
+                if !out.is_empty() {
+                    let _ = tx.send(StdinEvent::Bytes(std::mem::take(&mut out)));
+                }
+                esc_pending = true;
             } else {
                 out.push(b);
             }
