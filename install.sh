@@ -112,9 +112,17 @@ info "Installing hop-tap v${VERSION}"
 # --- Make sure hop is installed and running ---------------------------------
 #
 # hop-tap is a hop extension. Without hop running there's nothing for the
-# manifest to register against. If hop is missing (or stopped), we delegate
-# to its own daemon installer first — same script the user would run for
-# a standalone hop install.
+# manifest to register against.
+#
+# Two cases we handle:
+#   1. hop binary missing entirely — delegate to hop's official daemon
+#      installer (the only hop-related logic this script touches; we
+#      deliberately do NOT duplicate any of it).
+#   2. hop binary present but daemon not running — bail with a clear
+#      message. There are too many ways a user can run hop (systemd,
+#      tmux, user-local --dir install, custom service name) for us to
+#      reliably "fix" this without potentially clobbering their setup.
+#      They know their config; just tell them what we need.
 
 ensure_hop_running() {
   if ! command -v hop >/dev/null 2>&1; then
@@ -128,15 +136,11 @@ ensure_hop_running() {
   fi
 
   if ! systemctl is-active --quiet hop 2>/dev/null; then
-    info "hop is installed but the daemon isn't running — starting it..."
-    # The user might have hop binary installed without the systemd
-    # service set up (manual install). install-daemon.sh handles both.
-    if command -v curl >/dev/null 2>&1; then
-      bash <(curl -fsSL "${HOP_BASE_URL}/install-daemon.sh")
-    else
-      bash <(wget -qO- "${HOP_BASE_URL}/install-daemon.sh")
-    fi
-    return
+    die "hop is installed but the daemon isn't running.
+Start it however you normally do (e.g. \`sudo systemctl start hop\` or
+\`hop host\`) and re-run this installer. We deliberately don't try to
+start hop ourselves to avoid clobbering manual / user-local /
+non-systemd setups."
   fi
 
   info "hop daemon already running — registering hop-tap as an extension"
