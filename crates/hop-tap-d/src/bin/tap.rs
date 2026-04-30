@@ -662,17 +662,40 @@ async fn run_tui(socket: &std::path::Path) -> Result<Option<TuiAction>> {
             let inner_h = preview_inner.height as usize;
             let lines: Vec<Line> = match (&preview, inner_w, inner_h) {
                 (Some((_, _, contents)), w, h) if w > 0 && h > 0 => {
-                    let start = contents.len().saturating_sub(h);
-                    contents[start..]
+                    // The daemon's grid is only populated by output bytes
+                    // it has captured *while running*. A session that's
+                    // been sitting at an idle prompt since before the
+                    // daemon started has nothing in its grid yet — every
+                    // row is whitespace. Render a clearer placeholder
+                    // so the user knows it's an idle session, not a UI
+                    // bug, and what to do about it.
+                    let all_blank = contents
                         .iter()
-                        .map(|row| {
-                            let trimmed = row.trim_end_matches(' ');
-                            // Truncate by chars (not bytes) to avoid
-                            // splitting multi-byte UTF-8.
-                            let truncated: String = trimmed.chars().take(w).collect();
-                            Line::from(truncated)
-                        })
-                        .collect()
+                        .all(|row| row.chars().all(|c| c.is_whitespace()));
+                    if all_blank {
+                        vec![
+                            Line::from(""),
+                            Line::from("  (no captured output yet)"),
+                            Line::from(""),
+                            Line::from("  This session has been idle since"),
+                            Line::from("  hop-tap-d started — its screen"),
+                            Line::from("  populates as soon as it produces"),
+                            Line::from("  output. Press Enter to attach"),
+                            Line::from("  and interact with it."),
+                        ]
+                    } else {
+                        let start = contents.len().saturating_sub(h);
+                        contents[start..]
+                            .iter()
+                            .map(|row| {
+                                let trimmed = row.trim_end_matches(' ');
+                                // Truncate by chars (not bytes) to avoid
+                                // splitting multi-byte UTF-8.
+                                let truncated: String = trimmed.chars().take(w).collect();
+                                Line::from(truncated)
+                            })
+                            .collect()
+                    }
                 }
                 _ if preview_pty.is_some() => vec![Line::from("(loading…)")],
                 _ => vec![Line::from("(no session selected)")],
