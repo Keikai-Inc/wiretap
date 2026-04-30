@@ -153,24 +153,25 @@ def picker_body(highlight_root=True, quarantined=False):
     """Render a snapshot of the picker body (rows minus header/footer).
 
     Each row shows `loginuser(euid)`. alice(0) is alice sudo'd to root —
-    expected for an operator. ops(0) is suspicious: ops is a service
-    account that should never have euid 0. The mismatch (in red) is the
-    visual tell of a privesc."""
+    expected for an operator. www-data(0) is the smoking gun: the apache
+    service account has no business holding a root shell. Some 0day
+    landed an attacker in apache's worker, and a chained privesc bumped
+    them to euid 0. The mismatch (in red) is the visual tell."""
     rows = []
     # alice's row — operator's own session (running tap right now).
     rows.append(
         f"{BOLD}│{RESET}    3   alice(0)           tap         82s      0ms                         {BOLD}│{RESET}"
     )
-    # ops's row — login=ops but euid=0. Username in red flags the privesc.
+    # www-data's row — login=www-data but euid=0. Apache → root shell.
     label = "🎭  4" if quarantined else "    4"
-    line = f"{label}   {RED}ops(0){RESET}              bash        45s      0ms                       "
+    line = f"{label}   {RED}www-data(0){RESET}         bash        45s      0ms                       "
     if highlight_root:
         line = REV + line + RESET
     rows.append(f"{BOLD}│{RESET} {line}{BOLD}│{RESET}")
     # spacer
     rows.append(f"{BOLD}│{RESET}                                                                              {BOLD}│{RESET}")
-    # preview header
-    rows.append(f"{BOLD}│{RESET}  {DIM}preview of pty 4 (ops → euid 0) ── live{RESET}                                    {BOLD}│{RESET}")
+    # preview header — origin is apache (parent process chain leads to httpd)
+    rows.append(f"{BOLD}│{RESET}  {DIM}preview of pty 4 (origin: apache2 → euid 0) ── live{RESET}                        {BOLD}│{RESET}")
     return "\r\n".join(rows) + "\r\n"
 
 
