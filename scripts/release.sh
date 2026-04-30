@@ -335,9 +335,16 @@ else
   git -C "${PROJECT_ROOT}" tag "v${VERSION}"
 fi
 
-echo "==> Pushing to origin (with tags)"
-git -C "${PROJECT_ROOT}" push
-git -C "${PROJECT_ROOT}" push --tags
+# Skip the push if no `origin` remote is configured. Useful for
+# release hosts that publish artifacts but keep source local; the
+# tag still lives in the local repo and can be pushed later.
+if git -C "${PROJECT_ROOT}" remote get-url origin >/dev/null 2>&1; then
+  echo "==> Pushing to origin (with tags)"
+  git -C "${PROJECT_ROOT}" push
+  git -C "${PROJECT_ROOT}" push --tags
+else
+  echo "==> Skipping git push (no 'origin' remote configured)"
+fi
 
 # --- CloudFront invalidation -----------------------------------------------
 
