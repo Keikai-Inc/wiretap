@@ -355,12 +355,16 @@ struct StatusInfo {
 /// `tap connect <pty>` — attach to a session bidirectionally with a
 /// tmux-style bottom status bar.
 ///
-/// Layout: the local terminal's last row is reserved for the status
-/// bar via DECSTBM (set top/bottom margins to `1; rows-1`), so the
-/// captured session's content scrolls in the upper region without
-/// clobbering the bar. Most apps respect the scroll region;
-/// absolute-position writes to row N would still land on the bar,
-/// so we re-paint after every Output frame and on a 1s timer.
+/// We deliberately *don't* set DECSTBM to reserve the bottom row.
+/// Absolute cursor positioning ignores the scroll region anyway, so
+/// it doesn't reliably protect the bar; worse, when the captured
+/// session's cursor lands on the bottom row, every Output byte
+/// arrived there and our re-paint clobbered it — so output looked
+/// like it wasn't refreshing. Instead: paint the bar once after the
+/// Initial replay, then refresh only on a 1s timer. Chatty sessions
+/// will overdraw the bar briefly, but the timer brings it back. In
+/// Compose mode we paint after every Output so the input prompt
+/// stays visible while the user types.
 ///
 /// Keys:
 ///   Ctrl-T → detach
@@ -491,8 +495,6 @@ async fn connect(
                         match payload {
                             TapStreamFrame::Initial { replay_bytes, .. } => {
                                 let _ = stdout.write_all(b"\x1b[2J\x1b[H");
-                                // Reserve the bottom row for our status bar.
-                                let _ = write!(stdout, "\x1b[1;{}r", term_rows.saturating_sub(1).max(1));
                                 let _ = stdout.write_all(&replay_bytes);
                                 paint_status_bar(&mut stdout, term_rows, term_cols, &info, &mode);
                                 let _ = stdout.flush();
@@ -500,7 +502,13 @@ async fn connect(
                             }
                             TapStreamFrame::Output(b) => {
                                 let _ = stdout.write_all(&b);
-                                if session_ready {
+                                // Only re-paint the status bar when the
+                                // user is actively composing — otherwise
+                                // we'd overwrite the captured session's
+                                // own bottom-row content on every frame.
+                                // The 1s timer below brings the bar back
+                                // for normal mode.
+                                if session_ready && matches!(mode, ConnectMode::Compose(_)) {
                                     paint_status_bar(&mut stdout, term_rows, term_cols, &info, &mode);
                                 }
                                 let _ = stdout.flush();
@@ -526,15 +534,14 @@ async fn connect(
                 }
             }
             _ = status_timer.tick() => {
-                // Periodic re-paint catches the case where the session
-                // wrote into our status row via absolute cursor
-                // positioning. Also re-fetches terminal size in case
-                // the user resized.
+                // Periodic re-paint brings the bar back if the captured
+                // session has scrolled / overwritten it since the last
+                // tick. Also re-fetches terminal size in case the user
+                // resized.
                 if let Ok((c, r)) = crossterm::terminal::size() {
                     if (c, r) != (term_cols, term_rows) {
                         term_cols = c;
                         term_rows = r;
-                        let _ = write!(stdout, "\x1b[1;{}r", term_rows.saturating_sub(1).max(1));
                     }
                 }
                 if session_ready {
@@ -545,9 +552,8 @@ async fn connect(
         }
     };
 
-    // Tear down: clear scroll region back to full screen and erase
-    // the status row so it doesn't linger on the user's terminal.
-    let _ = stdout.write_all(b"\x1b[r");
+    // Tear down: erase the status row so it doesn't linger on the
+    // user's terminal once the picker (or shell prompt) takes over.
     let _ = write!(stdout, "\x1b[{};1H\x1b[K", term_rows);
     let _ = stdout.flush();
     drop(stdout);
