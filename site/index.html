@@ -70,6 +70,43 @@
       margin-left: 0.5rem;
     }
 
+    /* Dual-cast demo (admin / suspect, side-by-side on desktop,
+       stacked on mobile). Each side gets a small label above. */
+    .cast-pair {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 1.25rem;
+      max-width: 64rem;
+      margin: 0 auto;
+    }
+    .cast-pair figure { margin: 0; min-width: 0; }
+    .cast-pair figcaption {
+      font-family: var(--font-display);
+      font-weight: 600;
+      font-size: 0.85rem;
+      color: var(--color-text-secondary);
+      margin-bottom: 0.5rem;
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+    .cast-pair figcaption .role-dot {
+      display: inline-block;
+      width: 0.5rem;
+      height: 0.5rem;
+      border-radius: 50%;
+    }
+    .cast-pair .role-admin  { background: var(--color-accent-green, #22c55e); }
+    .cast-pair .role-suspect { background: var(--color-accent-red,   #ef4444); }
+    .cast-pair .cast-host {
+      border-radius: 0.5rem;
+      overflow: hidden;
+      background: #000;
+    }
+
+    @media (max-width: 900px) {
+      .cast-pair { grid-template-columns: 1fr; }
+    }
     @media (max-width: 768px) {
       .perms-grid { grid-template-columns: 1fr; }
       .scenarios { grid-template-columns: 1fr; }
@@ -145,6 +182,27 @@
 <span class="comment"># your keystrokes go straight into alice's vim. detach, pick another session.</span>
           </div>
         </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Dual-cast demo: a takedown in real time -->
+  <section id="takedown">
+    <div class="container">
+      <div class="section-header">
+        <h2>What a takedown looks like</h2>
+        <p>Left: the admin. Right: a compromised account. The admin spots it, watches, quarantines, asks them what they're doing, and ends the session — all from the picker.</p>
+      </div>
+
+      <div class="cast-pair">
+        <figure>
+          <figcaption><span class="role-dot role-admin"></span> Admin — alice@web-prod</figcaption>
+          <div id="cast-admin" class="cast-host"></div>
+        </figure>
+        <figure>
+          <figcaption><span class="role-dot role-suspect"></span> Suspect — root@web-prod (compromised)</figcaption>
+          <div id="cast-hacker" class="cast-host"></div>
+        </figure>
       </div>
     </div>
   </section>
@@ -277,17 +335,74 @@
   <script src="asciinema-player.min.js"></script>
   <script>
     (function () {
-      var el = document.getElementById('tap-cast');
-      if (!el || !window.AsciinemaPlayer) return;
-      AsciinemaPlayer.create('tap.cast', el, {
-        cols: 80,
-        rows: 24,
-        autoPlay: true,
+      if (!window.AsciinemaPlayer) return;
+
+      // Existing install-section cast — single player, autoplays, loops.
+      var installEl = document.getElementById('tap-cast');
+      if (installEl) {
+        AsciinemaPlayer.create('tap.cast', installEl, {
+          cols: 80, rows: 24,
+          autoPlay: true, loop: true,
+          idleTimeLimit: 1.5,
+          theme: 'asciinema', fit: 'width',
+        });
+      }
+
+      // Dual-cast takedown demo — two players in lockstep.
+      var adminEl  = document.getElementById('cast-admin');
+      var hackerEl = document.getElementById('cast-hacker');
+      if (!adminEl || !hackerEl) return;
+
+      var common = {
+        cols: 80, rows: 24,
+        autoPlay: false,
         loop: true,
         idleTimeLimit: 1.5,
-        theme: 'asciinema',
-        fit: 'width'
-      });
+        theme: 'asciinema', fit: 'width',
+      };
+      var admin  = AsciinemaPlayer.create('admin.cast',  adminEl,  common);
+      var hacker = AsciinemaPlayer.create('hacker.cast', hackerEl, common);
+
+      // Forward play/pause from either side to the other. The re-entrancy
+      // guard stops the events ping-ponging back through the bridge.
+      var bridging = false;
+      function bridge(src, dst) {
+        src.addEventListener('play',  function () {
+          if (bridging) return; bridging = true; dst.play();  bridging = false;
+        });
+        src.addEventListener('pause', function () {
+          if (bridging) return; bridging = true; dst.pause(); bridging = false;
+        });
+        src.addEventListener('ended', function () {
+          if (bridging) return; bridging = true; dst.pause(); bridging = false;
+        });
+      }
+      bridge(admin, hacker);
+      bridge(hacker, admin);
+
+      // Soft drift correction: every 500ms, if the two players have slipped
+      // more than 100ms apart, snap the leader back to the lagger. Stops a
+      // minute of playback from drifting half a second across browsers.
+      setInterval(function () {
+        try {
+          var a = admin.getCurrentTime();
+          var h = hacker.getCurrentTime();
+          if (typeof a !== 'number' || typeof h !== 'number') return;
+          if (Math.abs(a - h) > 0.1) {
+            var target = Math.min(a, h);
+            bridging = true;
+            if (a > target + 0.1) admin.seek(target);
+            if (h > target + 0.1) hacker.seek(target);
+            bridging = false;
+          }
+        } catch (e) { /* player not ready yet */ }
+      }, 500);
+
+      // Start them together once both DOMs are mounted. A small delay
+      // gives the player a tick to wire up its internal handlers.
+      setTimeout(function () {
+        try { admin.play(); hacker.play(); } catch (e) {}
+      }, 200);
     })();
   </script>
 </body>

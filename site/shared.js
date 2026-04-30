@@ -1,9 +1,10 @@
 (function () {
   var NAV_LINKS = [
-    { label: 'Commands',     href: '#commands', cross: 'index.html#commands' },
-    { label: 'Why',          href: '#why',      cross: 'index.html#why' },
-    { label: 'Install',      href: '#install',  cross: 'index.html#install' },
-    { label: 'Permissions',  href: '#perms',    cross: 'index.html#perms' },
+    { label: 'Commands',     href: '#commands',  cross: 'index.html#commands' },
+    { label: 'Demo',         href: '#takedown',  cross: 'index.html#takedown' },
+    { label: 'Why',          href: '#why',       cross: 'index.html#why' },
+    { label: 'Install',      href: '#install',   cross: 'index.html#install' },
+    { label: 'Permissions',  href: '#perms',     cross: 'index.html#perms' },
     { label: 'Remote / AI',  href: 'remote.html', cross: 'remote.html' },
   ];
 
