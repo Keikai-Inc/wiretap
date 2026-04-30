@@ -115,6 +115,15 @@ upload_site() {
       --cache-control "${long_cache}"
   done
 
+  # asciinema cast recordings — JSON-lines format, Content-Type per
+  # the asciicast v2 spec.
+  for f in "${site_dir}"/*.cast; do
+    [[ -e "$f" ]] || continue
+    aws s3 cp "$f" "s3://${BUCKET}/$(basename "$f")" \
+      --content-type "application/x-asciicast" \
+      --cache-control "${short_cache}"
+  done
+
   if [[ -f "${PROJECT_ROOT}/install.sh" ]]; then
     aws s3 cp "${PROJECT_ROOT}/install.sh" "s3://${BUCKET}/install.sh" \
       --content-type "text/x-shellscript; charset=utf-8" \

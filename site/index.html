@@ -12,6 +12,7 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Manrope:wght@600;700;800;900&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="shared.css">
+  <link rel="stylesheet" href="asciinema-player.css">
   <style>
     .perms-grid {
       display: grid;
@@ -210,23 +211,15 @@
         <p>One curl. Linux-only — eBPF needs a Linux kernel.</p>
       </div>
 
-      <div style="max-width: 36rem; margin: 0 auto;">
-        <div class="code-block">
-          <div class="code-header">
-            <span class="code-dot"></span>
-            <span class="code-dot"></span>
-            <span class="code-dot"></span>
-            <span class="code-title">Install (Linux x86_64 / arm64)</span>
-          </div>
-          <div class="code-body">
-<span class="prompt">$</span> <span class="cmd">curl -fsSL https://tap.keik.ai/install.sh | bash</span>
-<span class="output">...</span>
-<span class="prompt">$</span> <span class="cmd">tap</span>
-<span class="comment"># picker comes up immediately. existing sessions are already there.</span>
-          </div>
+      <div style="max-width: 44rem; margin: 0 auto;">
+        <div style="background: var(--color-surface); border: 1px solid var(--color-border); border-radius: 0.5rem; padding: 1rem 1.25rem; margin-bottom: 1.5rem; font-family: ui-monospace, SFMono-Regular, monospace; font-size: 0.95rem; overflow-x: auto;">
+          <span style="color: var(--color-text-secondary);">$ </span><span>curl -fsSL https://tap.keik.ai/install.sh | bash</span>
         </div>
+
+        <div id="tap-cast" style="border-radius: 0.5rem; overflow: hidden;"></div>
+
         <p style="text-align: center; color: var(--color-text-secondary); font-size: 0.875rem; margin-top: 1.5rem;">
-          The installer drops the daemon under systemd and the <code>tap</code> CLI in <code>/usr/local/bin</code>. Nothing to configure. <code>tap list</code> works the moment install finishes.
+          The installer drops the daemon under systemd and the <code>tap</code> CLI in <code>/usr/local/bin</code>. Nothing to configure — <code>tap</code> works the moment install finishes.
         </p>
       </div>
     </div>
@@ -298,5 +291,21 @@
 
   <footer id="site-footer"></footer>
   <script src="shared.js"></script>
+  <script src="asciinema-player.min.js"></script>
+  <script>
+    (function () {
+      var el = document.getElementById('tap-cast');
+      if (!el || !window.AsciinemaPlayer) return;
+      AsciinemaPlayer.create('tap.cast', el, {
+        cols: 80,
+        rows: 24,
+        autoPlay: true,
+        loop: true,
+        idleTimeLimit: 1.5,
+        theme: 'asciinema',
+        fit: 'width'
+      });
+    })();
+  </script>
 </body>
 </html>
