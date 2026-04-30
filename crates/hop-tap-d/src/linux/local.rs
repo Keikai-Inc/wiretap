@@ -45,7 +45,7 @@ pub(crate) async fn run_local_listener<F>(
     peer_for_uid: F,
 ) -> Result<()>
 where
-    F: Fn(u32) -> super::PeerContext + Send + Sync + Clone + 'static,
+    F: Fn(u32, Option<i32> /* pid */) -> super::PeerContext + Send + Sync + Clone + 'static,
 {
     // If a previous run left a socket file behind, remove it. Bind
     // would otherwise EADDRINUSE.
@@ -77,8 +77,12 @@ where
             }
         };
         let uid = cred.uid();
-        let peer = peer_for_uid(uid);
-        debug!(uid, role = %peer.peer_role, "local connection");
+        // peer_cred().pid() is Option<i32> on tokio's Unix sockets —
+        // the kernel only fills it in when the SCM_CREDENTIALS path is
+        // available, but for local AF_UNIX it always is.
+        let pid = cred.pid();
+        let peer = peer_for_uid(uid, pid);
+        debug!(uid, pid = ?pid, role = %peer.peer_role, "local connection");
 
         let sessions = sessions.clone();
         let streams = streams.clone();

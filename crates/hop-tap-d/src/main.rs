@@ -132,12 +132,20 @@ mod linux {
         Close(Option<String>),
     }
 
+    /// Per-subscriber bookkeeping: the channel we forward
+    /// SubscriberMsgs to, plus enough context to do cycle detection
+    /// when *another* subscriber tries to open against this one's
+    /// peer. `peer_controlling_pty` is None for hop callers (their
+    /// tty isn't on this host).
+    pub(crate) struct StreamRecord {
+        pub tx: mpsc::UnboundedSender<SubscriberMsg>,
+        pub peer_controlling_pty: Option<i32>,
+        pub target_pty: i32,
+    }
+
     /// Daemon-shared registry of active stream subscribers, keyed
-    /// by stream_id. Each entry's mpsc::UnboundedSender goes to a
-    /// transport-specific forwarder task that converts SubscriberMsg
-    /// to the right wire format.
-    pub(crate) type StreamsMap =
-        Arc<Mutex<HashMap<u64, mpsc::UnboundedSender<SubscriberMsg>>>>;
+    /// by stream_id.
+    pub(crate) type StreamsMap = Arc<Mutex<HashMap<u64, StreamRecord>>>;
 
     // Phase 1.8g replaced the rolling-byte replay buffer with a
     // deterministic grid walk in `render_grid_to_bytes`. The
@@ -673,6 +681,46 @@ mod linux {
         Some(name.to_string_lossy().into_owned())
     }
 
+    /// Read `/proc/<pid>/stat` and decode the controlling terminal's
+    /// pty index, if any. Returns `None` for processes that have no
+    /// controlling tty (daemons), processes whose controlling tty is
+    /// not a pty slave (e.g. /dev/console), or if /proc isn't
+    /// available.
+    ///
+    /// In `/proc/<pid>/stat`, field 7 (1-indexed) is `tty_nr`, encoded
+    /// as `(major << 8) | minor` per the kernel's old_encode_dev. For
+    /// /dev/pts/N (UNIX98 pty slaves) major == 136 and minor == N.
+    /// We accept any major in the 136..=143 range — the kernel
+    /// allocates additional pty-slave majors when /dev/pts is large.
+    ///
+    /// Parsing the line is a little finicky: field 2 is `comm` and
+    /// can contain whitespace + parens, so we anchor on the closing
+    /// paren and split the rest by whitespace.
+    fn controlling_pty_for_pid(pid: i32) -> Option<i32> {
+        let path = format!("/proc/{pid}/stat");
+        let stat = std::fs::read_to_string(&path).ok()?;
+        let close = stat.rfind(')')?;
+        let after = stat.get(close + 1..)?.trim_start();
+        let fields: Vec<&str> = after.split_whitespace().collect();
+        // After the comm/paren we've stripped:
+        //   fields[0] = state (e.g. R)
+        //   fields[1] = ppid
+        //   fields[2] = pgrp
+        //   fields[3] = session
+        //   fields[4] = tty_nr  ← we want this one
+        let tty_nr: u32 = fields.get(4)?.parse().ok()?;
+        if tty_nr == 0 {
+            return None; // no controlling tty
+        }
+        let major = (tty_nr >> 8) & 0xff;
+        let minor = (tty_nr & 0xff) | ((tty_nr >> 12) & 0xfff00);
+        if (136..=143).contains(&major) {
+            Some(minor as i32)
+        } else {
+            None
+        }
+    }
+
     type SessionTable = Arc<Mutex<HashMap<i32, SessionState>>>;
 
     /// Identity of the peer making this request, as reported by the
@@ -689,6 +737,20 @@ mod linux {
         peer_id: String,
         peer_username: Option<String>,
         peer_role: String,
+        /// Local-socket only: the pty index that this connection's
+        /// peer process is itself running on (i.e., the user's own
+        /// terminal). Used to:
+        ///   - hide that pty from List/Snapshot results so the user
+        ///     doesn't see their own shell
+        ///   - refuse Subscribe / Inject targeting that pty (would
+        ///     be a self-loop)
+        ///   - detect 2-cycles when a different connection has the
+        ///     reverse subscription open (outer tap on pts/A attached
+        ///     to pts/B, inner tap on pts/B asks for pts/A)
+        /// `None` for hop extension callers (their tty is on a remote
+        /// host, so no local cycle is possible) and for connections
+        /// whose /proc lookup failed.
+        controlling_pty: Option<i32>,
     }
 
     impl PeerContext {
@@ -884,18 +946,21 @@ mod linux {
         let local_streams = streams.clone();
         let local_next_id = next_stream_id.clone();
         readers.spawn(async move {
-            let peer_for_uid = |uid: u32| -> PeerContext {
+            let peer_for_uid = |uid: u32, pid: Option<i32>| -> PeerContext {
+                let controlling_pty = pid.and_then(controlling_pty_for_pid);
                 if uid == 0 {
                     PeerContext {
                         peer_id: format!("local:uid={uid}"),
                         peer_username: Some("root".to_string()),
                         peer_role: "creator".to_string(),
+                        controlling_pty,
                     }
                 } else {
                     PeerContext {
                         peer_id: format!("local:uid={uid}"),
                         peer_username: lookup_username(uid),
                         peer_role: "peer".to_string(),
+                        controlling_pty,
                     }
                 }
             };
@@ -994,6 +1059,10 @@ mod linux {
                         peer_id,
                         peer_username,
                         peer_role,
+                        // Hop peers connect from another machine; their
+                        // controlling tty isn't on this host, so the
+                        // local-cycle / self-tap checks don't apply.
+                        controlling_pty: None,
                     };
                     let response_payload = serve_request(&sessions, &peer, &payload);
                     if tx_to_hop
@@ -1019,6 +1088,10 @@ mod linux {
                         peer_id,
                         peer_username,
                         peer_role,
+                        // Hop peers connect from another machine; their
+                        // controlling tty isn't on this host, so the
+                        // local-cycle / self-tap checks don't apply.
+                        controlling_pty: None,
                     };
                     handle_stream_open(
                         &sessions,
@@ -1072,6 +1145,37 @@ mod linux {
         peer: &PeerContext,
         pty_index: i32,
     ) -> Result<SubscribeOk, String> {
+        // Self-tap: peer's own controlling tty is the target. Refuse
+        // with the same not-found wording so we don't leak whether
+        // the session is real but yours vs. simply absent.
+        if Some(pty_index) == peer.controlling_pty {
+            return Err(format!("no session with pty_index={pty_index}"));
+        }
+
+        // Cycle detection. The peer (running on its own pty `peer_pty`)
+        // is asking to subscribe to `pty_index`. If some *other*
+        // existing subscriber's record says `target_pty == peer_pty
+        // && peer_controlling_pty == pty_index`, then attaching here
+        // would close a feedback loop:
+        //
+        //     peer_pty ── attaches to ──> pty_index
+        //         ▲                            │
+        //         └── attaches to ─── other ───┘
+        //
+        // That's the "outer tap on pts/A is attached to pts/B; inside
+        // pts/B you run another tap and pick pts/A" scenario. Refuse.
+        if let Some(peer_pty) = peer.controlling_pty {
+            let map = streams.lock().expect("streams mutex poisoned");
+            let cycle = map.values().any(|r| {
+                r.target_pty == peer_pty && r.peer_controlling_pty == Some(pty_index)
+            });
+            if cycle {
+                return Err(format!(
+                    "subscribe would create a tap feedback loop with pty_index={pty_index}"
+                ));
+            }
+        }
+
         let stream_id = next_stream_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = mpsc::unbounded_channel::<SubscriberMsg>();
 
@@ -1099,7 +1203,14 @@ mod linux {
         streams
             .lock()
             .expect("streams mutex poisoned")
-            .insert(stream_id, tx);
+            .insert(
+                stream_id,
+                StreamRecord {
+                    tx,
+                    peer_controlling_pty: peer.controlling_pty,
+                    target_pty: pty_index,
+                },
+            );
         info!(stream_id, pty_index, "stream subscribed");
         Ok(SubscribeOk { stream_id, rx })
     }
@@ -1257,8 +1368,8 @@ mod linux {
         }
         let guard = streams.lock().expect("streams mutex poisoned");
         for stream_id in subscribers {
-            if let Some(tx) = guard.get(&stream_id) {
-                let _ = tx.send(SubscriberMsg::Close(Some("session ended".into())));
+            if let Some(rec) = guard.get(&stream_id) {
+                let _ = rec.tx.send(SubscriberMsg::Close(Some("session ended".into())));
             }
         }
     }
@@ -1305,9 +1416,9 @@ mod linux {
         }
         let guard = streams.lock().expect("streams mutex poisoned");
         for &sid in &f.subscribers {
-            if let Some(tx) = guard.get(&sid) {
+            if let Some(rec) = guard.get(&sid) {
                 for msg in &to_emit {
-                    let _ = tx.send(msg.clone());
+                    let _ = rec.tx.send(msg.clone());
                 }
             }
         }
@@ -1339,16 +1450,32 @@ mod linux {
                 // Filter to only the sessions this peer is allowed
                 // to see. `creator` role peers see everything; other
                 // roles see only their own sessions.
+                //
+                // Additionally, hide the peer's *own* controlling tty
+                // — running `tap` from pts/N shouldn't surface pts/N
+                // in the picker. Self-tap would loop the peer's own
+                // terminal output back through itself.
+                let self_pty = peer.controlling_pty;
                 let table = sessions.lock().expect("session table mutex poisoned");
                 let mut infos: Vec<SessionInfo> = table
                     .values()
                     .filter(|s| peer.scope_allows(s))
+                    .filter(|s| Some(s.pty_index) != self_pty)
                     .map(|s| s.to_session_info())
                     .collect();
                 infos.sort_by_key(|i| i.pty_index);
                 TapResponse::SessionList(infos)
             }
             TapRequest::Snapshot { pty_index } => {
+                // Self-snapshot would feed the peer's own terminal
+                // back to itself. Refuse with the same not-found
+                // error used for unauthorized lookups so the result
+                // is consistent regardless of why it's denied.
+                if Some(pty_index) == peer.controlling_pty {
+                    return TapResponse::Error(format!(
+                        "no active session with pty_index={pty_index}"
+                    ));
+                }
                 let table = sessions.lock().expect("session table mutex poisoned");
                 match table.get(&pty_index) {
                     Some(s) if peer.scope_allows(s) => TapResponse::Snapshot {
@@ -1394,6 +1521,15 @@ mod linux {
         pty_index: i32,
         bytes: &[u8],
     ) -> TapResponse {
+        // Self-inject is a feedback loop: the peer would inject into
+        // its own terminal, which would echo through the daemon back
+        // to the peer ad infinitum. Refuse early with the same wording
+        // as a non-existent pty.
+        if Some(pty_index) == peer.controlling_pty {
+            return TapResponse::Error(format!(
+                "no active session with pty_index={pty_index}"
+            ));
+        }
         // Cap to a sane upper bound. 64 KiB is well above any realistic
         // single keystroke or pasted line and far below the kernel's
         // pty input buffer cap. Anything larger is almost certainly a
