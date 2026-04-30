@@ -120,3 +120,4 @@ Not yet — see Phase 1.2.
 | 1.8h | `hop &lt;host&gt; tap` verb in hop-cli + extracted `hop-tap-protocol` crate | done |
 | 1.8i | Per-peer scope check (creator sees all; others gated by `opener_username`) | done |
 | 1.8j | `/proc` walk to seed pre-existing sessions with their session leader's identity | done |
+| 1.8k | Alt-screen-aware replay (vim/htop/less subscribers land in the right mode) | done |

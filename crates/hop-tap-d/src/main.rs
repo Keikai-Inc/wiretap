@@ -80,7 +80,7 @@ mod linux {
         index::{Column, Line, Point},
         term::{
             cell::{Cell, Flags},
-            Config, Term,
+            Config, Term, TermMode,
         },
         vte::ansi::{Color, Processor},
     };
@@ -333,7 +333,26 @@ mod linux {
     /// char itself.
     fn render_grid_to_bytes(state: &SessionState) -> Vec<u8> {
         let mut out: Vec<u8> = Vec::with_capacity(state.dims.cols * state.dims.lines * 8);
+        // Always start by resetting the receiver's primary screen.
         out.extend_from_slice(b"\x1b[2J\x1b[H\x1b[0m");
+
+        // If the captured session is currently using the alternate
+        // screen (vim, less, htop, mc, fzf — anything that does
+        // full-screen "take over the whole window"), put the
+        // receiver into the alt screen too before drawing. Otherwise
+        // the receiver would render vim's content onto its primary
+        // screen, and the eventual `\x1b[?1049l` from the live
+        // stream would leave them in a confused state with vim
+        // leftovers visible.
+        //
+        // `\x1b[?1049h` is xterm's combined "save cursor + enter
+        // alt screen + clear alt screen". The matching exit will
+        // arrive in the live byte stream when the captured session
+        // exits alt screen normally.
+        let in_alt = state.term.mode().contains(TermMode::ALT_SCREEN);
+        if in_alt {
+            out.extend_from_slice(b"\x1b[?1049h\x1b[2J\x1b[H");
+        }
 
         let grid = state.term.grid();
         let dims = state.dims;
