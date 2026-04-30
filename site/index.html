@@ -198,21 +198,21 @@
     <div class="container">
       <div class="section-header">
         <h2>What a takedown looks like</h2>
-        <p>Left: the admin. Right: a compromised account. The admin spots it, watches, quarantines, asks them what they're doing, and ends the session — all from the picker.</p>
+        <p>Left: alice, an operator who's been paged about a privilege escalation. She sudoes to root and runs <code>tap</code>. Right: <code>ops</code>, a service account that's somehow euid 0 — exactly what tap's picker is built to surface. She watches, quarantines, asks what they're doing, and ends the session.</p>
       </div>
 
       <div class="cast-pair">
         <figure>
           <figcaption>
             <span class="role-dot role-admin"></span>
-            <span class="role-label" id="label-admin">Admin — alice@web-prod</span>
+            <span class="role-label" id="label-admin">Admin — alice@web-prod (sudo'd to root)</span>
           </figcaption>
           <div id="cast-admin" class="cast-host"></div>
         </figure>
         <figure>
           <figcaption>
             <span class="role-dot role-suspect"></span>
-            <span class="role-label" id="label-hacker">Suspect — root@web-prod (compromised)</span>
+            <span class="role-label" id="label-hacker">Suspect — ops@web-prod → euid 0 (privesc)</span>
           </figcaption>
           <div id="cast-hacker" class="cast-host"></div>
         </figure>
@@ -389,18 +389,19 @@
       var hackerLabel = document.getElementById('label-hacker');
 
       var ADMIN_STATES = [
-        { t: 0.0,  text: 'Admin — alice@web-prod',                                                         klass: '' },
-        { t: 4.5,  text: 'Admin — tap',                                                                    klass: '' },
-        { t: 10.5, text: 'Admin — tap pty=4 root(0) bash — Ctrl-T menu  Ctrl-G msg',                       klass: '' },
-        { t: 19.0, text: 'Admin — tap',                                                                    klass: '' },
-        { t: 22.0, text: 'Admin — 🎭 tap pty=4 root(0) bash (quarantined) — Ctrl-T menu  Ctrl-G msg',     klass: 'is-quarantine' },
-        { t: 40.5, text: 'Admin — tap',                                                                    klass: '' },
-        { t: 41.5, text: 'Admin — alice@web-prod',                                                         klass: '' },
+        { t: 0.0,  text: "Admin — alice@web-prod",                                                          klass: '' },
+        { t: 3.0,  text: "Admin — alice@web-prod (sudo'd to root)",                                         klass: '' },
+        { t: 4.5,  text: 'Admin — tap',                                                                     klass: '' },
+        { t: 10.5, text: 'Admin — tap pty=4 ops→euid0 bash — Ctrl-T menu  Ctrl-G msg',                      klass: '' },
+        { t: 19.0, text: 'Admin — tap',                                                                     klass: '' },
+        { t: 22.0, text: 'Admin — 🎭 tap pty=4 ops→euid0 bash (quarantined) — Ctrl-T menu  Ctrl-G msg',    klass: 'is-quarantine' },
+        { t: 40.5, text: 'Admin — tap',                                                                     klass: '' },
+        { t: 41.5, text: "Admin — alice@web-prod (sudo'd to root)",                                         klass: '' },
       ];
       var HACKER_STATES = [
-        { t: 0.0,  text: 'Suspect — root@web-prod (compromised)',                klass: '' },
-        { t: 21.5, text: 'Suspect — root@web-prod  (now talking to honeypot)',  klass: 'is-quarantine' },
-        { t: 40.0, text: 'Suspect — [ session ended ]',                          klass: 'is-ended' },
+        { t: 0.0,  text: 'Suspect — ops@web-prod → euid 0 (privesc)',                klass: '' },
+        { t: 21.5, text: 'Suspect — ops@web-prod (now talking to honeypot)',         klass: 'is-quarantine' },
+        { t: 40.0, text: 'Suspect — [ session ended ]',                              klass: 'is-ended' },
       ];
 
       function applyState(label, states, t) {

@@ -67,11 +67,22 @@ CYAN = fg(36)
 GREY = fg(90)
 
 
-def admin_prompt():
+def alice_prompt():
+    """alice's pre-sudo prompt — only used briefly at t=0 before she sudoes."""
     return f"{BOLD}{GREEN}alice@web-prod{RESET}:{BOLD}{BLUE}~{RESET}$ "
 
 
+def admin_prompt():
+    """alice has sudo'd to root — same visual as the suspect's prompt.
+    Disambiguation between the two panes happens via the title bar above
+    each player, not the prompt string."""
+    return f"{BOLD}{RED}root@web-prod{RESET}:{BOLD}{BLUE}~{RESET}# "
+
+
 def hacker_prompt():
+    """ops escalated to euid 0 — bash relabels itself as root@. The picker
+    still shows ops as the loginuid, which is how the operator spots the
+    privesc."""
     return f"{BOLD}{RED}root@web-prod{RESET}:{BOLD}{BLUE}~{RESET}# "
 
 
@@ -88,11 +99,23 @@ def hacker_prompt():
 #   t=50..60: admin detaches, kills, picker refreshes
 #   t=60..65: clean state on both sides
 
-# Initial prompts
+# Initial prompts. Admin starts as alice (regular user); she sudoes to
+# root before running tap, since only root can attach to other root ptys.
 ADMIN = "admin"
 HACKER = "hacker"
-at(0.0, ADMIN,  "\x1b[2J\x1b[H" + admin_prompt())
+at(0.0, ADMIN,  "\x1b[2J\x1b[H" + alice_prompt())
 at(0.0, HACKER, "\x1b[2J\x1b[H" + hacker_prompt())
+
+# ── Admin: sudo -i to become root ──
+# In real life alice was paged about an unknown root session on web-prod;
+# she ssh'd in and is sudo'ing now to investigate.
+t_sudo = 1.5
+t_sudo = type_str(t_sudo, ADMIN, "sudo -i", cps=14)
+at(t_sudo + 0.20, ADMIN, "\r\n")
+at(t_sudo + 0.40, ADMIN, "[sudo] password for alice: ")
+at(t_sudo + 1.20, ADMIN, "\r\n")
+at(t_sudo + 1.30, ADMIN, "Last login: Mon Apr 30 14:03:11 2026 from 10.0.0.42\r\n")
+at(t_sudo + 1.40, ADMIN, admin_prompt())
 
 # ── Hacker: wget recon tool ──
 t = 1.0
@@ -127,22 +150,27 @@ PICKER_FOOTER = (
 
 
 def picker_body(highlight_root=True, quarantined=False):
-    """Render a snapshot of the picker body (rows minus header/footer)."""
+    """Render a snapshot of the picker body (rows minus header/footer).
+
+    Each row shows `loginuser(euid)`. alice(0) is alice sudo'd to root —
+    expected for an operator. ops(0) is suspicious: ops is a service
+    account that should never have euid 0. The mismatch (in red) is the
+    visual tell of a privesc."""
     rows = []
-    # alice's row
+    # alice's row — operator's own session (running tap right now).
     rows.append(
-        f"{BOLD}│{RESET}    3   alice(1000)        bash        82s      0ms                         {BOLD}│{RESET}"
+        f"{BOLD}│{RESET}    3   alice(0)           tap         82s      0ms                         {BOLD}│{RESET}"
     )
-    # root's row — highlighted (reverse video) when admin has cursor on it
+    # ops's row — login=ops but euid=0. Username in red flags the privesc.
     label = "🎭  4" if quarantined else "    4"
-    line = f"{label}   {RED}root(0){RESET}             bash        45s      0ms                       "
+    line = f"{label}   {RED}ops(0){RESET}              bash        45s      0ms                       "
     if highlight_root:
         line = REV + line + RESET
     rows.append(f"{BOLD}│{RESET} {line}{BOLD}│{RESET}")
     # spacer
     rows.append(f"{BOLD}│{RESET}                                                                              {BOLD}│{RESET}")
     # preview header
-    rows.append(f"{BOLD}│{RESET}  {DIM}preview of pty 4 (root) ── live{RESET}                                            {BOLD}│{RESET}")
+    rows.append(f"{BOLD}│{RESET}  {DIM}preview of pty 4 (ops → euid 0) ── live{RESET}                                    {BOLD}│{RESET}")
     return "\r\n".join(rows) + "\r\n"
 
 
@@ -403,15 +431,15 @@ t_picker_after = t_kill + 0.6
 at(t_picker_after, ADMIN, "\x1b[2J\x1b[H")
 at(t_picker_after + 0.05, ADMIN, PICKER_HEADER)
 at(t_picker_after + 0.10, ADMIN,
-   f"{BOLD}│{RESET} {REV}    3   alice(1000)        bash        87s      0ms                         {RESET}{BOLD}│{RESET}\r\n")
+   f"{BOLD}│{RESET} {REV}    3   alice(0)           tap         87s      0ms                         {RESET}{BOLD}│{RESET}\r\n")
 at(t_picker_after + 0.15, ADMIN,
    f"{BOLD}│{RESET}                                                                              {BOLD}│{RESET}\r\n")
 at(t_picker_after + 0.20, ADMIN,
-   f"{BOLD}│{RESET}  {DIM}preview of pty 3 (alice) ── live{RESET}                                          {BOLD}│{RESET}\r\n")
+   f"{BOLD}│{RESET}  {DIM}preview of pty 3 (alice → euid 0) ── live{RESET}                                  {BOLD}│{RESET}\r\n")
 at(t_picker_after + 0.25, ADMIN,
    f"{BOLD}│{RESET}                                                                              {BOLD}│{RESET}\r\n")
 at(t_picker_after + 0.30, ADMIN,
-   f"{BOLD}│{RESET}  {GREEN}alice@web-prod{RESET}:~$ tap                                                       {BOLD}│{RESET}\r\n")
+   f"{BOLD}│{RESET}  {RED}root@web-prod{RESET}:~# tap                                                        {BOLD}│{RESET}\r\n")
 at(t_picker_after + 0.35, ADMIN,
    f"{BOLD}│{RESET}                                                                              {BOLD}│{RESET}\r\n")
 at(t_picker_after + 0.40, ADMIN,
