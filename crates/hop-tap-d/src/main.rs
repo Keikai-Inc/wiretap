@@ -2271,6 +2271,36 @@ mod linux {
             )
         };
 
+        // Close our cached master fd. The daemon clones a writable
+        // copy of the pty's master via pidfd_getfd the first time
+        // someone injects input. That copy is a real reference on
+        // the kernel's tty struct — as long as we hold it, the pty
+        // can't be freed even after every other process closes its
+        // ends. The result: kill the shell, sshd closes its master,
+        // but our copy keeps the pty alive forever, the eBPF
+        // pty_close hook never fires, the session-end path never
+        // runs, and the entry hangs around in `tap list` until
+        // the daemon restarts.
+        // Closing it before signaling the shell breaks the cycle.
+        // SessionState's Drop normally closes it too, but Drop
+        // doesn't fire until the entry is removed from the table —
+        // which is the very thing this is trying to enable.
+        {
+            let mut table = sessions.lock().expect("session table mutex poisoned");
+            if let Some(state) = table.get_mut(&pty_index) {
+                if state.master_fd >= 0 {
+                    // SAFETY: we own this fd and we're about to
+                    // mark it as -1 so SessionState's Drop won't
+                    // double-close.
+                    unsafe {
+                        libc::close(state.master_fd);
+                    }
+                    state.master_fd = -1;
+                    state.master_holder_pid = 0;
+                }
+            }
+        }
+
         // If the session is quarantined, the impostor is holding
         // /dev/pts/N open as its stdin/stdout/stderr. Killing only
         // the original shell leaves the pty alive in the kernel
