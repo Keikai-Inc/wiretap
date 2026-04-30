@@ -110,38 +110,26 @@ fn main() -> anyhow::Result<()> {
             spec.uid = uid;
             spec.gid = gid;
 
-            // Snapshot the inherited slave fd's window size *before*
-            // the session-leader transition. Some kernel versions
-            // reset winsize to 0x0 when TIOCSCTTY changes the tty's
-            // session, which makes bash come up thinking it has a
-            // 0x0 terminal — readline misbehaves, output looks
-            // half-rendered, the user sees a broken shell.
-            // SAFETY: ioctl(TIOCGWINSZ) writes a winsize through the
-            // pointer; layout matches what the kernel expects.
+            // Snapshot the inherited slave fd's window size before
+            // the session-leader transition, in case TIOCSCTTY
+            // resets it on this kernel.
             let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
             let _ = unsafe {
                 libc::ioctl(0, libc::TIOCGWINSZ, &mut ws as *mut libc::winsize)
             };
 
-            // 1. setsid: become our own session leader so TIOCSCTTY
-            //    is allowed to bind a controlling tty to us.
+            // setsid: own session so TIOCSCTTY can attach. Then
+            // TIOCSCTTY with arg=1 = "steal" mode: take the captured
+            // tty away from the previous session (the SIGSTOPped
+            // real shell). On this kernel/setup the original shell
+            // survives the SIGHUP that the kernel sends on session
+            // clear (verified empirically), so reversibility holds.
             nix::unistd::setsid().map_err(|e| anyhow::anyhow!("setsid: {e}"))?;
-            // 2. TIOCSCTTY with arg=1 = "steal" mode: takes the tty
-            //    away from the previous controlling session (the
-            //    real shell, which the daemon SIGSTOPped before
-            //    spawning us). Requires CAP_SYS_ADMIN.
-            //    SAFETY: ioctl on STDIN with TIOCSCTTY's int arg.
             let r = unsafe { libc::ioctl(0, libc::TIOCSCTTY, 1) };
             if r != 0 {
                 let err = std::io::Error::last_os_error();
                 anyhow::bail!("TIOCSCTTY-steal on stdin: {err}");
             }
-
-            // Re-assert the saved winsize. If we got a non-zero
-            // value out of TIOCGWINSZ above, push it back so bash
-            // sees the real terminal dimensions when it starts.
-            // SAFETY: ioctl(TIOCSWINSZ) reads a winsize from the
-            // pointer.
             if ws.ws_row != 0 && ws.ws_col != 0 {
                 let _ = unsafe {
                     libc::ioctl(0, libc::TIOCSWINSZ, &ws as *const libc::winsize)
@@ -150,11 +138,8 @@ fn main() -> anyhow::Result<()> {
 
             // Reset the line discipline to a sane interactive
             // default before exec'ing bash. The previous shell may
-            // have left it in raw mode (readline mid-edit), or the
-            // kernel may have munged termios as part of the session
-            // transition. Bash will tcsetattr its own modes once
-            // readline starts up, but giving it a known starting
-            // point avoids a brief window of weirdness.
+            // have left it in raw mode mid-readline; give bash a
+            // known starting point.
             let mut tio: libc::termios = unsafe { std::mem::zeroed() };
             if unsafe { libc::tcgetattr(0, &mut tio as *mut _) } == 0 {
                 tio.c_lflag |=

@@ -1556,19 +1556,17 @@ mod linux {
     /// Lock semantics: quarantine implies lock. We SIGSTOP the
     /// foreground pgrp (same primitive as SetLock), open the
     /// captured slave fd, and spawn `tap-honeypot pty-attach` with
-    /// that fd as stdin/stdout/stderr. The impostor's own startup
-    /// does setsid + TIOCSCTTY-steal so it becomes the controlling
-    /// process of the captured tty — the user is now talking to
-    /// bash inside a namespace sandbox.
+    /// that fd as stdin/stdout/stderr. The impostor does setsid +
+    /// TIOCSCTTY-steal so it becomes the controlling process of
+    /// the captured tty.
     ///
     /// Release: kill the impostor, SIGCONT the original pgrp. The
-    /// real shell wakes up but no longer has the tty as its
-    /// controlling tty (TIOCSCTTY-steal is one-way without a
-    /// ptrace dance). Reads/writes still work; job-control features
-    /// (Ctrl-C / Ctrl-Z / `fg` / `bg`) are degraded — bash will
-    /// print "no job control in this shell" on the user's next
-    /// keystroke. Acceptable for the "decided they're legitimate,
-    /// hand them back" path; document for users.
+    /// real shell wakes up. Note: TIOCSCTTY-steal cleared its
+    /// controlling-tty pointer (tty_nr=0 in /proc/<pid>/stat), so
+    /// `foreground_pgrp_via_tty` won't find it on the next
+    /// quarantine attempt — `pgrp_for_session` falls back to
+    /// reading the shell's pgrp directly from
+    /// /proc/<opener_pid>/stat field 5.
     ///
     /// Authorization: opener-or-creator (same as Inject + Lock).
     fn handle_set_quarantine(
@@ -1618,7 +1616,7 @@ mod linux {
         // Snapshot the relevant state under the lock, then drop it
         // so we can do the slow fork+exec without blocking other
         // handlers. We re-acquire to write the result back.
-        let (already_quarantined, opener_uid, opener_username) = {
+        let (already_quarantined, opener_uid, opener_pid, opener_username) = {
             let table = sessions.lock().expect("session table mutex poisoned");
             let Some(state) = table.get(&pty_index) else {
                 return TapResponse::Error(format!(
@@ -1628,6 +1626,7 @@ mod linux {
             (
                 state.quarantined,
                 state.opener_uid,
+                state.opener_pid,
                 lookup_username(state.opener_uid)
                     .unwrap_or_else(|| format!("uid{}", state.opener_uid)),
             )
@@ -1646,8 +1645,12 @@ mod linux {
             };
         }
 
-        // SIGSTOP the foreground pgrp — same primitive Lock uses.
-        let pgrp = match foreground_pgrp(pty_index) {
+        // SIGSTOP the right pgrp. Use pgrp_for_session so we cope
+        // with the post-release case where the original shell has
+        // lost its controlling-tty pointer (tty_nr=0 in /proc) but
+        // is still alive; the fallback reads its pgrp directly
+        // from /proc/<opener_pid>/stat.
+        let pgrp = match pgrp_for_session(pty_index, opener_pid) {
             Ok(p) if p > 0 => p,
             Ok(p) => {
                 return TapResponse::Error(format!(
@@ -1656,7 +1659,7 @@ mod linux {
             }
             Err(e) => {
                 return TapResponse::Error(format!(
-                    "foreground_pgrp for pty_index={pty_index}: {e}"
+                    "pgrp_for_session for pty_index={pty_index}: {e}"
                 ));
             }
         };
@@ -1875,8 +1878,10 @@ mod linux {
             ));
         }
         // Scope + write-permission check; bail before touching kernel
-        // state if the peer can't act on this session.
-        {
+        // state if the peer can't act on this session. Also grab the
+        // opener_pid so pgrp_for_session can fall back to it if the
+        // tty-based lookup fails.
+        let opener_pid = {
             let table = sessions.lock().expect("session table mutex poisoned");
             let Some(state) = table.get(&pty_index) else {
                 return TapResponse::Error(format!(
@@ -1894,13 +1899,14 @@ mod linux {
                      may lock pty_index={pty_index}"
                 ));
             }
-        }
+            state.opener_pid
+        };
 
-        let pgrp = match foreground_pgrp(pty_index) {
+        let pgrp = match pgrp_for_session(pty_index, opener_pid) {
             Ok(p) => p,
             Err(e) => {
                 return TapResponse::Error(format!(
-                    "TIOCGPGRP for pty_index={pty_index}: {e}"
+                    "pgrp_for_session for pty_index={pty_index}: {e}"
                 ));
             }
         };
@@ -1946,6 +1952,61 @@ mod linux {
         }
     }
 
+    /// Pick a pgrp to signal for `pty_index`, with a fallback for
+    /// the post-quarantine-release case.
+    ///
+    /// Strategy 1: walk /proc for any process whose `tty_nr` matches
+    /// `pty_index`, return its `tpgid`. Standard "foreground pgrp"
+    /// semantics — picks up vim, less, etc. when they're in front.
+    ///
+    /// Strategy 2 (fallback): read `pgrp` directly from
+    /// /proc/<opener_pid>/stat field 5. Necessary after a
+    /// quarantine release — the impostor's TIOCSCTTY-steal clears
+    /// the original shell's controlling-tty pointer, so its
+    /// tty_nr becomes 0 and Strategy 1 finds nothing even though
+    /// the shell is alive and the user is happily interacting with
+    /// it. The shell's process group is unaffected by the
+    /// controlling-tty change.
+    fn pgrp_for_session(
+        pty_index: i32,
+        opener_pid: u32,
+    ) -> std::io::Result<libc::pid_t> {
+        if let Ok(pgrp) = foreground_pgrp(pty_index) {
+            if pgrp > 0 {
+                return Ok(pgrp);
+            }
+        }
+        pgrp_via_opener(opener_pid)
+    }
+
+    /// Read field 5 (`pgrp`) of /proc/<pid>/stat. Used by
+    /// `pgrp_for_session` as a fallback when the tty-based lookup
+    /// can't find a controlling process for the captured pty.
+    fn pgrp_via_opener(pid: u32) -> std::io::Result<libc::pid_t> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
+        let close = stat.rfind(')').ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("/proc/{pid}/stat: no closing comm paren"),
+            )
+        })?;
+        let fields: Vec<&str> = stat
+            .get(close + 1..)
+            .map(|s| s.split_whitespace().collect())
+            .unwrap_or_default();
+        // After comm: [0]=state, [1]=ppid, [2]=pgrp, ...
+        fields
+            .get(2)
+            .and_then(|s| s.parse::<libc::pid_t>().ok())
+            .filter(|p| *p > 0)
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("/proc/{pid}/stat: no usable pgrp field"),
+                )
+            })
+    }
+
     /// Read the foreground process group of `pty_index` from /proc.
     ///
     /// We can't use `ioctl(fd, TIOCGPGRP)` here: that ioctl requires
@@ -1959,6 +2020,11 @@ mod linux {
     /// it's attached to — which is what we want. Multiple processes
     /// in the same session share a controlling tty so they all
     /// report the same tpgid; finding any one is enough.
+    ///
+    /// Returns NotFound if no process has the captured pty as its
+    /// controlling tty — common after a quarantine release; callers
+    /// in that situation should use `pgrp_for_session` instead,
+    /// which falls back to the opener's own pgrp.
     fn foreground_pgrp(pty_index: i32) -> std::io::Result<libc::pid_t> {
         let proc_dir = std::fs::read_dir("/proc")?;
         for entry in proc_dir.flatten() {
@@ -2210,7 +2276,7 @@ mod linux {
             if let Err(e) = flush_pty_input(pty_index) {
                 warn!(pty_index, error = %e, "TCFLSH on kill-while-locked failed (continuing)");
             }
-            match foreground_pgrp(pty_index) {
+            match pgrp_for_session(pty_index, target_pid) {
                 Ok(pgrp) if pgrp > 0 => {
                     // SAFETY: kill(2) with a real pgrp + valid signal.
                     let r = unsafe {
@@ -2228,7 +2294,7 @@ mod linux {
                     warn!(pty_index, "no foreground pgrp to SIGCONT before kill");
                 }
                 Err(e) => {
-                    warn!(pty_index, error = %e, "foreground_pgrp failed before kill (continuing)");
+                    warn!(pty_index, error = %e, "pgrp_for_session failed before kill (continuing)");
                 }
             }
             // Mirror the unlock path: clear the in-memory lock flag.
