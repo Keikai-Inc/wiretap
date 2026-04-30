@@ -109,44 +109,39 @@ fi
 [[ -n "${VERSION}" ]] || die "Could not determine version"
 info "Installing hop-tap v${VERSION}"
 
-# --- Make sure hop is installed and running ---------------------------------
+# --- Detect hop integration ---------------------------------------------------
 #
-# hop-tap is a hop extension. Without hop running there's nothing for the
-# manifest to register against.
+# hop-tap can run two ways:
 #
-# Two cases we handle:
-#   1. hop binary missing entirely — delegate to hop's official daemon
-#      installer (the only hop-related logic this script touches; we
-#      deliberately do NOT duplicate any of it).
-#   2. hop binary present but daemon not running — bail with a clear
-#      message. There are too many ways a user can run hop (systemd,
-#      tmux, user-local --dir install, custom service name) for us to
-#      reliably "fix" this without potentially clobbering their setup.
-#      They know their config; just tell them what we need.
+#   1. Standalone — hop-tap-d + hop-tap-probe locally on the host, no hop.
+#      List / snapshot / watch sessions through `hop-tap-probe`. No remote
+#      access, no peer auth — the only authorization is "you can read
+#      /run/hop-tap/bootstrap" (root-owned, mode 0600).
+#
+#   2. hop-integrated — same daemon, plus a manifest registered with the
+#      hop daemon so peers on the hop network can run `hop <host> tap ...`.
+#      Adds remote QUIC-authenticated access on top of #1.
+#
+# We always install the daemon. We register the manifest only when hop is
+# present and running. We never auto-install hop, never auto-start hop —
+# that's the user's call (run hop's own installer if they want it).
 
-ensure_hop_running() {
-  if ! command -v hop >/dev/null 2>&1; then
-    info "hop binary not found — installing hop daemon first..."
-    if command -v curl >/dev/null 2>&1; then
-      bash <(curl -fsSL "${HOP_BASE_URL}/install-daemon.sh")
-    else
-      bash <(wget -qO- "${HOP_BASE_URL}/install-daemon.sh")
-    fi
-    return
+HOP_INTEGRATION="standalone"   # set to "registered" if we drop the manifest
+if command -v hop >/dev/null 2>&1; then
+  if systemctl is-active --quiet hop 2>/dev/null; then
+    HOP_INTEGRATION="registered"
+    info "hop daemon detected — will register hop-tap as an extension"
+  else
+    warn "hop is installed but the daemon isn't running."
+    warn "Installing hop-tap in standalone mode. Start hop and re-run this"
+    warn "installer to register hop-tap with the hop network."
   fi
-
-  if ! systemctl is-active --quiet hop 2>/dev/null; then
-    die "hop is installed but the daemon isn't running.
-Start it however you normally do (e.g. \`sudo systemctl start hop\` or
-\`hop host\`) and re-run this installer. We deliberately don't try to
-start hop ourselves to avoid clobbering manual / user-local /
-non-systemd setups."
-  fi
-
-  info "hop daemon already running — registering hop-tap as an extension"
-}
-
-ensure_hop_running
+else
+  info "hop is not installed — installing hop-tap in standalone mode."
+  info "Use hop-tap-probe directly on this host. To enable remote access,"
+  info "install hop (curl -fsSL ${HOP_BASE_URL}/install-daemon.sh | bash)"
+  info "and re-run this installer."
+fi
 
 # --- Download daemon + probe binaries + checksums ---------------------------
 
@@ -193,16 +188,20 @@ info "Installing hop-tap-d and hop-tap-probe to /usr/local/bin (sudo required)..
 sudo mv "${TMPDIR_HOPTAP}/hop-tap-d" /usr/local/bin/hop-tap-d
 sudo mv "${TMPDIR_HOPTAP}/hop-tap-probe" /usr/local/bin/hop-tap-probe
 
-# --- Drop the extension manifest --------------------------------------------
+# --- Drop the extension manifest (only if hop is around) --------------------
 #
-# hop-tap-d is going to run as root (eBPF) so expected_uid=0. The hop
-# daemon refuses to trust the bootstrap file unless its file owner
-# matches this UID, so the value here has to line up with the User= in
-# hop-tap.service.
+# hop-tap-d runs as root (eBPF) so expected_uid=0 lines up with the
+# User= in hop-tap.service. The hop daemon refuses to trust the bootstrap
+# file unless its file owner matches this UID.
+#
+# In standalone mode we skip this — there's no hop to register against,
+# and dropping a stale manifest in /etc/hop/extensions/ would mislead
+# any future hop install.
 
-info "Installing extension manifest at /etc/hop/extensions/tap-terminal.toml..."
-sudo mkdir -p /etc/hop/extensions
-sudo tee /etc/hop/extensions/tap-terminal.toml >/dev/null <<'EOF'
+if [[ "${HOP_INTEGRATION}" == "registered" ]]; then
+  info "Installing extension manifest at /etc/hop/extensions/tap-terminal.toml..."
+  sudo mkdir -p /etc/hop/extensions
+  sudo tee /etc/hop/extensions/tap-terminal.toml >/dev/null <<'EOF'
 # hop-tap extension manifest, installed by install.sh.
 ext_id         = "tap.terminal"
 description    = "Terminal session capture via eBPF"
@@ -211,8 +210,9 @@ expected_uid   = 0
 version        = "0.1.0"
 required_role  = "creator"
 EOF
-sudo chown root:hop /etc/hop/extensions/tap-terminal.toml 2>/dev/null || true
-sudo chmod 0640 /etc/hop/extensions/tap-terminal.toml
+  sudo chown root:hop /etc/hop/extensions/tap-terminal.toml 2>/dev/null || true
+  sudo chmod 0640 /etc/hop/extensions/tap-terminal.toml
+fi
 
 # --- Install systemd unit ----------------------------------------------------
 
@@ -241,9 +241,9 @@ if [[ ! -f /run/hop-tap/bootstrap ]]; then
   warn "/run/hop-tap/bootstrap didn't appear — check 'sudo journalctl -u hop-tap'"
 fi
 
-# --- Restart hop so it picks up the manifest --------------------------------
+# --- Restart hop so it picks up the manifest (only in registered mode) ------
 
-if [[ "${SKIP_RESTART}" == "false" ]]; then
+if [[ "${HOP_INTEGRATION}" == "registered" && "${SKIP_RESTART}" == "false" ]]; then
   info "Restarting hop daemon to pick up the new manifest..."
   if sudo systemctl restart hop 2>/dev/null; then
     info "hop restarted."
@@ -254,13 +254,25 @@ fi
 
 # --- Done --------------------------------------------------------------------
 
-printf "\n${BOLD}hop-tap v${VERSION}${RESET} installed.\n\n"
-printf "Try it from a peer:\n"
-printf "  ${BOLD}hop <host> ext list${RESET}              # tap.terminal listed as available\n"
-printf "  ${BOLD}hop <host> tap list${RESET}              # active sessions\n"
-printf "  ${BOLD}hop <host> tap snapshot <pty>${RESET}    # current screen\n"
-printf "  ${BOLD}hop <host> tap watch <pty>${RESET}       # live byte stream\n\n"
-printf "Or locally on this host (no hop network needed):\n"
+printf "\n${BOLD}hop-tap v${VERSION}${RESET} installed (mode: ${HOP_INTEGRATION}).\n\n"
+
+if [[ "${HOP_INTEGRATION}" == "registered" ]]; then
+  printf "Remote access (from any hop peer):\n"
+  printf "  ${BOLD}hop <host> ext list${RESET}              # tap.terminal listed as available\n"
+  printf "  ${BOLD}hop <host> tap list${RESET}              # active sessions\n"
+  printf "  ${BOLD}hop <host> tap snapshot <pty>${RESET}    # current screen\n"
+  printf "  ${BOLD}hop <host> tap watch <pty>${RESET}       # live byte stream\n\n"
+fi
+
+printf "Local access (no hop required):\n"
 printf "  ${BOLD}hop-tap-probe --bootstrap /run/hop-tap/bootstrap repl${RESET}\n\n"
+
 printf "Service control: ${BOLD}sudo systemctl status hop-tap${RESET}\n"
 printf "Logs:            ${BOLD}sudo journalctl -u hop-tap -f${RESET}\n"
+
+if [[ "${HOP_INTEGRATION}" == "standalone" ]]; then
+  printf "\n${YELLOW}Standalone mode:${RESET} hop is not installed or not running on this host.\n"
+  printf "To enable ${BOLD}hop <host> tap ...${RESET} from remote peers:\n"
+  printf "  curl -fsSL ${HOP_BASE_URL}/install-daemon.sh | bash\n"
+  printf "  curl -fsSL ${BASE_URL}/install.sh | bash    # re-run, will register\n"
+fi

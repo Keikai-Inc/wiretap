@@ -52,36 +52,79 @@ hop-tap/
 
 ## Install
 
-One-liner for any Linux host (mirrors hop's installer style):
+One-liner for any Linux host:
 
 ```bash
 curl -fsSL https://hop-tap.keik.ai/install.sh | bash
 ```
 
-What it does:
+The installer auto-detects whether hop is on the host and picks one
+of two modes — both fully working:
 
-- Refuses to run on non-Linux (eBPF-only); detects x86_64 / arm64.
-- If `hop` isn't installed, or its daemon isn't running, **first**
-  delegates to `https://hop.keik.ai/install-daemon.sh` — you get a
-  working hop daemon as a dependency, no separate step.
-- Downloads `hop-tap-d` and `hop-tap-probe` into `/usr/local/bin`,
-  drops a manifest at `/etc/hop/extensions/tap-terminal.toml`,
-  installs `hop-tap.service` as a systemd unit, enables and starts
-  it, then restarts hop so it picks up the new manifest.
+### Standalone mode (hop not installed)
 
-Verify:
+The most common case for first-time evaluation. The installer puts
+down `hop-tap-d` + `hop-tap-probe` in `/usr/local/bin`, installs the
+systemd unit, and starts the daemon. There's no manifest, no peer
+auth — just local audit via the bundled probe:
+
+```bash
+hop-tap-probe --bootstrap /run/hop-tap/bootstrap repl
+> list
+> snapshot 0
+> watch 0
+```
+
+The bootstrap file is root-owned mode 0600, so "you can run the
+probe" reduces to "you have root or the daemon's UID." That's the
+authorization model in standalone mode — appropriate for local
+operator audit, scripted recordings on a dedicated audit host, or
+just trying hop-tap out before bringing hop into the picture.
+
+### hop-integrated mode (hop installed and running)
+
+If `hop` is installed and `systemctl is-active hop` returns true at
+install time, the installer also drops a manifest at
+`/etc/hop/extensions/tap-terminal.toml` and restarts hop so it
+picks up the new extension. After that, peers on the hop network
+get remote access:
+
+```bash
+hop <host> ext list                       # tap.terminal listed as available
+hop <host> tap list                       # active sessions, with opener vs writer
+hop <host> tap snapshot 0                 # 24x80 grid for pty=0
+hop <host> tap watch 0                    # live byte stream
+```
+
+The remote path adds peer authentication, the per-peer scope check
+(creator role sees all; other roles gated by `opener_username`), and
+hop's QUIC transport. The local probe path keeps working unchanged.
+
+### Switching between modes
+
+Modes are decided at install time, but switching is just re-running
+the installer. Install hop after the fact, then re-run
+`curl -fsSL https://hop-tap.keik.ai/install.sh | bash` — the
+detector now sees hop, drops the manifest, and restarts hop.
+
+The installer never auto-installs hop. If you want hop too:
+
+```bash
+curl -fsSL https://hop.keik.ai/install-daemon.sh | bash    # then:
+curl -fsSL https://hop-tap.keik.ai/install.sh | bash
+```
+
+### Verify
 
 ```bash
 sudo systemctl status hop-tap                    # daemon up
 sudo journalctl -u hop-tap -f                    # tailing logs
-hop <host> ext list                              # tap.terminal listed as available
+
+# In hop-integrated mode:
+hop <host> ext list                              # tap.terminal listed
 hop <host> tap list                              # active sessions
-```
 
-For local development on the same host (no hop network required),
-the bundled probe drives the daemon directly:
-
-```bash
+# In any mode:
 hop-tap-probe --bootstrap /run/hop-tap/bootstrap repl
 ```
 
