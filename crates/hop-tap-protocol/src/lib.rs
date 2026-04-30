@@ -43,6 +43,12 @@ pub enum TapRequest {
     /// daemon clones the master fd from whoever holds it (sshd, tmux,
     /// the local terminal) via `pidfd_getfd` and writes through that.
     Inject { pty_index: i32, bytes: Vec<u8> },
+    /// Send a signal to the session's opener (the shell). Default is
+    /// SIGHUP — the same signal a closed terminal emulator sends, so
+    /// well-behaved shells exit cleanly and propagate to children.
+    /// If `force` is set we send SIGKILL instead.
+    /// Same write-scope authorization as Inject.
+    Kill { pty_index: i32, force: bool },
 }
 
 /// Daemon's reply. Carried inside `ExtMessage::Response.payload`.
@@ -64,6 +70,13 @@ pub enum TapResponse {
     Injected {
         pty_index: i32,
         bytes_written: usize,
+    },
+    /// Reply to a successful [`TapRequest::Kill`]. Reports which
+    /// pid we signaled and the signal number used.
+    Killed {
+        pty_index: i32,
+        pid: u32,
+        signal: i32,
     },
     Error(String),
 }

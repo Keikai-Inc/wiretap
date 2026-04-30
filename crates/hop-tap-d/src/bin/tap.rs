@@ -246,6 +246,13 @@ fn print_response(resp: &TapResponse) {
         } => {
             println!("injected {bytes_written} byte(s) into pty={pty_index}");
         }
+        TapResponse::Killed {
+            pty_index,
+            pid,
+            signal,
+        } => {
+            println!("sent signal {signal} to pid {pid} (pty={pty_index})");
+        }
         TapResponse::Error(msg) => eprintln!("error: {msg}"),
     }
 }
@@ -540,6 +547,15 @@ async fn run_tui(socket: &std::path::Path) -> Result<Option<TuiAction>> {
     let mut preview_pty: Option<i32> = None;
     let mut preview: Option<(u16, u16, Vec<String>)> = None;
 
+    // Pending kill confirmation: when the user presses 'x', we stash
+    // the highlighted pty here and override the status line. The next
+    // keystroke either confirms ('y') and fires the Kill RPC, or
+    // cancels (anything else).
+    let mut pending_kill: Option<i32> = None;
+    // Brief flash message: shows above the status line for one render
+    // cycle to confirm or report errors. Cleared on the next refresh.
+    let mut flash: Option<String> = None;
+
     loop {
         // Periodic refresh of the session list.
         if last_refresh.elapsed() >= refresh_interval {
@@ -556,7 +572,7 @@ async fn run_tui(socket: &std::path::Path) -> Result<Option<TuiAction>> {
                         state.select(Some(0));
                     }
                     status_line = format!(
-                        "{} session(s) — ↑/↓ select  Enter=connect  q=quit",
+                        "{} session(s) — ↑/↓ select  Enter=connect  x=kill  q=quit",
                         sessions.len()
                     );
                 }
@@ -723,7 +739,18 @@ async fn run_tui(socket: &std::path::Path) -> Result<Option<TuiAction>> {
             let preview_para = Paragraph::new(Text::from(lines)).block(preview_block);
             f.render_widget(preview_para, body[1]);
 
-            let status = Paragraph::new(status_line.clone());
+            // Status line: pending-kill prompt > flash > normal hint.
+            // Each takes precedence in that order.
+            let status_text = if let Some(p) = pending_kill {
+                format!(
+                    "kill pty {p}? press y to confirm (SIGHUP), X to force (SIGKILL), any other key to cancel"
+                )
+            } else if let Some(msg) = &flash {
+                msg.clone()
+            } else {
+                status_line.clone()
+            };
+            let status = Paragraph::new(status_text);
             f.render_widget(status, outer[2]);
         })
         .context("ratatui draw")?;
@@ -739,6 +766,33 @@ async fn run_tui(socket: &std::path::Path) -> Result<Option<TuiAction>> {
                     Some(k) => k,
                     None => return Ok(None),
                 };
+                // If a kill confirmation is pending, the next keystroke
+                // either confirms or cancels — nothing else fires.
+                if let Some(target) = pending_kill {
+                    pending_kill = None;
+                    let force = matches!(key.code, KeyCode::Char('X'));
+                    let confirmed = force || matches!(key.code, KeyCode::Char('y'));
+                    if confirmed {
+                        flash = match send_kill(&mut conn, &mut next_id, target, force).await {
+                            Ok(()) => Some(format!(
+                                "sent {} to pty {}",
+                                if force { "SIGKILL" } else { "SIGHUP" },
+                                target,
+                            )),
+                            Err(e) => Some(format!("kill failed: {e}")),
+                        };
+                        // Trigger an immediate list refresh so the killed
+                        // session disappears (or stops being highlighted)
+                        // without waiting for the periodic tick.
+                        last_refresh = Instant::now() - refresh_interval;
+                    } else {
+                        flash = Some(format!("kill of pty {target} cancelled"));
+                    }
+                    continue;
+                }
+                // Any keystroke clears a stale flash so old messages
+                // don't linger.
+                flash = None;
                 match (key.code, key.modifiers) {
                     (KeyCode::Char('q'), _) | (KeyCode::Esc, _) => return Ok(None),
                     (KeyCode::Char('c'), KeyModifiers::CONTROL) => return Ok(None),
@@ -755,6 +809,13 @@ async fn run_tui(socket: &std::path::Path) -> Result<Option<TuiAction>> {
                     (KeyCode::Enter, _) => {
                         if let Some(s) = state.selected().and_then(|i| sessions.get(i)) {
                             return Ok(Some(TuiAction::Connect(s.pty_index)));
+                        }
+                    }
+                    (KeyCode::Char('x'), _) => {
+                        // Arm a kill confirmation on the highlighted
+                        // session. The next key decides.
+                        if let Some(s) = state.selected().and_then(|i| sessions.get(i)) {
+                            pending_kill = Some(s.pty_index);
                         }
                     }
                     (KeyCode::Char('r'), _) => {
@@ -817,6 +878,38 @@ async fn refresh_snapshot(
             } if rid == request_id => bail!("daemon: {msg}"),
             other => {
                 tracing::debug!(?other, "tui: ignoring unexpected message during snapshot");
+            }
+        }
+    }
+}
+
+/// Send a Kill RPC for `pty` and await the matching reply. Used by
+/// the picker's `x` key.
+async fn send_kill(
+    conn: &mut Conn,
+    next_id: &mut u64,
+    pty: i32,
+    force: bool,
+) -> Result<()> {
+    let request_id = *next_id;
+    *next_id += 1;
+    conn.send(LocalMessage::Call {
+        request_id,
+        payload: TapRequest::Kill { pty_index: pty, force },
+    })
+    .await?;
+    loop {
+        match conn.recv().await? {
+            LocalMessage::Reply {
+                request_id: rid,
+                payload: TapResponse::Killed { .. },
+            } if rid == request_id => return Ok(()),
+            LocalMessage::Reply {
+                request_id: rid,
+                payload: TapResponse::Error(msg),
+            } if rid == request_id => bail!("daemon: {msg}"),
+            other => {
+                tracing::debug!(?other, "tui: ignoring unexpected message during kill");
             }
         }
     }

@@ -1501,6 +1501,73 @@ mod linux {
             TapRequest::Inject { pty_index, bytes } => {
                 handle_inject(sessions, peer, pty_index, &bytes)
             }
+            TapRequest::Kill { pty_index, force } => {
+                handle_kill(sessions, peer, pty_index, force)
+            }
+        }
+    }
+
+    /// Send a signal to the session's opener PID. SIGHUP by default
+    /// (mirrors what a closed terminal emulator sends to its session
+    /// — well-behaved shells handle it and exit, propagating to child
+    /// processes that don't ignore SIGHUP). SIGKILL when `force`.
+    ///
+    /// Authorization: same as Inject — opener-or-creator only. Read
+    /// scope isn't enough; killing someone's shell is at least as
+    /// invasive as typing into it.
+    ///
+    /// We don't try to kill the master holder (sshd, tmux server,
+    /// terminal emulator) — that would log the user out / kill tmux
+    /// for everyone, which is rarely what's wanted. The session
+    /// leader is the right target; the kernel cleans up the tty
+    /// when the leader exits.
+    fn handle_kill(
+        sessions: &SessionTable,
+        peer: &PeerContext,
+        pty_index: i32,
+        force: bool,
+    ) -> TapResponse {
+        if Some(pty_index) == peer.controlling_pty {
+            return TapResponse::Error(format!(
+                "no active session with pty_index={pty_index}"
+            ));
+        }
+        let target_pid: u32 = {
+            let table = sessions.lock().expect("session table mutex poisoned");
+            let Some(state) = table.get(&pty_index) else {
+                return TapResponse::Error(format!(
+                    "no active session with pty_index={pty_index}"
+                ));
+            };
+            if !peer.scope_allows(state) {
+                return TapResponse::Error(format!(
+                    "no active session with pty_index={pty_index}"
+                ));
+            }
+            if !peer_can_inject(peer, state) {
+                return TapResponse::Error(format!(
+                    "forbidden: only the session opener (or a creator-role peer) \
+                     may kill pty_index={pty_index}"
+                ));
+            }
+            state.opener_pid
+        };
+
+        let signal = if force { libc::SIGKILL } else { libc::SIGHUP };
+        // SAFETY: kill(2) with a real pid and a valid signal number.
+        let r = unsafe { libc::kill(target_pid as libc::pid_t, signal) };
+        if r != 0 {
+            let err = std::io::Error::last_os_error();
+            warn!(pty_index, target_pid, signal, error = %err, "kill failed");
+            return TapResponse::Error(format!(
+                "kill(pid={target_pid}, signal={signal}) for pty_index={pty_index} failed: {err}"
+            ));
+        }
+        info!(pty_index, target_pid, signal, "kill sent");
+        TapResponse::Killed {
+            pty_index,
+            pid: target_pid,
+            signal,
         }
     }
 
