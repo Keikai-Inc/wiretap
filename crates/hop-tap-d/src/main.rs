@@ -1840,7 +1840,7 @@ mod linux {
                 "no active session with pty_index={pty_index}"
             ));
         }
-        let target_pid: u32 = {
+        let (target_pid, was_locked) = {
             let table = sessions.lock().expect("session table mutex poisoned");
             let Some(state) = table.get(&pty_index) else {
                 return TapResponse::Error(format!(
@@ -1858,8 +1858,52 @@ mod linux {
                      may kill pty_index={pty_index}"
                 ));
             }
-            state.opener_pid
+            (state.opener_pid, state.locked)
         };
+
+        // If the session is currently locked (SIGSTOPped), SIGHUP would
+        // queue but never get delivered — stopped processes only react
+        // to SIGKILL and SIGCONT. Wake the foreground pgrp first.
+        // Also flush the pty's input queue so any keystrokes the user
+        // hammered in while locked don't replay into the shell during
+        // the brief window between SIGCONT and the kill signal.
+        if was_locked {
+            if let Err(e) = flush_pty_input(pty_index) {
+                warn!(pty_index, error = %e, "TCFLSH on kill-while-locked failed (continuing)");
+            }
+            match foreground_pgrp(pty_index) {
+                Ok(pgrp) if pgrp > 0 => {
+                    // SAFETY: kill(2) with a real pgrp + valid signal.
+                    let r = unsafe {
+                        libc::kill(-pgrp as libc::pid_t, libc::SIGCONT)
+                    };
+                    if r != 0 {
+                        warn!(
+                            pty_index, pgrp,
+                            error = %std::io::Error::last_os_error(),
+                            "SIGCONT before kill failed (continuing)"
+                        );
+                    }
+                }
+                Ok(_) => {
+                    warn!(pty_index, "no foreground pgrp to SIGCONT before kill");
+                }
+                Err(e) => {
+                    warn!(pty_index, error = %e, "foreground_pgrp failed before kill (continuing)");
+                }
+            }
+            // Mirror the unlock path: clear the in-memory lock flag.
+            // Don't bother if the kill succeeds — the session ends and
+            // the entry gets removed — but on error we still want the
+            // bookkeeping to reflect the SIGCONT that did happen.
+            if let Some(state) = sessions
+                .lock()
+                .expect("session table mutex poisoned")
+                .get_mut(&pty_index)
+            {
+                state.locked = false;
+            }
+        }
 
         let signal = if force { libc::SIGKILL } else { libc::SIGHUP };
         // SAFETY: kill(2) with a real pid and a valid signal number.
@@ -1871,7 +1915,7 @@ mod linux {
                 "kill(pid={target_pid}, signal={signal}) for pty_index={pty_index} failed: {err}"
             ));
         }
-        info!(pty_index, target_pid, signal, "kill sent");
+        info!(pty_index, target_pid, signal, was_locked, "kill sent");
         TapResponse::Killed {
             pty_index,
             pid: target_pid,
