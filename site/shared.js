@@ -1,10 +1,10 @@
 (function () {
   var NAV_LINKS = [
-    { label: 'What it does',  href: '#what',     cross: 'index.html#what' },
-    { label: 'Install',       href: '#install',  cross: 'index.html#install' },
-    { label: 'Permissions',   href: '#perms',    cross: 'index.html#perms' },
-    { label: 'How it works',  href: '#how',      cross: 'index.html#how' },
-    { label: 'Remote / AI',   href: 'remote.html', cross: 'remote.html' },
+    { label: 'Commands',     href: '#commands', cross: 'index.html#commands' },
+    { label: 'Why',          href: '#why',      cross: 'index.html#why' },
+    { label: 'Install',      href: '#install',  cross: 'index.html#install' },
+    { label: 'Permissions',  href: '#perms',    cross: 'index.html#perms' },
+    { label: 'Remote / AI',  href: 'remote.html', cross: 'remote.html' },
   ];
 
   var path = location.pathname;
@@ -37,7 +37,7 @@
     footerEl.innerHTML =
       '<div class="footer-bottom">' +
         '<p class="footer-copy">&copy; 2026 <a href="https://keik.ai">Keik.ai</a> Cybersecurity. ' +
-          'tap is a Linux-only eBPF terminal-audit utility. ' +
+          'tap is the missing Linux administrator command. ' +
           'Optional integration with <a href="https://hop.keik.ai">hop</a> for remote and AI access.</p>' +
       '</div>';
   }

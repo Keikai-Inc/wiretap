@@ -3,8 +3,8 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>tap — Terminal Session Audit for Linux</title>
-  <meta name="description" content="Full visibility, auditability, and control over every TTY/PTY session on a Linux host. eBPF capture, off-screen emulator per session, kernel-authoritative permission model — local-first, no daemon dependencies.">
+  <title>tap — the missing Linux administrator command</title>
+  <meta name="description" content="See every shell on a Linux host. Attach to any of them. Type into them. The multi-user Unix administrator tool that nobody shipped.">
   <link rel="icon" type="image/x-icon" href="favicon.ico">
   <link rel="icon" type="image/png" sizes="32x32" href="favicon-32x32.png">
   <link rel="apple-touch-icon" sizes="180x180" href="apple-touch-icon.png">
@@ -13,8 +13,6 @@
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Manrope:wght@600;700;800;900&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="shared.css">
   <style>
-    .steps-4 { grid-template-columns: repeat(4, 1fr); }
-
     .perms-grid {
       display: grid;
       grid-template-columns: 1fr 1fr;
@@ -55,8 +53,19 @@
       margin-top: 0.1rem;
     }
 
+    .step-wide h3 {
+      font-family: var(--font-display);
+      font-weight: 700;
+    }
+    .step-wide h3 .pill {
+      font-family: var(--font-body);
+      font-size: 0.7em;
+      font-weight: 500;
+      opacity: 0.7;
+      margin-left: 0.5rem;
+    }
+
     @media (max-width: 768px) {
-      .steps-4 { grid-template-columns: 1fr; }
       .perms-grid { grid-template-columns: 1fr; }
     }
   </style>
@@ -67,35 +76,40 @@
 
   <!-- Hero -->
   <div class="hero">
-    <div class="badge"><span class="dot"></span> Terminal Session Audit · Linux · eBPF</div>
-    <h1>Full visibility, auditability,<br>and <span class="gradient">control</span> over every session</h1>
-    <p>tap captures every TTY/PTY session on a Linux host using eBPF. <strong>Local-first</strong> — install on a server, list and watch sessions immediately, no extra daemons, no network. Authentication is the kernel's own answer to "who's connecting": <code>SO_PEERCRED</code> on a Unix socket. <a href="remote.html" style="color: var(--color-primary); font-weight: 500; text-decoration: none;">Remote and AI access via hop &rarr;</a></p>
+    <div class="badge"><span class="dot"></span> The missing Linux administrator command</div>
+    <h1>See every shell. Attach to any.<br><span class="gradient">Type</span> into them.</h1>
+    <p>Linux ships <code>ps</code>, <code>ss</code>, <code>lsof</code>, <code>who</code> — none of them answer the obvious operator question: <em>what is each shell doing right now, and can I jump in?</em> <strong>tap</strong> does. Your sessions if you're you, every session on the host if you're root. <a href="remote.html" style="color: var(--color-primary); font-weight: 500; text-decoration: none;">Remote and AI access via hop &rarr;</a></p>
     <div class="hero-actions">
       <a href="#install" class="btn btn-primary">Install</a>
-      <a href="#what" class="btn btn-ghost">What It Does</a>
+      <a href="#commands" class="btn btn-ghost">Commands</a>
     </div>
   </div>
 
-  <!-- What it does -->
-  <section id="what">
+  <!-- Commands -->
+  <section id="commands">
     <div class="container">
       <div class="section-header">
-        <h2>Three commands, full session visibility</h2>
-        <p>From a fresh install to streaming a live session in seconds.</p>
+        <h2>What you actually do with it</h2>
+        <p>Pick a session. Attach. Type. Or just look at what every shell is doing.</p>
+      </div>
+
+      <div class="step step-wide" style="margin-bottom: 2rem;">
+        <h3>tap<span class="pill">(no args)</span></h3>
+        <p>Live-refreshing picker of every session you can see. Arrow keys to select, Enter to attach, <code>w</code> for read-only watch, <code>s</code> for a screen snapshot, <code>q</code> to leave. The tmux-style session switcher Unix has been missing for the shells the user didn't open in tmux.</p>
       </div>
 
       <div class="steps">
         <div class="step">
-          <h3>tap list</h3>
-          <p>Active sessions you can see. Sticky opener identity (who logged in) plus the current writer (sudo/setpriv visible inline). Byte counters, age, idle.</p>
-        </div>
-        <div class="step">
-          <h3>tap snapshot N</h3>
-          <p>Current screen of pty <code>N</code> as a row × column grid. Colors, attributes, alt-screen, cursor — full SGR-aware reproduction.</p>
+          <h3>tap connect N</h3>
+          <p>Attach to pty <code>N</code> like it's your own terminal. Live output to your screen, your keystrokes injected into the session. Detach with <code>Ctrl-B d</code>; <code>Ctrl-B Ctrl-B</code> sends a literal <code>Ctrl-B</code> through to an inner tmux.</p>
         </div>
         <div class="step">
           <h3>tap watch N</h3>
-          <p>Live byte stream into your terminal. Captured escape sequences flow through unchanged; what the original user sees, you see.</p>
+          <p>Read-only live byte stream. Watch a session without typing into it. Useful for shoulder-surfing a teammate's terminal during pairing or incident response.</p>
+        </div>
+        <div class="step">
+          <h3>tap list · tap snapshot N</h3>
+          <p>Enumerate active sessions with identity and byte counters, or grab a one-shot full-screen render of any session you can see.</p>
         </div>
       </div>
 
@@ -105,30 +119,87 @@
             <span class="code-dot"></span>
             <span class="code-dot"></span>
             <span class="code-dot"></span>
-            <span class="code-title">Terminal — local audit</span>
+            <span class="code-title">Terminal — pick a session, attach, type into it</span>
           </div>
           <div class="code-body">
-<span class="prompt">$</span> <span class="cmd">tap list</span>
-<span class="output">2 active session(s):</span>
-<span class="output">  pty=  3  user=alice(1000)    comm=bash      pid=  3214  out=12384b/421ev  in=83b/12ev   age=82s idle=0ms</span>
-<span class="output">  pty=  4  opener=alice(1000)  writer=root(0)  comm=sudo      out=2891b/14ev   in=4b/1ev    age=12s idle=0ms</span>
+<span class="prompt">$</span> <span class="cmd">tap</span>
+<span class="comment"># live-refreshing picker, arrow keys to select, Enter to attach</span>
+<span class="output">┌── tap — terminal session picker ────────────────────────────┐</span>
+<span class="output">│ pty   user                comm        out (b/ev)   age      │</span>
+<span class="output">│   3   alice(1000)         bash        12384/421    82s      │</span>
+<span class="output">│ ▶ 4   alice(1000)         vim          2891/14     12s      │</span>
+<span class="output">│   5   bob(1001)           psql           830/9       4s      │</span>
+<span class="output">└─────────────────────────────────────────────────────────────┘</span>
+<span class="output">3 session(s) — ↑/↓ select  enter=connect  w=watch  s=snapshot  q=quit</span>
 
-<span class="comment"># `opener=alice writer=root` flags the privilege escalation —</span>
-<span class="comment"># alice opened the session, currently sudo is writing.</span>
+<span class="comment"># Enter on alice's vim session — bidirectional from here on:</span>
+<span class="output">[tap connect pty=4 — Ctrl-B d to detach]</span>
+<span class="output">  1 # Project plan</span>
+<span class="output">  2</span>
+<span class="output">  3 ## Next sprint</span>
+<span class="comment"># your keystrokes go straight into alice's vim. detach, pick another session.</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
 
-<span class="prompt">$</span> <span class="cmd">tap snapshot 3</span>
+  <!-- Why -->
+  <section id="why">
+    <div class="container">
+      <div class="section-header">
+        <h2>The capability Unix forgot to ship</h2>
+        <p>Decades of admin tools, none of them answer the live-shell question.</p>
+      </div>
+
+      <div class="perms-grid">
+        <div class="perms-info">
+          <h3>What you have today</h3>
+          <p>Linux ships <code>ps</code> for processes, <code>ss</code> and <code>netstat</code> for sockets, <code>lsof</code> for open files, <code>who</code> and <code>w</code> for logged-in users. Each answers one slice of "what's happening on this host." None of them answers the most obvious operator question: <em>what is each shell doing right now, and can I get into one?</em></p>
+
+          <h3>What you've been doing instead</h3>
+          <p>screen and tmux work — but only for sessions you set up inside them ahead of time. They're invisible to a third party joining late. SSH'd-in sessions stay opaque. <code>strace</code>-on-bash works but is brittle, root-only, and breaks when the user reaches for tab completion. Audit logs land hours later and are usually incomplete.</p>
+
+          <h3>What tap does</h3>
+          <p>Every active TTY/PTY on the host, live, by default — including sessions that started before tap was installed (seeded from <code>/proc</code> at daemon start). Attach to any of them. Type into them. Or just look. Same authority model Unix already has: you see your own; root sees everything.</p>
+
+          <ul class="perms-list">
+            <li><strong>Every shell</strong> — including ones screen/tmux can't see</li>
+            <li><strong>Attach live</strong> — type into any session you're allowed to see</li>
+            <li><strong>Snapshot any session</strong> — full SGR-aware screen grab</li>
+            <li><strong>Pre-existing sessions</strong> seeded from <code>/proc</code> at startup</li>
+            <li><strong>Identity follows the opener</strong> — sudo can't sneak past it</li>
+          </ul>
+        </div>
+
+        <div>
+          <div class="code-block">
+            <div class="code-header">
+              <span class="code-dot"></span>
+              <span class="code-dot"></span>
+              <span class="code-dot"></span>
+              <span class="code-title">Terminal — what other tools tell you vs. what tap does</span>
+            </div>
+            <div class="code-body">
+<span class="prompt">#</span> <span class="cmd">who</span>
+<span class="output">alice    pts/3        2026-04-29 09:41 (10.0.0.42)</span>
+<span class="output">bob      pts/4        2026-04-29 11:02 (10.0.0.18)</span>
+<span class="comment"># tells you who, not what.</span>
+
+<span class="prompt">#</span> <span class="cmd">ps -t pts/3 -o pid,comm</span>
+<span class="output">  3214 bash</span>
+<span class="output">  3812 vim</span>
+<span class="comment"># tells you the program, not the screen.</span>
+
+<span class="prompt">#</span> <span class="cmd">tap snapshot 3</span>
 <span class="output">snapshot pty=3 (24x80)</span>
-<span class="output">┌────────────────────────────────────────────────────────────────────────────────┐</span>
-<span class="output">│alice@myserver:~$ vim notes.md                                                  │</span>
-<span class="output">│  1 # Project plan                                                              │</span>
-<span class="output">│  2                                                                             │</span>
-<span class="output">│  3 ## Next sprint                                                              │</span>
-<span class="output">│  ...                                                                           │</span>
-
-<span class="prompt">$</span> <span class="cmd">tap watch 3</span>
-<span class="output">(stream opened: stream_id=1)</span>
-<span class="output">(initial frame: 24x80, replay=1342 bytes)</span>
-<span class="comment"># Live byte stream renders alice's session in real time.</span>
+<span class="output">┌──────────────────────────────────────────────────┐</span>
+<span class="output">│alice@web-prod:~$ vim notes.md                    │</span>
+<span class="output">│  3 ## Next sprint — payments hardening           │</span>
+<span class="output">│  4   - rotate signing keys before EOM            │</span>
+<span class="output">└──────────────────────────────────────────────────┘</span>
+<span class="comment"># the actual screen.  followed by `tap connect 3` to type into it.</span>
+            </div>
           </div>
         </div>
       </div>
@@ -140,10 +211,10 @@
     <div class="container">
       <div class="section-header">
         <h2>Install</h2>
-        <p>One curl. Linux-only — eBPF requires a Linux kernel.</p>
+        <p>One curl. Linux-only — eBPF needs a Linux kernel.</p>
       </div>
 
-      <div style="max-width: 36rem; margin: 0 auto 3rem;">
+      <div style="max-width: 36rem; margin: 0 auto;">
         <div class="code-block">
           <div class="code-header">
             <span class="code-dot"></span>
@@ -153,27 +224,14 @@
           </div>
           <div class="code-body">
 <span class="prompt">$</span> <span class="cmd">curl -fsSL https://tap.keik.ai/install.sh | bash</span>
+<span class="output">...</span>
+<span class="prompt">$</span> <span class="cmd">tap</span>
+<span class="comment"># picker comes up immediately. existing sessions are already there.</span>
           </div>
         </div>
-      </div>
-
-      <div class="steps steps-4">
-        <div class="step">
-          <h3>Daemon installs as root</h3>
-          <p><code>hop-tap-d</code> via systemd, eBPF needs CAP_BPF/CAP_PERFMON/CAP_SYS_ADMIN.</p>
-        </div>
-        <div class="step">
-          <h3>tap installs to /usr/local/bin</h3>
-          <p>The CLI you actually run. Connects to the daemon's local Unix socket.</p>
-        </div>
-        <div class="step">
-          <h3>Run any session</h3>
-          <p>tap captures every TTY/PTY automatically. Existing sessions are seeded from <code>/proc</code>.</p>
-        </div>
-        <div class="step">
-          <h3>Audit</h3>
-          <p><code>tap list</code> immediately. No keys, no peers, no setup beyond the install.</p>
-        </div>
+        <p style="text-align: center; color: var(--color-text-secondary); font-size: 0.875rem; margin-top: 1.5rem;">
+          The installer drops the daemon under systemd and the <code>tap</code> CLI in <code>/usr/local/bin</code>. Nothing to configure. <code>tap list</code> works the moment install finishes.
+        </p>
       </div>
     </div>
   </section>
@@ -182,25 +240,20 @@
   <section id="perms">
     <div class="container">
       <div class="section-header">
-        <h2>Permission model</h2>
-        <p>Authentication is the kernel's authoritative answer to "who's connecting" — not a claim on the wire.</p>
+        <h2>Your shells, or all shells if you're root</h2>
+        <p>The same authority model Unix has had since 1969. No new ACLs, no key management.</p>
       </div>
 
       <div class="perms-grid">
         <div class="perms-info">
-          <h3>SO_PEERCRED on a Unix socket</h3>
-          <p>The daemon listens on <code>/run/hop-tap/local.sock</code> mode 0666 — any local user can connect. On each accept, the daemon reads <code>SO_PEERCRED</code> from the kernel; that's the caller's real uid. The wire carries no identity claims, and there's no way for a client to lie.</p>
-          <h3>Two tiers, one rule</h3>
-          <p>Root (uid 0) gets the <code>creator</code> role and sees every active session. Non-root users get the <code>peer</code> role and see only sessions whose <strong>opener</strong> matches their username. Sticky opener identity (captured at session creation) means a user can't escape their scope by escalating privileges mid-session.</p>
-          <h3>Why this shape</h3>
-          <p>Local audit on a single host has a natural authority gradient: root is the OS administrator. Anything more complex (ACLs, named groups, capabilities) wouldn't survive contact with the actual deployments, where root is what you have. tap embraces it.</p>
-          <ul class="perms-list">
-            <li><strong>Kernel-authoritative</strong> identity via SO_PEERCRED</li>
-            <li><strong>uid 0</strong> sees everything</li>
-            <li><strong>non-root</strong> sees only sessions they opened</li>
-            <li><strong>Sticky opener</strong> survives sudo / setpriv mid-session</li>
-            <li><strong>Same denial wording</strong> as missing-pty for non-enumeration</li>
-          </ul>
+          <h3>The rule</h3>
+          <p>Root sees and acts on every session. Non-root users see and act on only the sessions they opened. The kernel tells the daemon who's connecting (<code>SO_PEERCRED</code> on the local socket) — there's no key management, no on-the-wire claim a client could lie about.</p>
+
+          <h3>Sticky opener identity</h3>
+          <p>Every session remembers who opened it. <code>sudo</code> in the middle of a session doesn't change ownership for tap's purposes — alice's session is alice's session even when she's running root commands inside it. So a user can't escape their scope by escalating mid-session, and root can still see exactly when the privilege transition happened.</p>
+
+          <h3>Same denial wording</h3>
+          <p>Probing a pty you can't see returns the same error as probing one that doesn't exist. So a non-root user can't enumerate other users' sessions by trying every pty number.</p>
         </div>
 
         <div>
@@ -215,31 +268,20 @@
 <span class="comment"># root sees every session</span>
 <span class="prompt">root#</span> <span class="cmd">tap list</span>
 <span class="output">2 active session(s):</span>
-<span class="output">  pty=0  user=root(0)      comm=script  ...</span>
-<span class="output">  pty=1  user=alice(1000)  comm=script  ...</span>
+<span class="output">  pty=3  user=alice(1000)  comm=vim   ...</span>
+<span class="output">  pty=4  user=bob(1001)    comm=psql  ...</span>
 
 <span class="comment"># alice sees only her own</span>
 <span class="prompt">alice$</span> <span class="cmd">tap list</span>
 <span class="output">1 active session(s):</span>
-<span class="output">  pty=1  user=alice(1000)  comm=script  ...</span>
+<span class="output">  pty=3  user=alice(1000)  comm=vim   ...</span>
 
-<span class="comment"># forbidden snapshot — same error as a missing pty,</span>
-<span class="comment"># so non-root can't enumerate other users by probing</span>
-<span class="prompt">alice$</span> <span class="cmd">tap snapshot 0</span>
-<span class="output">error: no active session with pty_index=0</span>
+<span class="comment"># probing bob's pty: same error as one that doesn't exist</span>
+<span class="prompt">alice$</span> <span class="cmd">tap snapshot 4</span>
+<span class="output">error: no active session with pty_index=4</span>
             </div>
           </div>
         </div>
-      </div>
-    </div>
-  </section>
-
-  <!-- How it works -->
-  <section id="how">
-    <div class="container">
-      <div class="section-header">
-        <h2>How it works</h2>
-        <p>Pure-Rust eBPF, CO-RE across kernels, alacritty driving the off-screen grid, sticky opener identity.</p>
       </div>
     </div>
   </section>
@@ -248,9 +290,8 @@
   <section style="padding-top: 0; padding-bottom: 8rem;">
     <div class="container">
       <div style="background: var(--color-surface); border: 1px solid var(--color-border); border-radius: 1rem; padding: 3rem; text-align: center;">
-        <h2 style="font-family: var(--font-display); font-weight: 800; font-size: 1.5rem; margin-bottom: 0.75rem;">Linux only — eBPF inside</h2>
-        <p style="color: var(--color-text-secondary); font-size: 0.95rem; line-height: 1.65; max-width: 36rem; margin: 0 auto 1.5rem;">tap captures via kernel-side BPF programs that ride on Linux's pty subsystem. macOS/Windows are out of scope for the daemon. The CLI naturally only runs where the daemon does.</p>
-        <p style="color: var(--color-text-secondary); font-size: 0.95rem; line-height: 1.65; max-width: 36rem; margin: 0 auto 1.5rem;">Need to drive tap from another machine? <a href="remote.html" style="color: var(--color-primary); font-weight: 500;">Pair it with hop</a> — same eBPF capture, but accessible over an authenticated QUIC peer connection from any client OS.</p>
+        <h2 style="font-family: var(--font-display); font-weight: 800; font-size: 1.5rem; margin-bottom: 0.75rem;">Linux only</h2>
+        <p style="color: var(--color-text-secondary); font-size: 0.95rem; line-height: 1.65; max-width: 36rem; margin: 0 auto 1.5rem;">tap rides Linux's pty subsystem via eBPF. macOS and Windows are out of scope for the daemon. Want to drive tap from another machine? <a href="remote.html" style="color: var(--color-primary); font-weight: 500;">Pair it with hop</a> for authenticated remote and AI-driven access from any client OS.</p>
         <div style="display: flex; gap: 1rem; justify-content: center; flex-wrap: wrap;">
           <a href="#install" class="btn btn-primary">Install</a>
           <a href="remote.html" class="btn btn-ghost">Remote / AI &rarr;</a>
