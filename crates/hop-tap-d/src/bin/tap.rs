@@ -578,6 +578,14 @@ async fn connect(
                             TapStreamFrame::Output(b) => {
                                 tracing::trace!(len = b.len(), "Output frame");
                                 let _ = stdout.write_all(&b);
+                                // The captured session aggressively
+                                // resets the window title — bash's
+                                // PROMPT_COMMAND runs `\x1b]0;...\x07`
+                                // before every prompt, top sets its
+                                // own title, etc. — so we re-assert
+                                // ours after each forwarded frame.
+                                // OSC 2 is just metadata; no flicker.
+                                set_window_title(&mut stdout, &info);
                                 // Compose mode owns the bottom row —
                                 // re-paint the input prompt after every
                                 // frame so the captured session's
@@ -610,21 +618,23 @@ async fn connect(
                 }
             }
             _ = housekeeping_timer.tick() => {
+                // Re-assert our window title in case the captured
+                // session set its own and there's no Output activity
+                // (e.g., the user has dropped to an idle prompt).
+                if session_ready {
+                    set_window_title(&mut stdout, &info);
+                }
                 // Re-fetch terminal size in case the user resized.
-                // We don't repaint anything in normal mode — the
-                // window title is set once and lives in the chrome.
-                // In Compose mode, repaint the prompt so its
-                // dimensions track the new terminal size.
                 if let Ok((c, r)) = crossterm::terminal::size() {
                     if (c, r) != (term_cols, term_rows) {
                         term_cols = c;
                         term_rows = r;
                         if let ConnectMode::Compose(buf) = &mode {
                             paint_compose_prompt(&mut stdout, term_rows, term_cols, buf);
-                            let _ = stdout.flush();
                         }
                     }
                 }
+                let _ = stdout.flush();
             }
         }
     };
