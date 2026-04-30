@@ -71,6 +71,12 @@ pub enum TapRequest {
     /// run as commands) and SIGCONTs the group. Same write-scope
     /// authorization as Inject.
     SetLock { pty_index: i32, locked: bool },
+    /// Transition (or release) the captured session into a
+    /// sandboxed honeypot. While quarantined the user is talking to
+    /// an impostor bash running in a Linux-namespace sandbox; their
+    /// real shell stays SIGSTOPped in the background so the swap is
+    /// reversible. Same write-scope authorization as Inject.
+    SetQuarantine { pty_index: i32, quarantined: bool },
 }
 
 /// Daemon's reply. Carried inside `ExtMessage::Response.payload`.
@@ -111,6 +117,14 @@ pub enum TapResponse {
         pty_index: i32,
         locked: bool,
         pgrp: i32,
+    },
+    /// Reply to a successful [`TapRequest::SetQuarantine`]. On
+    /// quarantine, `impostor_pid` is the PID of the spawned
+    /// sandboxed bash; on release it's None.
+    QuarantineSet {
+        pty_index: i32,
+        quarantined: bool,
+        impostor_pid: Option<u32>,
     },
     Error(String),
 }
@@ -159,6 +173,12 @@ pub struct SessionInfo {
     /// not daemon restarts (the underlying SIGSTOP does, though).
     #[serde(default)]
     pub locked: bool,
+    /// True if an admin has transitioned this session into a
+    /// honeypot sandbox via `TapRequest::SetQuarantine`. The real
+    /// shell is SIGSTOPped (and thus also `locked`) and an impostor
+    /// bash running in a namespace sandbox owns the captured pty.
+    #[serde(default)]
+    pub quarantined: bool,
 }
 
 /// Carried inside `ExtMessage::StreamOpen.payload`. The peer asks

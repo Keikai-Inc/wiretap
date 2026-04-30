@@ -37,7 +37,9 @@ fn main() -> anyhow::Result<()> {
 
     #[derive(Subcommand, Debug)]
     enum Cmd {
-        /// Set up a sandbox and exec bash inside it.
+        /// Set up a sandbox and exec bash inside it. Inherits the
+        /// caller's stdin/stdout/stderr — useful for testing the
+        /// sandbox interactively from a regular shell.
         Exec {
             /// Pretend username inside the sandbox.
             #[arg(long, default_value = "alice")]
@@ -49,6 +51,25 @@ fn main() -> anyhow::Result<()> {
             #[arg(long, default_value_t = 1000)]
             uid: u32,
             /// Pretend gid.
+            #[arg(long, default_value_t = 1000)]
+            gid: u32,
+        },
+        /// Attach to the inherited stdin/stdout/stderr as our
+        /// controlling tty (setsid + TIOCSCTTY-steal), then enter
+        /// the sandbox and exec bash. Used by the daemon when it
+        /// transitions a captured session into the honeypot —
+        /// the daemon opens /dev/pts/N, plumbs it into our stdio
+        /// via std::process::Command, and we take it over here.
+        ///
+        /// Requires CAP_SYS_ADMIN to steal an in-use tty. The
+        /// daemon runs as root so this is fine.
+        PtyAttach {
+            #[arg(long)]
+            user: String,
+            #[arg(long)]
+            hostname: Option<String>,
+            #[arg(long, default_value_t = 1000)]
+            uid: u32,
             #[arg(long, default_value_t = 1000)]
             gid: u32,
         },
@@ -73,8 +94,34 @@ fn main() -> anyhow::Result<()> {
             }
             spec.uid = uid;
             spec.gid = gid;
-            // enter_sandbox_and_exec returns Infallible on success
-            // (it execs); only setup-failure paths return.
+            let _: std::convert::Infallible = enter_sandbox_and_exec(spec)?;
+            unreachable!()
+        }
+        Cmd::PtyAttach {
+            user,
+            hostname,
+            uid,
+            gid,
+        } => {
+            let mut spec = SandboxSpec::default_for_user(user);
+            if let Some(h) = hostname {
+                spec.hostname = h;
+            }
+            spec.uid = uid;
+            spec.gid = gid;
+            // 1. setsid: become our own session leader so TIOCSCTTY
+            //    is allowed to bind a controlling tty to us.
+            nix::unistd::setsid().map_err(|e| anyhow::anyhow!("setsid: {e}"))?;
+            // 2. TIOCSCTTY with arg=1 = "steal" mode: takes the tty
+            //    away from the previous controlling session (the
+            //    real shell, which the daemon SIGSTOPped before
+            //    spawning us). Requires CAP_SYS_ADMIN.
+            //    SAFETY: ioctl on STDIN with TIOCSCTTY's int arg.
+            let r = unsafe { libc::ioctl(0, libc::TIOCSCTTY, 1) };
+            if r != 0 {
+                let err = std::io::Error::last_os_error();
+                anyhow::bail!("TIOCSCTTY-steal on stdin: {err}");
+            }
             let _: std::convert::Infallible = enter_sandbox_and_exec(spec)?;
             unreachable!()
         }

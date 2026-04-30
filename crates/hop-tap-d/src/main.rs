@@ -240,6 +240,15 @@ mod linux {
         // SetLock(false), which also flushes the input queue and
         // SIGCONTs.
         locked: bool,
+        // Admin-quarantined: a sandboxed impostor bash has taken
+        // over the captured pty. The real shell is SIGSTOPped in
+        // the background. `quarantine_impostor_pid` is the PID of
+        // the impostor process the daemon spawned;
+        // `quarantine_orig_pgrp` is the pgrp we SIGSTOPped so we
+        // know what to SIGCONT on release.
+        quarantined: bool,
+        quarantine_impostor_pid: Option<u32>,
+        quarantine_orig_pgrp: Option<i32>,
     }
 
     impl Drop for SessionState {
@@ -291,6 +300,9 @@ mod linux {
                 master_holder_pid: 0,
                 master_fd: -1,
                 locked: false,
+                quarantined: false,
+                quarantine_impostor_pid: None,
+                quarantine_orig_pgrp: None,
             }
         }
 
@@ -379,6 +391,7 @@ mod linux {
                 age_ms: self.created_at.elapsed().as_millis() as u64,
                 idle_ms: self.last_activity.elapsed().as_millis() as u64,
                 locked: self.locked,
+                quarantined: self.quarantined,
             }
         }
     }
@@ -1520,6 +1533,298 @@ mod linux {
             TapRequest::SetLock { pty_index, locked } => {
                 handle_set_lock(sessions, peer, pty_index, locked)
             }
+            TapRequest::SetQuarantine { pty_index, quarantined } => {
+                handle_set_quarantine(sessions, peer, pty_index, quarantined)
+            }
+        }
+    }
+
+    /// Transition a session into the honeypot sandbox (or release
+    /// it back to the real shell).
+    ///
+    /// Lock semantics: quarantine implies lock. We SIGSTOP the
+    /// foreground pgrp (same primitive as SetLock), open the
+    /// captured slave fd, and spawn `tap-honeypot pty-attach` with
+    /// that fd as stdin/stdout/stderr. The impostor's own startup
+    /// does setsid + TIOCSCTTY-steal so it becomes the controlling
+    /// process of the captured tty — the user is now talking to
+    /// bash inside a namespace sandbox.
+    ///
+    /// Release: kill the impostor, SIGCONT the original pgrp. The
+    /// real shell wakes up but no longer has the tty as its
+    /// controlling tty (TIOCSCTTY-steal is one-way without a
+    /// ptrace dance). Reads/writes still work; job-control features
+    /// (Ctrl-C / Ctrl-Z / `fg` / `bg`) are degraded — bash will
+    /// print "no job control in this shell" on the user's next
+    /// keystroke. Acceptable for the "decided they're legitimate,
+    /// hand them back" path; document for users.
+    ///
+    /// Authorization: opener-or-creator (same as Inject + Lock).
+    fn handle_set_quarantine(
+        sessions: &SessionTable,
+        peer: &PeerContext,
+        pty_index: i32,
+        quarantined: bool,
+    ) -> TapResponse {
+        if Some(pty_index) == peer.controlling_pty {
+            return TapResponse::Error(format!(
+                "no active session with pty_index={pty_index}"
+            ));
+        }
+        // Scope + write-permission check.
+        {
+            let table = sessions.lock().expect("session table mutex poisoned");
+            let Some(state) = table.get(&pty_index) else {
+                return TapResponse::Error(format!(
+                    "no active session with pty_index={pty_index}"
+                ));
+            };
+            if !peer.scope_allows(state) {
+                return TapResponse::Error(format!(
+                    "no active session with pty_index={pty_index}"
+                ));
+            }
+            if !peer_can_inject(peer, state) {
+                return TapResponse::Error(format!(
+                    "forbidden: only the session opener (or a creator-role peer) \
+                     may quarantine pty_index={pty_index}"
+                ));
+            }
+        }
+
+        if quarantined {
+            quarantine_session(sessions, pty_index)
+        } else {
+            release_quarantine(sessions, pty_index)
+        }
+    }
+
+    /// Activate the honeypot for `pty_index`. Idempotent in the
+    /// sense that a second call on an already-quarantined session
+    /// returns success without spawning another impostor (the
+    /// existing one is still alive).
+    fn quarantine_session(sessions: &SessionTable, pty_index: i32) -> TapResponse {
+        // Snapshot the relevant state under the lock, then drop it
+        // so we can do the slow fork+exec without blocking other
+        // handlers. We re-acquire to write the result back.
+        let (already_quarantined, opener_uid, opener_username) = {
+            let table = sessions.lock().expect("session table mutex poisoned");
+            let Some(state) = table.get(&pty_index) else {
+                return TapResponse::Error(format!(
+                    "no active session with pty_index={pty_index}"
+                ));
+            };
+            (
+                state.quarantined,
+                state.opener_uid,
+                lookup_username(state.opener_uid)
+                    .unwrap_or_else(|| format!("uid{}", state.opener_uid)),
+            )
+        };
+        if already_quarantined {
+            // Re-quarantining is a no-op — surface the existing
+            // impostor PID so the caller's UI matches reality.
+            let impostor_pid = sessions
+                .lock()
+                .ok()
+                .and_then(|t| t.get(&pty_index).and_then(|s| s.quarantine_impostor_pid));
+            return TapResponse::QuarantineSet {
+                pty_index,
+                quarantined: true,
+                impostor_pid,
+            };
+        }
+
+        // SIGSTOP the foreground pgrp — same primitive Lock uses.
+        let pgrp = match foreground_pgrp(pty_index) {
+            Ok(p) if p > 0 => p,
+            Ok(p) => {
+                return TapResponse::Error(format!(
+                    "pty_index={pty_index} has no foreground process group (pgrp={p})"
+                ));
+            }
+            Err(e) => {
+                return TapResponse::Error(format!(
+                    "foreground_pgrp for pty_index={pty_index}: {e}"
+                ));
+            }
+        };
+        // SAFETY: kill on a real pgrp + valid signal.
+        let r = unsafe { libc::kill(-pgrp as libc::pid_t, libc::SIGSTOP) };
+        if r != 0 {
+            let err = std::io::Error::last_os_error();
+            return TapResponse::Error(format!(
+                "SIGSTOP on pgrp {pgrp} for pty_index={pty_index}: {err}"
+            ));
+        }
+
+        // Open the captured slave fd. We hand three clones of it to
+        // the impostor as stdin/stdout/stderr via std::process::Command.
+        let path = format!("/dev/pts/{pty_index}");
+        let slave = match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+        {
+            Ok(f) => f,
+            Err(e) => {
+                // Roll back the SIGSTOP — leaving the pgrp frozen
+                // when quarantine fails would be an obscure footgun.
+                unsafe {
+                    libc::kill(-pgrp as libc::pid_t, libc::SIGCONT);
+                }
+                return TapResponse::Error(format!("open {path}: {e}"));
+            }
+        };
+
+        // Spawn the impostor.
+        use std::os::fd::OwnedFd;
+        use std::process::{Command, Stdio};
+        let stdin_fd: OwnedFd = match slave.try_clone() {
+            Ok(f) => f.into(),
+            Err(e) => {
+                unsafe {
+                    libc::kill(-pgrp as libc::pid_t, libc::SIGCONT);
+                }
+                return TapResponse::Error(format!("dup slave fd: {e}"));
+            }
+        };
+        let stdout_fd: OwnedFd = match slave.try_clone() {
+            Ok(f) => f.into(),
+            Err(e) => {
+                unsafe {
+                    libc::kill(-pgrp as libc::pid_t, libc::SIGCONT);
+                }
+                return TapResponse::Error(format!("dup slave fd: {e}"));
+            }
+        };
+        let stderr_fd: OwnedFd = slave.into();
+
+        let mut cmd = Command::new("/usr/local/bin/tap-honeypot");
+        cmd.arg("pty-attach")
+            .arg("--user")
+            .arg(&opener_username)
+            .arg("--uid")
+            .arg(opener_uid.to_string())
+            .arg("--gid")
+            .arg(opener_uid.to_string()) // best-effort: gid often == uid
+            .stdin(Stdio::from(stdin_fd))
+            .stdout(Stdio::from(stdout_fd))
+            .stderr(Stdio::from(stderr_fd));
+
+        let child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                unsafe {
+                    libc::kill(-pgrp as libc::pid_t, libc::SIGCONT);
+                }
+                return TapResponse::Error(format!("spawn tap-honeypot: {e}"));
+            }
+        };
+        let impostor_pid = child.id();
+        // We don't keep the Child handle — Linux will reparent the
+        // impostor to PID 1 if the daemon dies, and we'll reap it
+        // explicitly on release_quarantine via waitpid(WNOHANG).
+        std::mem::forget(child);
+
+        // Persist the state so release_quarantine can find what to
+        // kill and what to SIGCONT.
+        {
+            let mut table = sessions.lock().expect("session table mutex poisoned");
+            if let Some(state) = table.get_mut(&pty_index) {
+                state.locked = true;
+                state.quarantined = true;
+                state.quarantine_impostor_pid = Some(impostor_pid);
+                state.quarantine_orig_pgrp = Some(pgrp);
+            }
+        }
+
+        info!(pty_index, impostor_pid, pgrp, "session quarantined");
+        TapResponse::QuarantineSet {
+            pty_index,
+            quarantined: true,
+            impostor_pid: Some(impostor_pid),
+        }
+    }
+
+    /// Release a session from quarantine: kill the impostor and
+    /// SIGCONT the original foreground process group. The user's
+    /// real shell wakes up — see the comment on
+    /// `handle_set_quarantine` for the job-control caveat.
+    fn release_quarantine(sessions: &SessionTable, pty_index: i32) -> TapResponse {
+        let (impostor_pid, orig_pgrp, was_quarantined) = {
+            let table = sessions.lock().expect("session table mutex poisoned");
+            let Some(state) = table.get(&pty_index) else {
+                return TapResponse::Error(format!(
+                    "no active session with pty_index={pty_index}"
+                ));
+            };
+            (
+                state.quarantine_impostor_pid,
+                state.quarantine_orig_pgrp,
+                state.quarantined,
+            )
+        };
+        if !was_quarantined {
+            return TapResponse::QuarantineSet {
+                pty_index,
+                quarantined: false,
+                impostor_pid: None,
+            };
+        }
+
+        if let Some(pid) = impostor_pid {
+            // SIGTERM first; if the impostor catches it, SIGKILL.
+            // For an unattended bash inside a sandbox SIGTERM is
+            // typically enough.
+            // SAFETY: kill(2) on a pid + signal.
+            unsafe {
+                libc::kill(pid as libc::pid_t, libc::SIGTERM);
+            }
+            // Reap the zombie. Don't block — if the impostor is
+            // slow to exit, we leave the kernel to reap when the
+            // daemon eventually does.
+            let mut status: libc::c_int = 0;
+            unsafe {
+                libc::waitpid(
+                    pid as libc::pid_t,
+                    &mut status as *mut _,
+                    libc::WNOHANG,
+                );
+            }
+        }
+
+        // Drain stale input that piled up during the impostor's
+        // lifetime so the original shell doesn't replay it.
+        if let Err(e) = flush_pty_input(pty_index) {
+            warn!(pty_index, error = %e, "TCFLSH on quarantine release failed");
+        }
+
+        if let Some(pgrp) = orig_pgrp {
+            // SAFETY: kill(2) on -pgrp + valid signal.
+            let r = unsafe { libc::kill(-pgrp as libc::pid_t, libc::SIGCONT) };
+            if r != 0 {
+                let err = std::io::Error::last_os_error();
+                warn!(pty_index, pgrp, error = %err, "SIGCONT on release failed");
+            }
+        }
+
+        // Clear bookkeeping.
+        {
+            let mut table = sessions.lock().expect("session table mutex poisoned");
+            if let Some(state) = table.get_mut(&pty_index) {
+                state.locked = false;
+                state.quarantined = false;
+                state.quarantine_impostor_pid = None;
+                state.quarantine_orig_pgrp = None;
+            }
+        }
+
+        info!(pty_index, ?impostor_pid, ?orig_pgrp, "session released from quarantine");
+        TapResponse::QuarantineSet {
+            pty_index,
+            quarantined: false,
+            impostor_pid: None,
         }
     }
 

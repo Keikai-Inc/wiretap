@@ -269,6 +269,22 @@ fn print_response(resp: &TapResponse) {
                 if *locked { "locked" } else { "unlocked" }
             );
         }
+        TapResponse::QuarantineSet {
+            pty_index,
+            quarantined,
+            impostor_pid,
+        } => {
+            if *quarantined {
+                println!(
+                    "quarantined pty={pty_index} (impostor pid={})",
+                    impostor_pid
+                        .map(|p| p.to_string())
+                        .unwrap_or_else(|| "?".into())
+                );
+            } else {
+                println!("released pty={pty_index} from quarantine");
+            }
+        }
         TapResponse::Error(msg) => eprintln!("error: {msg}"),
     }
 }
@@ -970,6 +986,10 @@ async fn run_tui(socket: &std::path::Path) -> Result<Option<TuiAction>> {
     // the 'l' key (locking only — unlocking is reversible and fires
     // immediately).
     let mut pending_lock: Option<i32> = None;
+    // Pending quarantine confirmation: same pattern. Releasing fires
+    // immediately (reversible-ish — see the daemon-side caveat about
+    // job-control degradation).
+    let mut pending_quarantine: Option<i32> = None;
     // Brief flash message: shows above the status line for one render
     // cycle to confirm or report errors. Cleared on the next refresh.
     let mut flash: Option<String> = None;
@@ -990,7 +1010,7 @@ async fn run_tui(socket: &std::path::Path) -> Result<Option<TuiAction>> {
                         state.select(Some(0));
                     }
                     status_line = format!(
-                        "{} session(s) — ↑/↓ select  Enter=connect  l=lock  x=kill  q=quit",
+                        "{} session(s) — ↑/↓ select  Enter=connect  l=lock  Q=quarantine  x=kill  q=quit",
                         sessions.len()
                     );
                 }
@@ -1057,7 +1077,12 @@ async fn run_tui(socket: &std::path::Path) -> Result<Option<TuiAction>> {
                 .iter()
                 .map(|s| {
                     let opener = format_user(&s.opener_username, s.opener_uid);
-                    let pty_label = if s.locked {
+                    // Status flag: quarantine takes priority over lock
+                    // (it implies lock anyway). Show a single-glyph
+                    // prefix so the column stays narrow.
+                    let pty_label = if s.quarantined {
+                        format!("🎭 {}", s.pty_index)
+                    } else if s.locked {
                         format!("🔒 {}", s.pty_index)
                     } else {
                         format!("   {}", s.pty_index)
@@ -1162,8 +1187,7 @@ async fn run_tui(socket: &std::path::Path) -> Result<Option<TuiAction>> {
             let preview_para = Paragraph::new(Text::from(lines)).block(preview_block);
             f.render_widget(preview_para, body[1]);
 
-            // Status line: pending-kill / pending-lock prompt > flash
-            // > normal hint. Each takes precedence in that order.
+            // Status line: pending-* prompts > flash > normal hint.
             let status_text = if let Some(p) = pending_kill {
                 format!(
                     "kill pty {p}? press y to confirm (SIGHUP), X to force (SIGKILL), any other key to cancel"
@@ -1171,6 +1195,10 @@ async fn run_tui(socket: &std::path::Path) -> Result<Option<TuiAction>> {
             } else if let Some(p) = pending_lock {
                 format!(
                     "lock pty {p}? press y to confirm — user's input will be frozen until you unlock"
+                )
+            } else if let Some(p) = pending_quarantine {
+                format!(
+                    "quarantine pty {p}? press y to confirm — switches them into a sandboxed honeypot (reversible)"
                 )
             } else if let Some(msg) = &flash {
                 msg.clone()
@@ -1232,6 +1260,20 @@ async fn run_tui(socket: &std::path::Path) -> Result<Option<TuiAction>> {
                     }
                     continue;
                 }
+                // Pending-quarantine confirmation.
+                if let Some(target) = pending_quarantine {
+                    pending_quarantine = None;
+                    if matches!(key.code, KeyCode::Char('y')) {
+                        flash = match send_set_quarantine(&mut conn, &mut next_id, target, true).await {
+                            Ok(()) => Some(format!("quarantined pty {target}")),
+                            Err(e) => Some(format!("quarantine failed: {e}")),
+                        };
+                        last_refresh = Instant::now() - refresh_interval;
+                    } else {
+                        flash = Some(format!("quarantine of pty {target} cancelled"));
+                    }
+                    continue;
+                }
                 // Any keystroke clears a stale flash so old messages
                 // don't linger.
                 flash = None;
@@ -1275,6 +1317,25 @@ async fn run_tui(socket: &std::path::Path) -> Result<Option<TuiAction>> {
                                 last_refresh = Instant::now() - refresh_interval;
                             } else {
                                 pending_lock = Some(s.pty_index);
+                            }
+                        }
+                    }
+                    (KeyCode::Char('Q'), _) => {
+                        // Toggle quarantine. Already-quarantined →
+                        // release immediately (admin's decided the
+                        // user was legit). Not yet quarantined → arm
+                        // a confirmation, since transitioning them
+                        // into the sandbox is observable.
+                        if let Some(s) = state.selected().and_then(|i| sessions.get(i)) {
+                            if s.quarantined {
+                                let pty = s.pty_index;
+                                flash = match send_set_quarantine(&mut conn, &mut next_id, pty, false).await {
+                                    Ok(()) => Some(format!("released pty {pty} from quarantine")),
+                                    Err(e) => Some(format!("release failed: {e}")),
+                                };
+                                last_refresh = Instant::now() - refresh_interval;
+                            } else {
+                                pending_quarantine = Some(s.pty_index);
                             }
                         }
                     }
@@ -1402,6 +1463,41 @@ async fn send_set_lock(
             } if rid == request_id => bail!("daemon: {msg}"),
             other => {
                 tracing::debug!(?other, "tui: ignoring unexpected message during set_lock");
+            }
+        }
+    }
+}
+
+/// Send a SetQuarantine RPC for `pty`. Used by the picker's `Q` key
+/// (both quarantine and release paths).
+async fn send_set_quarantine(
+    conn: &mut Conn,
+    next_id: &mut u64,
+    pty: i32,
+    quarantined: bool,
+) -> Result<()> {
+    let request_id = *next_id;
+    *next_id += 1;
+    conn.send(LocalMessage::Call {
+        request_id,
+        payload: TapRequest::SetQuarantine {
+            pty_index: pty,
+            quarantined,
+        },
+    })
+    .await?;
+    loop {
+        match conn.recv().await? {
+            LocalMessage::Reply {
+                request_id: rid,
+                payload: TapResponse::QuarantineSet { .. },
+            } if rid == request_id => return Ok(()),
+            LocalMessage::Reply {
+                request_id: rid,
+                payload: TapResponse::Error(msg),
+            } if rid == request_id => bail!("daemon: {msg}"),
+            other => {
+                tracing::debug!(?other, "tui: ignoring unexpected message during set_quarantine");
             }
         }
     }
