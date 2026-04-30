@@ -109,6 +109,20 @@ fn main() -> anyhow::Result<()> {
             }
             spec.uid = uid;
             spec.gid = gid;
+
+            // Snapshot the inherited slave fd's window size *before*
+            // the session-leader transition. Some kernel versions
+            // reset winsize to 0x0 when TIOCSCTTY changes the tty's
+            // session, which makes bash come up thinking it has a
+            // 0x0 terminal — readline misbehaves, output looks
+            // half-rendered, the user sees a broken shell.
+            // SAFETY: ioctl(TIOCGWINSZ) writes a winsize through the
+            // pointer; layout matches what the kernel expects.
+            let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+            let _ = unsafe {
+                libc::ioctl(0, libc::TIOCGWINSZ, &mut ws as *mut libc::winsize)
+            };
+
             // 1. setsid: become our own session leader so TIOCSCTTY
             //    is allowed to bind a controlling tty to us.
             nix::unistd::setsid().map_err(|e| anyhow::anyhow!("setsid: {e}"))?;
@@ -122,6 +136,36 @@ fn main() -> anyhow::Result<()> {
                 let err = std::io::Error::last_os_error();
                 anyhow::bail!("TIOCSCTTY-steal on stdin: {err}");
             }
+
+            // Re-assert the saved winsize. If we got a non-zero
+            // value out of TIOCGWINSZ above, push it back so bash
+            // sees the real terminal dimensions when it starts.
+            // SAFETY: ioctl(TIOCSWINSZ) reads a winsize from the
+            // pointer.
+            if ws.ws_row != 0 && ws.ws_col != 0 {
+                let _ = unsafe {
+                    libc::ioctl(0, libc::TIOCSWINSZ, &ws as *const libc::winsize)
+                };
+            }
+
+            // Reset the line discipline to a sane interactive
+            // default before exec'ing bash. The previous shell may
+            // have left it in raw mode (readline mid-edit), or the
+            // kernel may have munged termios as part of the session
+            // transition. Bash will tcsetattr its own modes once
+            // readline starts up, but giving it a known starting
+            // point avoids a brief window of weirdness.
+            let mut tio: libc::termios = unsafe { std::mem::zeroed() };
+            if unsafe { libc::tcgetattr(0, &mut tio as *mut _) } == 0 {
+                tio.c_lflag |=
+                    libc::ICANON | libc::ECHO | libc::ECHOE | libc::ECHOK
+                        | libc::ECHOCTL | libc::ISIG | libc::IEXTEN;
+                tio.c_iflag |=
+                    libc::ICRNL | libc::IXON | libc::BRKINT | libc::IMAXBEL;
+                tio.c_oflag |= libc::OPOST | libc::ONLCR;
+                let _ = unsafe { libc::tcsetattr(0, libc::TCSANOW, &tio as *const _) };
+            }
+
             let _: std::convert::Infallible = enter_sandbox_and_exec(spec)?;
             unreachable!()
         }
