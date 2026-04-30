@@ -363,8 +363,9 @@
       var admin  = AsciinemaPlayer.create('admin.cast',  adminEl,  common);
       var hacker = AsciinemaPlayer.create('hacker.cast', hackerEl, common);
 
-      // Forward play/pause from either side to the other. The re-entrancy
-      // guard stops the events ping-ponging back through the bridge.
+      // Bridge play/pause/ended in both directions so a click on either
+      // player's controls drives both. Re-entrancy guard stops events
+      // ping-ponging back across the bridge.
       var bridging = false;
       function bridge(src, dst) {
         src.addEventListener('play',  function () {
@@ -380,29 +381,31 @@
       bridge(admin, hacker);
       bridge(hacker, admin);
 
-      // Soft drift correction: every 500ms, if the two players have slipped
-      // more than 100ms apart, snap the leader back to the lagger. Stops a
-      // minute of playback from drifting half a second across browsers.
+      // Unidirectional drift correction: admin is the leader, hacker
+      // follows. Every 200ms if hacker has slipped more than 30ms from
+      // admin's clock, snap it. Bidirectional snap-to-min (the previous
+      // approach) made the *leader* visibly stutter; one-way follow
+      // hides the correction in the side that's allowed to lag.
       setInterval(function () {
         try {
           var a = admin.getCurrentTime();
           var h = hacker.getCurrentTime();
           if (typeof a !== 'number' || typeof h !== 'number') return;
-          if (Math.abs(a - h) > 0.1) {
-            var target = Math.min(a, h);
+          if (Math.abs(a - h) > 0.03) {
             bridging = true;
-            if (a > target + 0.1) admin.seek(target);
-            if (h > target + 0.1) hacker.seek(target);
+            hacker.seek(a);
             bridging = false;
           }
         } catch (e) { /* player not ready yet */ }
-      }, 500);
-
-      // Start them together once both DOMs are mounted. A small delay
-      // gives the player a tick to wire up its internal handlers.
-      setTimeout(function () {
-        try { admin.play(); hacker.play(); } catch (e) {}
       }, 200);
+
+      // Start them together. play() returns a Promise; awaiting both
+      // before either has a chance to render means the first frames
+      // line up — much better than setTimeout.
+      Promise.all([admin.play(), hacker.play()]).catch(function () {
+        // Some browsers refuse autoplay without a gesture; fall back to
+        // the user clicking either player.
+      });
     })();
   </script>
 </body>

