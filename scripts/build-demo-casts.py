@@ -177,16 +177,16 @@ emit_picker(
 )
 
 # ── Hacker: chmod + run ──
-t = 5.5
+t = 5.0
 t = type_str(t, HACKER, "chmod +x recon.sh && ./recon.sh", cps=14)
 at(t + 0.20, HACKER, "\r\n")
-at(t + 0.50, HACKER, f"{CYAN}[recon]{RESET} starting subnet sweep on 10.0.0.0/24...\r\n")
-at(t + 1.10, HACKER, f"{CYAN}[recon]{RESET} 10.0.0.1 (gw)    open: 22 80 443\r\n")
-at(t + 1.50, HACKER, f"{CYAN}[recon]{RESET} 10.0.0.5 (db)    open: 22 5432 6379\r\n")
-at(t + 1.90, HACKER, f"{CYAN}[recon]{RESET} 10.0.0.7 (auth)  open: 22 443 8443\r\n")
-at(t + 2.30, HACKER, f"{CYAN}[recon]{RESET} 10.0.0.12 (api)  open: 22 80 443 9090\r\n")
-at(t + 2.70, HACKER, f"{CYAN}[recon]{RESET} sweep complete: 4 hosts, 13 open ports\r\n\r\n")
-t = t + 2.90
+at(t + 0.30, HACKER, f"{CYAN}[recon]{RESET} starting subnet sweep on 10.0.0.0/24...\r\n")
+at(t + 0.50, HACKER, f"{CYAN}[recon]{RESET} 10.0.0.1 (gw)    open: 22 80 443\r\n")
+at(t + 0.65, HACKER, f"{CYAN}[recon]{RESET} 10.0.0.5 (db)    open: 22 5432 6379\r\n")
+at(t + 0.80, HACKER, f"{CYAN}[recon]{RESET} 10.0.0.7 (auth)  open: 22 443 8443\r\n")
+at(t + 0.95, HACKER, f"{CYAN}[recon]{RESET} 10.0.0.12 (api)  open: 22 80 443 9090\r\n")
+at(t + 1.10, HACKER, f"{CYAN}[recon]{RESET} sweep complete: 4 hosts, 13 open ports\r\n\r\n")
+t = t + 1.30
 at(t, HACKER, hacker_prompt())
 
 # ── Admin: refresh picker preview to reflect new hacker state ──
@@ -205,7 +205,9 @@ emit_picker(
 )
 
 # ── Hacker: starts something more incriminating ──
-t = 9.5
+# Recon prompt has been visible since ~t=8.6, so the cursor sits at a
+# fresh prompt before this typing begins.
+t = 9.0
 t = type_str(t, HACKER, "cat /etc/shadow", cps=14)
 at(t + 0.20, HACKER, "\r\n")
 
