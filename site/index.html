@@ -95,9 +95,16 @@
       width: 0.5rem;
       height: 0.5rem;
       border-radius: 50%;
+      flex-shrink: 0;
     }
     .cast-pair .role-admin  { background: var(--color-accent-green, #22c55e); }
     .cast-pair .role-suspect { background: var(--color-accent-red,   #ef4444); }
+    .cast-pair .role-label {
+      transition: color 0.25s ease;
+      font-variant-numeric: tabular-nums;
+    }
+    .cast-pair .role-label.is-quarantine { color: #fbbf24; }
+    .cast-pair .role-label.is-ended      { color: #94a3b8; }
     .cast-pair .cast-host {
       border-radius: 0.5rem;
       overflow: hidden;
@@ -196,11 +203,17 @@
 
       <div class="cast-pair">
         <figure>
-          <figcaption><span class="role-dot role-admin"></span> Admin — alice@web-prod</figcaption>
+          <figcaption>
+            <span class="role-dot role-admin"></span>
+            <span class="role-label" id="label-admin">Admin — alice@web-prod</span>
+          </figcaption>
           <div id="cast-admin" class="cast-host"></div>
         </figure>
         <figure>
-          <figcaption><span class="role-dot role-suspect"></span> Suspect — root@web-prod (compromised)</figcaption>
+          <figcaption>
+            <span class="role-dot role-suspect"></span>
+            <span class="role-label" id="label-hacker">Suspect — root@web-prod (compromised)</span>
+          </figcaption>
           <div id="cast-hacker" class="cast-host"></div>
         </figure>
       </div>
@@ -356,16 +369,51 @@
       var common = {
         cols: 80, rows: 24,
         autoPlay: false,
-        loop: true,
+        loop: false,        // we handle the loop manually so we can pause between iterations
         idleTimeLimit: 1.5,
         theme: 'asciinema', fit: 'width',
       };
       var admin  = AsciinemaPlayer.create('admin.cast',  adminEl,  common);
       var hacker = AsciinemaPlayer.create('hacker.cast', hackerEl, common);
 
-      // Bridge play/pause/ended in both directions so a click on either
-      // player's controls drives both. Re-entrancy guard stops events
-      // ping-ponging back across the bridge.
+      // Labels above each player. They mirror the OSC 2 title real tap
+      // sets, plus extra cues for the demo viewer (🎭 quarantine, [ session
+      // ended ]). Driven from each player's currentTime against a state
+      // table — no markers needed in the casts themselves.
+      var adminLabel  = document.getElementById('label-admin');
+      var hackerLabel = document.getElementById('label-hacker');
+
+      var ADMIN_STATES = [
+        { t: 0.0,  text: 'Admin — alice@web-prod',                                                         klass: '' },
+        { t: 4.5,  text: 'Admin — tap',                                                                    klass: '' },
+        { t: 10.5, text: 'Admin — tap pty=4 root(0) bash — Ctrl-T menu  Ctrl-G msg',                       klass: '' },
+        { t: 19.0, text: 'Admin — tap',                                                                    klass: '' },
+        { t: 22.0, text: 'Admin — 🎭 tap pty=4 root(0) bash (quarantined) — Ctrl-T menu  Ctrl-G msg',     klass: 'is-quarantine' },
+        { t: 40.5, text: 'Admin — tap',                                                                    klass: '' },
+        { t: 41.5, text: 'Admin — alice@web-prod',                                                         klass: '' },
+      ];
+      var HACKER_STATES = [
+        { t: 0.0,  text: 'Suspect — root@web-prod (compromised)',                klass: '' },
+        { t: 21.5, text: 'Suspect — root@web-prod  (now talking to honeypot)',  klass: 'is-quarantine' },
+        { t: 40.0, text: 'Suspect — [ session ended ]',                          klass: 'is-ended' },
+      ];
+
+      function applyState(label, states, t) {
+        // Find the latest state whose threshold is <= t.
+        var pick = states[0];
+        for (var i = 0; i < states.length; i++) {
+          if (states[i].t <= t) pick = states[i];
+        }
+        if (label._lastText === pick.text) return;
+        label._lastText = pick.text;
+        label.textContent = pick.text;
+        label.classList.remove('is-quarantine', 'is-ended');
+        if (pick.klass) label.classList.add(pick.klass);
+      }
+
+      // Bridge play/pause in both directions so clicking either player's
+      // controls drives both. Don't bridge 'ended' here — restart logic
+      // owns that.
       var bridging = false;
       function bridge(src, dst) {
         src.addEventListener('play',  function () {
@@ -374,37 +422,66 @@
         src.addEventListener('pause', function () {
           if (bridging) return; bridging = true; dst.pause(); bridging = false;
         });
-        src.addEventListener('ended', function () {
-          if (bridging) return; bridging = true; dst.pause(); bridging = false;
-        });
       }
       bridge(admin, hacker);
       bridge(hacker, admin);
 
-      // Unidirectional drift correction: admin is the leader, hacker
-      // follows. Every 200ms if hacker has slipped more than 30ms from
-      // admin's clock, snap it. Bidirectional snap-to-min (the previous
-      // approach) made the *leader* visibly stutter; one-way follow
-      // hides the correction in the side that's allowed to lag.
-      setInterval(function () {
+      // Restart with a pause: when either side ends, pause both, hold for
+      // 3s on the final frame, then seek both back to 0 and play. The
+      // debounce flag keeps two simultaneous 'ended' events from
+      // scheduling two restart loops.
+      var restartPending = false;
+      function scheduleRestart() {
+        if (restartPending) return;
+        restartPending = true;
+        try { admin.pause(); } catch (e) {}
+        try { hacker.pause(); } catch (e) {}
+        setTimeout(function () {
+          bridging = true;
+          try { admin.seek(0); hacker.seek(0); } catch (e) {}
+          Promise.all([admin.play(), hacker.play()]).catch(function () {});
+          bridging = false;
+          restartPending = false;
+        }, 3000);
+      }
+      admin.addEventListener('ended',  scheduleRestart);
+      hacker.addEventListener('ended', scheduleRestart);
+
+      // Unidirectional drift correction + label updates, on rAF (~60fps).
+      // Admin is the leader; hacker is the follower. Threshold is 5ms;
+      // any larger gap and we snap hacker forward to admin's clock.
+      // 200ms setInterval was visibly drifting between snaps — rAF is
+      // tight enough that the snap is invisible.
+      function syncFrame() {
         try {
           var a = admin.getCurrentTime();
           var h = hacker.getCurrentTime();
-          if (typeof a !== 'number' || typeof h !== 'number') return;
-          if (Math.abs(a - h) > 0.03) {
-            bridging = true;
-            hacker.seek(a);
-            bridging = false;
+          if (typeof a === 'number' && typeof h === 'number') {
+            if (Math.abs(a - h) > 0.005 && !restartPending) {
+              bridging = true;
+              hacker.seek(a);
+              bridging = false;
+            }
+            applyState(adminLabel,  ADMIN_STATES,  a);
+            applyState(hackerLabel, HACKER_STATES, h);
           }
         } catch (e) { /* player not ready yet */ }
-      }, 200);
+        requestAnimationFrame(syncFrame);
+      }
+      requestAnimationFrame(syncFrame);
 
-      // Start them together. play() returns a Promise; awaiting both
-      // before either has a chance to render means the first frames
-      // line up — much better than setTimeout.
-      Promise.all([admin.play(), hacker.play()]).catch(function () {
-        // Some browsers refuse autoplay without a gesture; fall back to
-        // the user clicking either player.
+      // Start them together. seek(0) on both before play guarantees the
+      // first event lands at the same wall-clock moment on both
+      // players (otherwise their internal clocks would have advanced
+      // by a few ms during construction).
+      bridging = true;
+      Promise.all([admin.seek(0), hacker.seek(0)]).then(function () {
+        bridging = false;
+        return Promise.all([admin.play(), hacker.play()]);
+      }).catch(function () {
+        bridging = false;
+        // Some browsers refuse autoplay without a user gesture; fall
+        // back to the viewer clicking either player.
       });
     })();
   </script>
