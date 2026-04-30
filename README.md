@@ -44,8 +44,7 @@ hop-tap/
 │   ├── hop-tap-protocol/            # wire types (TapRequest/Response,
 │   │                                #   stream frames). Tiny crate;
 │   │                                #   hop-cli depends on it via path.
-│   └── hop-tap-d/                   # userspace daemon (stable Rust);
-│                                    #   bundles `hop-tap-probe` test client
+│   └── hop-tap-d/                   # userspace daemon + bundled `tap` CLI
 └── manifests/
     └── tap-terminal.toml.example    # example Hop extension manifest
 ```
@@ -63,31 +62,39 @@ of two modes — both fully working:
 
 ### Standalone mode (hop not installed)
 
-The most common case for first-time evaluation. The installer puts
-down `hop-tap-d` + `hop-tap-probe` in `/usr/local/bin`, installs the
-systemd unit, and starts the daemon. There's no manifest, no peer
-auth — just local audit via the bundled probe:
+`tap` is a fully self-contained local audit utility. The installer
+puts down `hop-tap-d` (the daemon, started by systemd as root) and
+`tap` (the user-facing CLI) in `/usr/local/bin`, then starts the
+daemon. Anyone on the host can use it:
 
 ```bash
-hop-tap-probe --bootstrap /run/hop-tap/bootstrap repl
-> list
-> snapshot 0
-> watch 0
+tap list                # sessions you can see
+tap snapshot 0          # current screen for pty=0
+tap watch 0             # live byte stream → your terminal
+tap repl                # interactive multi-command session
 ```
 
-The bootstrap file is root-owned mode 0600, so "you can run the
-probe" reduces to "you have root or the daemon's UID." That's the
-authorization model in standalone mode — appropriate for local
-operator audit, scripted recordings on a dedicated audit host, or
-just trying hop-tap out before bringing hop into the picture.
+**Local permission model.** The daemon listens on a Unix socket
+at `/run/hop-tap/local.sock` (mode 0666, world-connectable). On
+each accept it reads `SO_PEERCRED` from the kernel — the caller's
+uid is authoritative; the wire carries no identity claims.
+
+- **uid 0** (root) → `creator` role → sees every session
+- **non-root** → `peer` role → sees only sessions whose opener
+  matches the caller's username
+
+The model is "everyone can audit themselves; root can audit
+anyone" — a natural local audit boundary, no special groups or
+credentials required.
 
 ### hop-integrated mode (hop installed and running)
 
 If `hop` is installed and `systemctl is-active hop` returns true at
 install time, the installer also drops a manifest at
 `/etc/hop/extensions/tap-terminal.toml` and restarts hop so it
-picks up the new extension. After that, peers on the hop network
-get remote access:
+picks up the new extension. **Local `tap` works exactly the same.**
+What hop adds is *remote* access: peers on the hop network can
+now run
 
 ```bash
 hop <host> ext list                       # tap.terminal listed as available
@@ -96,9 +103,9 @@ hop <host> tap snapshot 0                 # 24x80 grid for pty=0
 hop <host> tap watch 0                    # live byte stream
 ```
 
-The remote path adds peer authentication, the per-peer scope check
-(creator role sees all; other roles gated by `opener_username`), and
-hop's QUIC transport. The local probe path keeps working unchanged.
+over hop's authenticated QUIC transport. The remote path uses
+hop's existing peer/role permission model (creator sees all;
+other roles gated by `opener_username`).
 
 ### Switching between modes
 

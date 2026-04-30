@@ -24,7 +24,7 @@ hop-tap-ebpf-common = { path = "crates/hop-tap-ebpf-common" }
 hop-tap-protocol = { path = "crates/hop-tap-protocol" }
 
 # Async runtime
-tokio = { version = "1", features = ["macros", "net", "rt", "rt-multi-thread", "sync", "time", "signal"] }
+tokio = { version = "1", features = ["macros", "net", "rt", "rt-multi-thread", "sync", "time", "signal", "io-util"] }
 
 # Error handling & logging
 anyhow = "1"

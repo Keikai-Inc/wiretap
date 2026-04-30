@@ -37,6 +37,12 @@ struct Args {
     /// the corresponding hop-side manifest's `version`.
     #[arg(long = "protocol-version", default_value = "0.1.0")]
     protocol_version: String,
+
+    /// Local Unix socket path the `tap` CLI connects to. Mode 0666
+    /// — any local user can connect; SO_PEERCRED authenticates the
+    /// caller's uid.
+    #[arg(long = "local-socket")]
+    local_socket: Option<std::path::PathBuf>,
 }
 
 #[tokio::main]
@@ -69,11 +75,14 @@ async fn main() -> Result<()> {
 
 #[cfg(target_os = "linux")]
 mod linux {
+    mod local;
+
     use super::Args;
     use hop_tap_d::extension::{write_bootstrap_atomically, ExtMessage};
     use hop_tap_d::protocol::{
         SessionInfo, TapRequest, TapResponse, TapStreamFrame, TapStreamRequest,
     };
+    use tokio::sync::mpsc;
     use alacritty_terminal::{
         event::VoidListener,
         grid::Dimensions,
@@ -106,8 +115,27 @@ mod linux {
         thread,
         time::{Duration, Instant},
     };
-    use tokio::{signal, task::JoinSet, time::interval};
+    use tokio::{runtime::Handle, signal, task::JoinSet, time::interval};
     use tracing::{debug, info, warn};
+
+    /// Cross-transport subscriber message carried over per-stream
+    /// mpsc channels. Each transport (hop ipc-channel, local unix
+    /// socket) owns its own forwarder task that drains the channel
+    /// and converts to its wire format. ingest_event and
+    /// ingest_end_event are transport-agnostic — they fan out
+    /// SubscriberMsgs without caring how each gets to the subscriber.
+    #[derive(Debug, Clone)]
+    pub(crate) enum SubscriberMsg {
+        Frame(TapStreamFrame),
+        Close(Option<String>),
+    }
+
+    /// Daemon-shared registry of active stream subscribers, keyed
+    /// by stream_id. Each entry's mpsc::UnboundedSender goes to a
+    /// transport-specific forwarder task that converts SubscriberMsg
+    /// to the right wire format.
+    pub(crate) type StreamsMap =
+        Arc<Mutex<HashMap<u64, mpsc::UnboundedSender<SubscriberMsg>>>>;
 
     // Phase 1.8g replaced the rolling-byte replay buffer with a
     // deterministic grid walk in `render_grid_to_bytes`. The
@@ -696,6 +724,8 @@ mod linux {
 
         let sessions: SessionTable = Arc::new(Mutex::new(HashMap::new()));
         let writer: WriterSlot = Arc::new(Mutex::new(None));
+        let streams: StreamsMap = Arc::new(Mutex::new(HashMap::new()));
+        let next_stream_id: Arc<AtomicU64> = Arc::new(AtomicU64::new(1));
 
         // Seed pre-existing sessions from /proc before readers start
         // pulling events. This way sessions that opened before the
@@ -728,7 +758,7 @@ mod linux {
             let cpu_id = *cpu_id;
             let mut buf = perf.open(cpu_id, Some(128)).context("perf open")?;
             let sessions = sessions.clone();
-            let writer = writer.clone();
+            let streams = streams.clone();
             readers.spawn(async move {
                 let mut bufs =
                     vec![BytesMut::with_capacity(core::mem::size_of::<PtyWriteEvent>()); 16];
@@ -745,7 +775,7 @@ mod linux {
                     }
                     for raw in bufs.iter().take(events.read) {
                         let event = unsafe { &*(raw.as_ptr() as *const PtyWriteEvent) };
-                        ingest_event(&sessions, &writer, cpu_id, event);
+                        ingest_event(&sessions, &streams, cpu_id, event);
                     }
                 }
             });
@@ -754,7 +784,7 @@ mod linux {
             let cpu_id = *cpu_id;
             let mut buf = perf_end.open(cpu_id, Some(8)).context("perf_end open")?;
             let sessions = sessions.clone();
-            let writer = writer.clone();
+            let streams = streams.clone();
             readers.spawn(async move {
                 let mut bufs =
                     vec![BytesMut::with_capacity(core::mem::size_of::<PtyEndEvent>()); 8];
@@ -771,7 +801,7 @@ mod linux {
                     }
                     for raw in bufs.iter().take(events.read) {
                         let event = unsafe { &*(raw.as_ptr() as *const PtyEndEvent) };
-                        ingest_end_event(&sessions, &writer, event);
+                        ingest_end_event(&sessions, &streams, event);
                     }
                 }
             });
@@ -794,15 +824,65 @@ mod linux {
         let ext_thread = if let Some(bootstrap) = args.bootstrap.clone() {
             let sessions = sessions.clone();
             let writer = writer.clone();
+            let streams = streams.clone();
+            let next_stream_id = next_stream_id.clone();
+            let rt_handle = Handle::current();
             let version = args.protocol_version.clone();
             Some(thread::spawn(move || {
-                if let Err(e) = run_extension(bootstrap, version, sessions, writer) {
+                if let Err(e) = run_extension(
+                    bootstrap,
+                    version,
+                    sessions,
+                    writer,
+                    streams,
+                    next_stream_id,
+                    rt_handle,
+                ) {
                     warn!(error = %e, "extension thread exited with error");
                 }
             }))
         } else {
             None
         };
+
+        // Always listen on the local Unix socket so the `tap` CLI
+        // works without hop. SO_PEERCRED gives us authoritative
+        // caller identity; we don't trust the client's claims.
+        let local_socket_path = args
+            .local_socket
+            .clone()
+            .unwrap_or_else(|| std::path::PathBuf::from("/run/hop-tap/local.sock"));
+        let local_sessions = sessions.clone();
+        let local_streams = streams.clone();
+        let local_next_id = next_stream_id.clone();
+        readers.spawn(async move {
+            let peer_for_uid = |uid: u32| -> PeerContext {
+                if uid == 0 {
+                    PeerContext {
+                        peer_id: format!("local:uid={uid}"),
+                        peer_username: Some("root".to_string()),
+                        peer_role: "creator".to_string(),
+                    }
+                } else {
+                    PeerContext {
+                        peer_id: format!("local:uid={uid}"),
+                        peer_username: lookup_username(uid),
+                        peer_role: "peer".to_string(),
+                    }
+                }
+            };
+            if let Err(e) = local::run_local_listener(
+                local_socket_path,
+                local_sessions,
+                local_streams,
+                local_next_id,
+                peer_for_uid,
+            )
+            .await
+            {
+                warn!(error = %e, "local listener exited");
+            }
+        });
 
         info!("hop-tap-d running; Ctrl-C to exit");
         signal::ctrl_c().await.context("ctrl-c")?;
@@ -831,6 +911,9 @@ mod linux {
         protocol_version: String,
         sessions: SessionTable,
         writer: WriterSlot,
+        streams: StreamsMap,
+        next_stream_id: Arc<AtomicU64>,
+        rt_handle: Handle,
     ) -> Result<()> {
         let (server, server_name) = IpcOneShotServer::<ExtMessage>::new()
             .context("creating ipc-channel server")?;
@@ -862,8 +945,6 @@ mod linux {
         // can write to the same hop connection.
         *writer.lock().expect("writer mutex poisoned") = Some(tx_to_hop.clone());
         info!("extension handshake complete");
-
-        let next_stream_id = AtomicU64::new(1);
 
         loop {
             let msg = match rx_from_hop.recv() {
@@ -906,7 +987,6 @@ mod linux {
                     peer_role,
                     payload,
                 } => {
-                    let stream_id = next_stream_id.fetch_add(1, Ordering::Relaxed);
                     let peer = PeerContext {
                         peer_id,
                         peer_username,
@@ -914,10 +994,12 @@ mod linux {
                     };
                     handle_stream_open(
                         &sessions,
+                        &streams,
+                        &next_stream_id,
+                        &rt_handle,
                         &tx_to_hop,
                         &peer,
                         request_id,
-                        stream_id,
                         &payload,
                     );
                 }
@@ -939,47 +1021,39 @@ mod linux {
     /// the `Initial` frame containing the session's recent byte
     /// history. If the request can't be served (decode failure or
     /// missing pty), reply with `StreamClosed { reason: ... }`.
-    fn handle_stream_open(
+    /// Result of a successful subscribe: the assigned stream_id
+    /// and the receiver each transport's forwarder drains. The
+    /// caller (hop extension or local socket handler) is
+    /// responsible for sending its transport-specific "stream
+    /// opened" message and spawning a forwarder.
+    pub(crate) struct SubscribeOk {
+        pub stream_id: u64,
+        pub rx: mpsc::UnboundedReceiver<SubscriberMsg>,
+    }
+
+    /// Validate access, allocate a stream_id, register the
+    /// subscriber, queue the Initial frame onto the channel.
+    /// Returns Err with a "no session with pty_index=N"-shaped
+    /// message on missing session OR forbidden access (same wording
+    /// for both, so callers can't enumerate other users' ptys by
+    /// probing).
+    pub(crate) fn register_subscriber(
         sessions: &SessionTable,
-        tx_to_hop: &IpcSender<ExtMessage>,
+        streams: &StreamsMap,
+        next_stream_id: &Arc<AtomicU64>,
         peer: &PeerContext,
-        request_id: u64,
-        stream_id: u64,
-        payload: &[u8],
-    ) {
-        let cfg = bincode::config::standard();
-        let req: TapStreamRequest = match bincode::serde::decode_from_slice(payload, cfg) {
-            Ok((req, _)) => req,
-            Err(e) => {
-                let _ = tx_to_hop.send(ExtMessage::StreamClosed {
-                    stream_id,
-                    reason: Some(format!("decode TapStreamRequest: {e}")),
-                });
-                return;
-            }
-        };
-        let TapStreamRequest::Subscribe { pty_index } = req;
+        pty_index: i32,
+    ) -> Result<SubscribeOk, String> {
+        let stream_id = next_stream_id.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = mpsc::unbounded_channel::<SubscriberMsg>();
 
         let initial = {
             let mut table = sessions.lock().expect("session table mutex poisoned");
             let Some(state) = table.get_mut(&pty_index) else {
-                drop(table);
-                let _ = tx_to_hop.send(ExtMessage::StreamClosed {
-                    stream_id,
-                    reason: Some(format!("no session with pty_index={pty_index}")),
-                });
-                return;
+                return Err(format!("no session with pty_index={pty_index}"));
             };
-            // Authorization gate. Same wording as the snapshot
-            // denial so peers can't enumerate other users' ptys
-            // by probing.
             if !peer.scope_allows(state) {
-                drop(table);
-                let _ = tx_to_hop.send(ExtMessage::StreamClosed {
-                    stream_id,
-                    reason: Some(format!("no session with pty_index={pty_index}")),
-                });
-                return;
+                return Err(format!("no session with pty_index={pty_index}"));
             }
             state.subscribers.push(stream_id);
             TapStreamFrame::Initial {
@@ -989,42 +1063,146 @@ mod linux {
             }
         };
 
-        if tx_to_hop
-            .send(ExtMessage::StreamOpened {
-                request_id,
-                stream_id,
-            })
-            .is_err()
-        {
-            return;
-        }
-        let frame_bytes = match bincode::serde::encode_to_vec(&initial, cfg) {
-            Ok(b) => b,
+        // Pre-queue the Initial frame so the forwarder writes it
+        // first. Send is infallible here — we just created the
+        // receiver and haven't given it away yet.
+        let _ = tx.send(SubscriberMsg::Frame(initial));
+
+        streams
+            .lock()
+            .expect("streams mutex poisoned")
+            .insert(stream_id, tx);
+        info!(stream_id, pty_index, "stream subscribed");
+        Ok(SubscribeOk { stream_id, rx })
+    }
+
+    /// Hop-side stream open: decode the TapStreamRequest payload,
+    /// register the subscriber, send StreamOpened, then spawn a
+    /// forwarder task that drains the SubscriberMsg channel and
+    /// converts each message to ExtMessage::StreamFrame /
+    /// StreamClosed.
+    fn handle_stream_open(
+        sessions: &SessionTable,
+        streams: &StreamsMap,
+        next_stream_id: &Arc<AtomicU64>,
+        rt_handle: &Handle,
+        tx_to_hop: &IpcSender<ExtMessage>,
+        peer: &PeerContext,
+        request_id: u64,
+        payload: &[u8],
+    ) {
+        let cfg = bincode::config::standard();
+        let req: TapStreamRequest = match bincode::serde::decode_from_slice(payload, cfg) {
+            Ok((req, _)) => req,
             Err(e) => {
+                // No stream_id allocated yet, but hop expects a
+                // close on the request_id. Reuse request_id as the
+                // synthetic stream_id for the failure case.
                 let _ = tx_to_hop.send(ExtMessage::StreamClosed {
-                    stream_id,
-                    reason: Some(format!("encode Initial: {e}")),
+                    stream_id: request_id,
+                    reason: Some(format!("decode TapStreamRequest: {e}")),
                 });
                 return;
             }
         };
-        let _ = tx_to_hop.send(ExtMessage::StreamFrame {
-            stream_id,
-            payload: frame_bytes,
-        });
-        info!(stream_id, pty_index, "stream subscribed");
+        let TapStreamRequest::Subscribe { pty_index } = req;
+
+        match register_subscriber(sessions, streams, next_stream_id, peer, pty_index) {
+            Err(reason) => {
+                let _ = tx_to_hop.send(ExtMessage::StreamClosed {
+                    stream_id: request_id,
+                    reason: Some(reason),
+                });
+            }
+            Ok(SubscribeOk { stream_id, rx }) => {
+                if tx_to_hop
+                    .send(ExtMessage::StreamOpened {
+                        request_id,
+                        stream_id,
+                    })
+                    .is_err()
+                {
+                    // hop hung up before we could open; drop the
+                    // subscriber.
+                    streams.lock().unwrap().remove(&stream_id);
+                    return;
+                }
+                let tx_clone = tx_to_hop.clone();
+                let streams = streams.clone();
+                let sessions = sessions.clone();
+                rt_handle.spawn(async move {
+                    forward_to_hop(stream_id, pty_index, rx, tx_clone, streams, sessions).await;
+                });
+            }
+        }
+    }
+
+    /// Hop-side per-stream forwarder. Drains the SubscriberMsg
+    /// channel and converts each to ExtMessage::StreamFrame or
+    /// StreamClosed. On any send error, exits; on receiver close
+    /// (channel dropped), exits with no further wire writes (other
+    /// side already saw the StreamClosed via Close path).
+    async fn forward_to_hop(
+        stream_id: u64,
+        pty_index: i32,
+        mut rx: mpsc::UnboundedReceiver<SubscriberMsg>,
+        tx_to_hop: IpcSender<ExtMessage>,
+        streams: StreamsMap,
+        sessions: SessionTable,
+    ) {
+        let cfg = bincode::config::standard();
+        while let Some(msg) = rx.recv().await {
+            match msg {
+                SubscriberMsg::Frame(frame) => {
+                    let payload = match bincode::serde::encode_to_vec(&frame, cfg) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            warn!(stream_id, "encode TapStreamFrame: {e}");
+                            break;
+                        }
+                    };
+                    if tx_to_hop
+                        .send(ExtMessage::StreamFrame { stream_id, payload })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                SubscriberMsg::Close(reason) => {
+                    let _ = tx_to_hop.send(ExtMessage::StreamClosed { stream_id, reason });
+                    break;
+                }
+            }
+        }
+        cleanup_stream(stream_id, pty_index, &streams, &sessions);
+    }
+
+    /// Remove a finished stream from the daemon's bookkeeping.
+    pub(crate) fn cleanup_stream(
+        stream_id: u64,
+        pty_index: i32,
+        streams: &StreamsMap,
+        sessions: &SessionTable,
+    ) {
+        streams
+            .lock()
+            .expect("streams mutex poisoned")
+            .remove(&stream_id);
+        if let Ok(mut table) = sessions.lock() {
+            if let Some(state) = table.get_mut(&pty_index) {
+                state.subscribers.retain(|&id| id != stream_id);
+            }
+        }
     }
 
     /// Handle a PtyEndEvent from the kernel. Removes the session
     /// (idempotent — the event fires once per side of a pty pair, so
     /// the second one for the same index naturally finds nothing to
     /// remove) and proactively closes any active stream subscribers
-    /// with `StreamClosed { reason: "session ended" }`.
-    fn ingest_end_event(sessions: &SessionTable, writer: &WriterSlot, event: &PtyEndEvent) {
-        // Snapshot subscribers inside the sessions lock, drop the
-        // session, release the lock, then take the writer lock to
-        // send StreamClosed. Same lock-ordering discipline as
-        // ingest_event.
+    /// by sending SubscriberMsg::Close on each subscriber's channel.
+    /// Each transport's forwarder picks that up and writes the right
+    /// wire-level Closed message.
+    fn ingest_end_event(sessions: &SessionTable, streams: &StreamsMap, event: &PtyEndEvent) {
         let subscribers: Vec<u64> = {
             let mut table = sessions.lock().expect("session table mutex poisoned");
             match table.remove(&event.pty_index) {
@@ -1044,13 +1222,10 @@ mod linux {
         if subscribers.is_empty() {
             return;
         }
-        let guard = writer.lock().expect("writer mutex poisoned");
-        if let Some(tx) = guard.as_ref() {
-            for stream_id in subscribers {
-                let _ = tx.send(ExtMessage::StreamClosed {
-                    stream_id,
-                    reason: Some("session ended".into()),
-                });
+        let guard = streams.lock().expect("streams mutex poisoned");
+        for stream_id in subscribers {
+            if let Some(tx) = guard.get(&stream_id) {
+                let _ = tx.send(SubscriberMsg::Close(Some("session ended".into())));
             }
         }
     }
@@ -1076,40 +1251,30 @@ mod linux {
         dim_change: Option<(u16, u16)>,
     }
 
-    /// Send `Output` and/or `Resize` frames to each subscriber. Drops
-    /// silently if the writer slot is unset (handshake hasn't run
-    /// yet, or the hop connection is gone) — in either case the
-    /// subscribers themselves are gone too.
-    fn fan_out(writer: &WriterSlot, f: FanOut) {
-        let cfg = bincode::config::standard();
-        let mut payloads: Vec<(u64, Vec<u8>)> = Vec::new();
-        if let Some((rows, cols)) = f.dim_change {
-            let frame = TapStreamFrame::Resize { rows, cols };
-            if let Ok(bytes) = bincode::serde::encode_to_vec(&frame, cfg) {
-                for &sid in &f.subscribers {
-                    payloads.push((sid, bytes.clone()));
-                }
-            }
-        }
-        if let Some(bytes) = f.live_bytes {
-            let frame = TapStreamFrame::Output(bytes);
-            if let Ok(b) = bincode::serde::encode_to_vec(&frame, cfg) {
-                for &sid in &f.subscribers {
-                    payloads.push((sid, b.clone()));
-                }
-            }
-        }
-        if payloads.is_empty() {
+    /// Fan out one event's frames to each subscribed stream. Looks
+    /// up each stream_id in the StreamsMap and sends via its
+    /// per-stream mpsc channel. Closed channels (subscriber
+    /// disconnected) just drop silently — the forwarder task
+    /// handles its own cleanup when it exits.
+    fn fan_out(streams: &StreamsMap, f: FanOut) {
+        if f.subscribers.is_empty() {
             return;
         }
-        let guard = writer.lock().expect("writer mutex poisoned");
-        if let Some(tx) = guard.as_ref() {
-            for (stream_id, payload) in payloads {
-                if tx
-                    .send(ExtMessage::StreamFrame { stream_id, payload })
-                    .is_err()
-                {
-                    warn!(stream_id, "stream frame send failed");
+        let mut to_emit: Vec<SubscriberMsg> = Vec::new();
+        if let Some((rows, cols)) = f.dim_change {
+            to_emit.push(SubscriberMsg::Frame(TapStreamFrame::Resize { rows, cols }));
+        }
+        if let Some(bytes) = f.live_bytes {
+            to_emit.push(SubscriberMsg::Frame(TapStreamFrame::Output(bytes)));
+        }
+        if to_emit.is_empty() {
+            return;
+        }
+        let guard = streams.lock().expect("streams mutex poisoned");
+        for &sid in &f.subscribers {
+            if let Some(tx) = guard.get(&sid) {
+                for msg in &to_emit {
+                    let _ = tx.send(msg.clone());
                 }
             }
         }
@@ -1178,7 +1343,7 @@ mod linux {
 
     fn ingest_event(
         sessions: &SessionTable,
-        writer: &WriterSlot,
+        streams: &StreamsMap,
         cpu_id: u32,
         event: &PtyWriteEvent,
     ) {
@@ -1256,7 +1421,7 @@ mod linux {
         };
 
         if let Some(f) = fanout {
-            fan_out(writer, f);
+            fan_out(streams, f);
         }
 
         let dir = direction_label(event.subtype);

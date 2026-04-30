@@ -10,7 +10,7 @@
 #   - If `hop` is not installed (or its daemon isn't running), this
 #     script first delegates to `https://hop.keik.ai/install-daemon.sh`
 #     to bring up hop, then continues.
-#   - Downloads the hop-tap-d daemon and hop-tap-probe binaries to
+#   - Downloads the hop-tap-d daemon and tap binaries to
 #     /usr/local/bin, drops a manifest at /etc/hop/extensions/tap-terminal.toml,
 #     installs a systemd unit, and starts the service.
 #   - Restarts hop afterwards so it picks up the new manifest.
@@ -20,7 +20,7 @@
 #   hop <host> tap snapshot <pty>   # current screen
 #   hop <host> tap watch <pty>      # live byte stream
 #
-# (or `hop-tap-probe` directly on the host for local development).
+# (or `tap` directly on the host for local development).
 
 set -euo pipefail
 
@@ -113,8 +113,8 @@ info "Installing hop-tap v${VERSION}"
 #
 # hop-tap can run two ways:
 #
-#   1. Standalone — hop-tap-d + hop-tap-probe locally on the host, no hop.
-#      List / snapshot / watch sessions through `hop-tap-probe`. No remote
+#   1. Standalone — hop-tap-d + tap locally on the host, no hop.
+#      List / snapshot / watch sessions through `tap`. No remote
 #      access, no peer auth — the only authorization is "you can read
 #      /run/hop-tap/bootstrap" (root-owned, mode 0600).
 #
@@ -138,7 +138,7 @@ if command -v hop >/dev/null 2>&1; then
   fi
 else
   info "hop is not installed — installing hop-tap in standalone mode."
-  info "Use hop-tap-probe directly on this host. To enable remote access,"
+  info "Use tap directly on this host. To enable remote access,"
   info "install hop (curl -fsSL ${HOP_BASE_URL}/install-daemon.sh | bash)"
   info "and re-run this installer."
 fi
@@ -146,17 +146,17 @@ fi
 # --- Download daemon + probe binaries + checksums ---------------------------
 
 DAEMON_NAME="hop-tap-d-linux-${ARCH}"
-PROBE_NAME="hop-tap-probe-linux-${ARCH}"
+TAP_NAME="tap-linux-${ARCH}"
 DAEMON_URL="${BASE_URL}/v${VERSION}/${DAEMON_NAME}"
-PROBE_URL="${BASE_URL}/v${VERSION}/${PROBE_NAME}"
+TAP_URL="${BASE_URL}/v${VERSION}/${TAP_NAME}"
 
 info "Downloading hop-tap-d..."
 fetch "${DAEMON_URL}" "${TMPDIR_HOPTAP}/hop-tap-d"
 fetch "${DAEMON_URL}.sha256" "${TMPDIR_HOPTAP}/hop-tap-d.sha256"
 
-info "Downloading hop-tap-probe..."
-fetch "${PROBE_URL}" "${TMPDIR_HOPTAP}/hop-tap-probe"
-fetch "${PROBE_URL}.sha256" "${TMPDIR_HOPTAP}/hop-tap-probe.sha256"
+info "Downloading tap..."
+fetch "${TAP_URL}" "${TMPDIR_HOPTAP}/tap"
+fetch "${TAP_URL}.sha256" "${TMPDIR_HOPTAP}/tap.sha256"
 
 # --- Verify checksums --------------------------------------------------------
 
@@ -179,14 +179,18 @@ verify_sha256() {
 
 info "Verifying checksums..."
 verify_sha256 "${TMPDIR_HOPTAP}/hop-tap-d" "${TMPDIR_HOPTAP}/hop-tap-d.sha256"
-verify_sha256 "${TMPDIR_HOPTAP}/hop-tap-probe" "${TMPDIR_HOPTAP}/hop-tap-probe.sha256"
+verify_sha256 "${TMPDIR_HOPTAP}/tap" "${TMPDIR_HOPTAP}/tap.sha256"
 
 # --- Install binaries --------------------------------------------------------
+#
+# `hop-tap-d` is the daemon (started by systemd, runs as root for
+# eBPF). `tap` is the user-facing CLI; SO_PEERCRED on the daemon's
+# local socket authenticates the caller.
 
-chmod +x "${TMPDIR_HOPTAP}/hop-tap-d" "${TMPDIR_HOPTAP}/hop-tap-probe"
-info "Installing hop-tap-d and hop-tap-probe to /usr/local/bin (sudo required)..."
+chmod +x "${TMPDIR_HOPTAP}/hop-tap-d" "${TMPDIR_HOPTAP}/tap"
+info "Installing hop-tap-d and tap to /usr/local/bin (sudo required)..."
 sudo mv "${TMPDIR_HOPTAP}/hop-tap-d" /usr/local/bin/hop-tap-d
-sudo mv "${TMPDIR_HOPTAP}/hop-tap-probe" /usr/local/bin/hop-tap-probe
+sudo mv "${TMPDIR_HOPTAP}/tap" /usr/local/bin/tap
 
 # --- Drop the extension manifest (only if hop is around) --------------------
 #
@@ -264,8 +268,14 @@ if [[ "${HOP_INTEGRATION}" == "registered" ]]; then
   printf "  ${BOLD}hop <host> tap watch <pty>${RESET}       # live byte stream\n\n"
 fi
 
-printf "Local access (no hop required):\n"
-printf "  ${BOLD}hop-tap-probe --bootstrap /run/hop-tap/bootstrap repl${RESET}\n\n"
+printf "Local access:\n"
+printf "  ${BOLD}tap list${RESET}                          # sessions you can see\n"
+printf "  ${BOLD}tap snapshot <pty>${RESET}                # current screen\n"
+printf "  ${BOLD}tap watch <pty>${RESET}                   # live byte stream\n"
+printf "  ${BOLD}tap repl${RESET}                          # interactive REPL\n\n"
+printf "  Permission model: root sees every session; non-root users\n"
+printf "  see only sessions opened by themselves. Authenticated by\n"
+printf "  SO_PEERCRED on the daemon's local socket (no claims trusted).\n\n"
 
 printf "Service control: ${BOLD}sudo systemctl status hop-tap${RESET}\n"
 printf "Logs:            ${BOLD}sudo journalctl -u hop-tap -f${RESET}\n"

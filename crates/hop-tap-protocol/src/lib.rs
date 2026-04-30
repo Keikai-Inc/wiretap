@@ -26,6 +26,8 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod local;
+
 /// Peer-initiated request. Carried inside `ExtMessage::Request.payload`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TapRequest {

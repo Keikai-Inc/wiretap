@@ -10,11 +10,12 @@ name = "hop-tap-d"
 path = "src/main.rs"
 
 [[bin]]
-# Test client used in lieu of a running hop daemon. Reads the
-# bootstrap rendezvous file, performs the Hello/HelloAck handshake,
-# and sends a single Tap subprotocol request, printing the response.
-name = "hop-tap-probe"
-path = "src/bin/probe.rs"
+# `tap` is the standalone CLI for the local audit utility.
+# Connects directly to /run/hop-tap/local.sock; SO_PEERCRED on the
+# daemon side authenticates the caller's uid (root sees all
+# sessions; non-root users see only their own).
+name = "tap"
+path = "src/bin/tap.rs"
 
 [dependencies]
 hop-tap-ebpf-common = { workspace = true, features = ["user"] }
