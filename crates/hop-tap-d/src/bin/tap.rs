@@ -57,6 +57,16 @@ enum Cmd {
         #[arg(value_name = "PTY")]
         pty: i32,
     },
+    /// Send a chat reply back to whoever is tapping your shell.
+    /// Run this from inside the captured session — the daemon uses
+    /// your controlling tty (kernel-authoritative) to identify
+    /// which session the reply belongs to. No tapper privilege
+    /// required; anyone can reply to whoever is observing them.
+    Reply {
+        /// Reply text. Wrap in quotes if it contains spaces.
+        #[arg(value_name = "MESSAGE")]
+        message: Vec<String>,
+    },
 }
 
 #[tokio::main]
@@ -94,7 +104,51 @@ async fn main() -> Result<()> {
             let mut conn = Conn::new(stream);
             one_shot(&mut conn, &mut next_id, TapRequest::List).await
         }
+        Cmd::Reply { message } => {
+            // Join multi-word messages with a single space — argv
+            // splitting via shell already removed the user's exact
+            // spacing, so canonicalise to one-space-between-words.
+            let message = message.join(" ");
+            if message.is_empty() {
+                bail!("tap reply: message text is empty");
+            }
+            let from = whoami_or_uid();
+            let mut conn = Conn::new(stream);
+            one_shot(
+                &mut conn,
+                &mut next_id,
+                TapRequest::Reply { from, message },
+            )
+            .await
+        }
     }
+}
+
+/// Best-effort caller name for the `from` field on outgoing
+/// messages. Reads `$USER` first (set by login), falls back to
+/// `getpwuid_r` (handles non-login shells), then to a literal
+/// "uid=N" string. The daemon trusts whatever string we send.
+fn whoami_or_uid() -> String {
+    if let Ok(u) = std::env::var("USER") {
+        if !u.is_empty() {
+            return u;
+        }
+    }
+    // SAFETY: getuid is signal-safe; fetched once at startup.
+    let uid = unsafe { libc::getuid() };
+    // Try a passwd lookup. getpwuid_r is the thread-safe form but
+    // its API is awkward; getpwuid is fine for our single-call use
+    // since the result lives only until the next libc call into
+    // pwent storage and we copy out immediately.
+    unsafe {
+        let pw = libc::getpwuid(uid);
+        if !pw.is_null() && !(*pw).pw_name.is_null() {
+            if let Ok(s) = std::ffi::CStr::from_ptr((*pw).pw_name).to_str() {
+                return s.to_string();
+            }
+        }
+    }
+    format!("uid={uid}")
 }
 
 /// Loop: pick a session in the TUI → connect to it → on detach
@@ -291,6 +345,17 @@ fn print_response(resp: &TapResponse) {
         // request_id elsewhere). Branch present only for
         // exhaustiveness.
         TapResponse::SubscriptionResized { .. } => {}
+        TapResponse::Replied { pty_index, subscribers } => {
+            if *subscribers == 0 {
+                eprintln!(
+                    "(no one is currently tapping pty {pty_index} — message not delivered)"
+                );
+            } else if *subscribers == 1 {
+                println!("reply delivered to 1 tapper");
+            } else {
+                println!("reply delivered to {subscribers} tappers");
+            }
+        }
         TapResponse::Error(msg) => eprintln!("error: {msg}"),
     }
 }
@@ -645,6 +710,46 @@ async fn connect(
                             }
                             TapStreamFrame::Resize { rows, cols } => {
                                 tracing::debug!(rows, cols, "captured-session resize");
+                            }
+                            TapStreamFrame::UserReply { from, message } => {
+                                // The captured user replied via
+                                // `tap reply`. Render it as an
+                                // overlay banner — yellow header
+                                // line, message in cyan, mirroring
+                                // the AdminMessage style we
+                                // already use for the other
+                                // direction (so it reads as a
+                                // chat-style exchange).
+                                //
+                                // Strip embedded escapes from the
+                                // payload defensively (the daemon
+                                // already strips control bytes,
+                                // but cheap to double-check).
+                                let safe_from: String = from
+                                    .chars()
+                                    .filter(|c| !c.is_control())
+                                    .take(64)
+                                    .collect();
+                                let safe_msg: String = message
+                                    .chars()
+                                    .map(|c| if c.is_control() && c != '\n' { ' ' } else { c })
+                                    .collect();
+                                let banner = format!(
+                                    "\r\n\x07\
+                                     \x1b[1;36;7m  reply: {safe_from}  \x1b[0m\r\n\
+                                     \x1b[1;36m  {safe_msg}\x1b[0m\r\n\
+                                     \r\n",
+                                );
+                                let _ = stdout.write_all(banner.as_bytes());
+                                set_window_title(&mut stdout, &info);
+                                if session_ready && matches!(mode, ConnectMode::Compose(_)) {
+                                    if let ConnectMode::Compose(buf) = &mode {
+                                        paint_compose_prompt(
+                                            &mut stdout, term_rows, term_cols, buf,
+                                        );
+                                    }
+                                }
+                                let _ = stdout.flush();
                             }
                         }
                     }

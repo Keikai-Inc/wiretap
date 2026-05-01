@@ -320,33 +320,40 @@ at(t + 0.45, JUNIOR, bob_prompt())
 at(t + 0.45, SENIOR, bob_prompt())
 t_after_active = t + 0.60
 
-# ── Junior: thanks via Ctrl-G ──
-t_thanks_open = t_after_active + 0.6
-at(t_thanks_open, JUNIOR,
-   f"\x1b[24;1H\x1b[K{REV}{YELLOW} bob > {RESET}{YELLOW}")
-at(t_thanks_open, SENIOR,
-   f"\x1b[24;1H\x1b[K{REV}{YELLOW} bob > {RESET}{YELLOW}")
-t = t_thanks_open + 0.3
-typed = "thanks! 🙏"
+# ── Junior: thanks via `tap reply` ──
+# Bob doesn't have a hidden "Ctrl-G to chat back" mode (that would
+# leak the fact he's being tapped to anyone who hits Ctrl-G in
+# their shell). Instead, bob runs `tap reply` — an explicit,
+# user-initiated subcommand that fans the message out to whoever
+# is observing his session. Available to anyone, no tapper
+# privilege required.
+t = t_after_active + 0.6
+typed = 'tap reply "thanks! 🙏"'
 for ch in typed:
     at(t, JUNIOR, ch)
     at(t, SENIOR, ch)
-    delay = (1.0 / 11) * (1 + random.uniform(-0.4, 0.4))
+    delay = (1.0 / 13) * (1 + random.uniform(-0.4, 0.4))
     t += max(0.02, delay)
-t_thanks_send = t + 0.4
-at(t_thanks_send, JUNIOR, RESET + "\x1b[24;1H\x1b[K")
-at(t_thanks_send, SENIOR, RESET + "\x1b[24;1H\x1b[K")
+at(t + 0.15, JUNIOR, "\r\n"); at(t + 0.15, SENIOR, "\r\n")
+# `tap reply` reports delivery on bob's stdout so he knows the
+# message went through.
+at(t + 0.30, JUNIOR, "reply delivered to 1 tapper\r\n")
+at(t + 0.30, SENIOR, "reply delivered to 1 tapper\r\n")
+at(t + 0.45, JUNIOR, bob_prompt())
+at(t + 0.45, SENIOR, bob_prompt())
+t_thanks_send = t + 0.55
 
+# Alice's tap CLI receives a UserReply frame and renders it as an
+# overlay banner — same shape as how bob saw alice's admin
+# message earlier, but in cyan so the direction reads at a glance.
 BOB_MSG = (
     "\r\n\x07"
-    f"{REV}{YELLOW}  user: bob  {RESET}\r\n"
-    f"{YELLOW}  thanks! 🙏{RESET}\r\n"
+    f"{REV}{CYAN}  reply: bob  {RESET}\r\n"
+    f"{CYAN}  thanks! 🙏{RESET}\r\n"
     "\r\n"
 )
-# Emit on senior side only — bob just sent it, so his pane shows the
-# compose flow rather than a received message.
-at(t_thanks_send + 0.10, SENIOR, BOB_MSG)
-at(t_thanks_send + 0.15, SENIOR, bob_prompt())
+at(t_thanks_send + 0.05, SENIOR, BOB_MSG)
+at(t_thanks_send + 0.10, SENIOR, bob_prompt())
 
 # ── Senior: detaches (Ctrl-T, no visible char), picker reappears ──
 t_detach = t_thanks_send + 1.4
@@ -356,8 +363,8 @@ emit_picker(
     preview_lines=[
         f"{GREEN}active{RESET}",
         bob_prompt(),
-        f"{REV}{YELLOW}  user: bob  {RESET}",
-        f"{YELLOW}  thanks! 🙏{RESET}",
+        f"{REV}{CYAN}  reply: bob  {RESET}",
+        f"{CYAN}  thanks! 🙏{RESET}",
         "",
         bob_prompt(),
     ],

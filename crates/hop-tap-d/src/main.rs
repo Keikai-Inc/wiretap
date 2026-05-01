@@ -1745,6 +1745,126 @@ mod linux {
             TapRequest::ResizeSubscription { stream_id, rows, cols } => {
                 handle_resize_subscription(sessions, streams, stream_id, rows, cols)
             }
+            TapRequest::Reply { from, message } => {
+                handle_reply(sessions, streams, peer, &from, &message)
+            }
+        }
+    }
+
+    /// Send a chat reply from the captured user back to whoever is
+    /// tapping their session.
+    ///
+    /// Auth model: the caller's controlling pty (kernel-authoritative
+    /// via SO_PEERCRED on the local socket) IS the session being
+    /// replied for. Anyone can run `tap reply` from their own shell;
+    /// they can't impersonate someone else's session because
+    /// PeerContext.controlling_pty is set by the kernel, not by the
+    /// caller.
+    ///
+    /// The reply is fanned out to every subscriber on that session
+    /// — tappers see each others' presence in this design (you'd
+    /// already see another tapper's renders in your own view if it
+    /// caused output, since the daemon's grid is shared). If no one
+    /// is currently tapping, the reply is a no-op (`subscribers: 0`).
+    fn handle_reply(
+        sessions: &SessionTable,
+        streams: &StreamsMap,
+        peer: &PeerContext,
+        from: &str,
+        message: &str,
+    ) -> TapResponse {
+        // Caller must have a controlling pty. Hop callers don't
+        // (their tty is on a different host); they shouldn't be
+        // sending Reply at all. Surface a clear error.
+        let pty_index = match peer.controlling_pty {
+            Some(idx) => idx,
+            None => {
+                return TapResponse::Error(
+                    "Reply requires a controlling tty (run from a captured shell)"
+                        .to_string(),
+                );
+            }
+        };
+
+        // Cap message length — same bound as AdminMessage so we
+        // don't let a hostile caller flood subscriber channels.
+        const MAX_MSG_BYTES: usize = 4096;
+        if message.len() > MAX_MSG_BYTES {
+            return TapResponse::Error(format!(
+                "Reply message too long: {} bytes (max {MAX_MSG_BYTES})",
+                message.len()
+            ));
+        }
+
+        // Strip control bytes from caller-supplied content. The frame
+        // is just data passed through to subscribers, but their CLIs
+        // will eventually render it to a terminal — we don't want
+        // bob's reply to embed escape sequences that screw up
+        // alice's view.
+        let safe_message: String = message
+            .chars()
+            .map(|c| if c.is_control() && c != '\n' { ' ' } else { c })
+            .collect();
+        let safe_from: String = from
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .filter(|c| !c.is_whitespace() || *c == ' ')
+            .take(64)
+            .collect();
+
+        // Snapshot subscribers list under the sessions lock; do the
+        // fanout under the streams lock. Lock order sessions→streams
+        // matches register_subscriber's pattern.
+        let subscribers: Vec<u64> = {
+            let table = sessions.lock().expect("session table mutex poisoned");
+            match table.get(&pty_index) {
+                Some(state) => state.subscribers.clone(),
+                None => {
+                    // Session table doesn't have an entry for the
+                    // caller's controlling pty — usually means the
+                    // daemon hasn't yet observed any output on that
+                    // pty (so it's not in the table). Treat as "no
+                    // tappers" rather than an error; the user would
+                    // otherwise see "your shell isn't being captured"
+                    // confusingly when no one is even watching.
+                    return TapResponse::Replied {
+                        pty_index,
+                        subscribers: 0,
+                    };
+                }
+            }
+        };
+
+        if subscribers.is_empty() {
+            return TapResponse::Replied {
+                pty_index,
+                subscribers: 0,
+            };
+        }
+
+        let frame = TapStreamFrame::UserReply {
+            from: safe_from,
+            message: safe_message,
+        };
+        let mut delivered = 0usize;
+        let map = streams.lock().expect("streams mutex poisoned");
+        for sid in &subscribers {
+            if let Some(rec) = map.get(sid) {
+                if rec.tx.send(SubscriberMsg::Frame(frame.clone())).is_ok() {
+                    delivered += 1;
+                }
+            }
+        }
+
+        info!(
+            pty_index,
+            delivered,
+            total = subscribers.len(),
+            "user reply fanned out"
+        );
+        TapResponse::Replied {
+            pty_index,
+            subscribers: delivered,
         }
     }
 

@@ -90,6 +90,24 @@ pub enum TapRequest {
         rows: u16,
         cols: u16,
     },
+    /// Send a chat message back to whoever is tapping the caller's
+    /// own session. The daemon uses the kernel-authoritative
+    /// controlling tty of the calling peer (from SO_PEERCRED on the
+    /// local socket) to identify which session to attribute the
+    /// reply to; subscribers of that session all receive a
+    /// `TapStreamFrame::UserReply` frame. No tapper privilege is
+    /// required — anyone can reply to whoever is observing them.
+    Reply {
+        /// Display name shown to subscribers as `[user: <name>]`.
+        /// Convention: caller fills in their local username; the
+        /// daemon trusts it (same trust model as AdminMessage's
+        /// `from` field; the kernel-authoritative uid is on the
+        /// PeerContext separately for any caller that wants to
+        /// cross-check).
+        from: String,
+        /// The reply text. UTF-8.
+        message: String,
+    },
 }
 
 /// Daemon's reply. Carried inside `ExtMessage::Response.payload`.
@@ -145,6 +163,13 @@ pub enum TapResponse {
         stream_id: u64,
         rows: u16,
         cols: u16,
+    },
+    /// Reply to a successful [`TapRequest::Reply`]. `subscribers` is
+    /// how many tappers received the reply — useful for the caller
+    /// to know whether anyone was actually listening.
+    Replied {
+        pty_index: i32,
+        subscribers: usize,
     },
     Error(String),
 }
@@ -258,4 +283,10 @@ pub enum TapStreamFrame {
     /// subscriber's viewport is unchanged — the daemon will keep
     /// rendering at the subscriber's size.
     Resize { rows: u16, cols: u16 },
+    /// The captured user replied via `tap reply`. Subscribers
+    /// receive this frame and can render it however they like
+    /// (typically as an overlay banner, mirroring how the captured
+    /// user sees admin messages). Multiple subscribers attached to
+    /// the same session all receive the same UserReply frame.
+    UserReply { from: String, message: String },
 }
