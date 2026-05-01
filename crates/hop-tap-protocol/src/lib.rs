@@ -77,6 +77,19 @@ pub enum TapRequest {
     /// real shell stays SIGSTOPped in the background so the swap is
     /// reversible. Same write-scope authorization as Inject.
     SetQuarantine { pty_index: i32, quarantined: bool },
+    /// Update an open subscription's viewport. The subscriber sends
+    /// this when its local terminal resizes (SIGWINCH); the daemon
+    /// updates the StreamRecord and triggers an immediate re-render
+    /// targeting the new dimensions, including a screen-clear so
+    /// any newly-revealed rows are clean instead of showing stale
+    /// content from before the resize. Replies with
+    /// `TapResponse::SubscriptionResized` on success or
+    /// `TapResponse::Error` if the stream_id isn't valid.
+    ResizeSubscription {
+        stream_id: u64,
+        rows: u16,
+        cols: u16,
+    },
 }
 
 /// Daemon's reply. Carried inside `ExtMessage::Response.payload`.
@@ -125,6 +138,13 @@ pub enum TapResponse {
         pty_index: i32,
         quarantined: bool,
         impostor_pid: Option<u32>,
+    },
+    /// Reply to a successful [`TapRequest::ResizeSubscription`].
+    /// Echoes the new dimensions for confirmation.
+    SubscriptionResized {
+        stream_id: u64,
+        rows: u16,
+        cols: u16,
     },
     Error(String),
 }

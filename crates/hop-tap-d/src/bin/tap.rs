@@ -285,6 +285,12 @@ fn print_response(resp: &TapResponse) {
                 println!("released pty={pty_index} from quarantine");
             }
         }
+        // SubscriptionResized is fire-and-forget from the connect
+        // loop; it never reaches print_response (it goes through
+        // the LocalMessage::Reply arm and is matched on
+        // request_id elsewhere). Branch present only for
+        // exhaustiveness.
+        TapResponse::SubscriptionResized { .. } => {}
         TapResponse::Error(msg) => eprintln!("error: {msg}"),
     }
 }
@@ -664,6 +670,11 @@ async fn connect(
                     set_window_title(&mut stdout, &info);
                 }
                 // Re-fetch terminal size in case the user resized.
+                // On change, push the new viewport to the daemon so
+                // it re-renders at the right dimensions; otherwise
+                // bob's pty content (still rendered at the old
+                // viewport) will wrap awkwardly in the new window
+                // and leave stale paint at the bottom.
                 if let Ok((c, r)) = crossterm::terminal::size() {
                     if (c, r) != (term_cols, term_rows) {
                         term_cols = c;
@@ -671,6 +682,22 @@ async fn connect(
                         if let ConnectMode::Compose(buf) = &mode {
                             paint_compose_prompt(&mut stdout, term_rows, term_cols, buf);
                         }
+                        // Fire-and-forget — daemon replies with
+                        // SubscriptionResized which we ignore.
+                        let resize_id = *next_id;
+                        *next_id += 1;
+                        let _ = send_local(
+                            &mut write_half,
+                            &LocalMessage::Call {
+                                request_id: resize_id,
+                                payload: TapRequest::ResizeSubscription {
+                                    stream_id,
+                                    rows: r,
+                                    cols: c,
+                                },
+                            },
+                        )
+                        .await;
                     }
                 }
                 let _ = stdout.flush();

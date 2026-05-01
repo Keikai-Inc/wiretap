@@ -169,7 +169,7 @@ async fn handle_connection(
                 request_id,
                 payload,
             } => {
-                let resp = handle_call(&sessions, &peer, payload);
+                let resp = handle_call(&sessions, &streams, &peer, payload);
                 let _ = out_tx.send(LocalMessage::Reply {
                     request_id,
                     payload: resp,
@@ -208,10 +208,11 @@ async fn handle_connection(
 
 fn handle_call(
     sessions: &super::SessionTable,
+    streams: &super::StreamsMap,
     peer: &super::PeerContext,
     req: TapRequest,
 ) -> TapResponse {
-    super::handle_tap_request(sessions, peer, req)
+    super::handle_tap_request(sessions, streams, peer, req)
 }
 
 fn handle_subscribe(

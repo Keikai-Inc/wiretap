@@ -424,53 +424,86 @@ mod linux {
     /// Skips `WIDE_CHAR_SPACER` cells (the placeholder column after
     /// a wide char) and steps the column cursor by 2 on the wide
     /// char itself.
+    /// Frame prelude — determines what the renderer emits before the
+    /// cell paint loop. Different attach/refresh scenarios need
+    /// different setup:
+    ///
+    /// - `Initial`: subscriber just attached. Clear primary screen,
+    ///   reset SGR, and if the captured grid is in alt-screen mode
+    ///   enter alt-screen on the subscriber too so subsequent live
+    ///   frames render onto the alt buffer (matching what the
+    ///   captured app expects).
+    /// - `Live`: subscriber already has prior content. Just home
+    ///   the cursor and reset SGR. Cells overwrite the previous
+    ///   frame's cells.
+    /// - `Resize`: subscriber's local terminal grew or shrank,
+    ///   possibly exposing rows we never painted (or hiding ones
+    ///   we did). Clear so newly-revealed rows don't show stale
+    ///   content; do NOT toggle alt-screen (subscriber is already
+    ///   wherever Initial put them).
+    enum FramePrelude {
+        Initial,
+        Live,
+        Resize,
+    }
+
     /// Render the captured pty's grid into bytes targeting a
     /// subscriber's terminal of `vp_rows × vp_cols`. The grid is
     /// **clipped** to the visible region (top-left intersection of
     /// captured-grid and subscriber-viewport): if the subscriber is
     /// smaller than bob's pty, only the top-left fits; if larger,
-    /// the extra space stays whatever it was (cleared on Initial,
-    /// untouched on Output frames).
-    ///
-    /// `initial = true` emits a screen-clear preamble so the
-    /// subscriber starts from a known state. `false` skips the
-    /// clear — used for live updates where each render overwrites
-    /// the prior render's cells in-place.
+    /// the extra space is cleared on Initial / Resize and left
+    /// untouched on Live frames.
     fn render_grid_for(
         state: &SessionState,
         vp_rows: u16,
         vp_cols: u16,
-        initial: bool,
+        prelude: FramePrelude,
     ) -> Vec<u8> {
         let render_lines = (state.dims.lines as u16).min(vp_rows.max(1)) as i32;
         let render_cols = (state.dims.cols as u16).min(vp_cols.max(1)) as usize;
         let mut out: Vec<u8> =
             Vec::with_capacity(render_lines as usize * render_cols * 8);
 
-        if initial {
-            // Clear primary screen first. If the captured session is
-            // currently using the alternate screen (vim, less, htop,
-            // mc, fzf — anything that does full-screen "take over
-            // the whole window"), enter the alt screen on the
-            // subscriber's side too before drawing. The matching
-            // `\x1b[?1049l` will arrive when the captured session
-            // exits alt screen normally — the daemon ingests the
-            // sequence into its grid mode flag, which the next
-            // Output frame won't touch directly but subscriber's
-            // terminal state will follow alt-screen toggles relayed
-            // explicitly. (For v1 we re-render and that's it; alt-
-            // screen exit on captured side just leaves subscriber in
-            // alt — small known limitation, fixed in Phase 2.)
-            out.extend_from_slice(b"\x1b[2J\x1b[H\x1b[0m");
-            if state.term.mode().contains(TermMode::ALT_SCREEN) {
-                out.extend_from_slice(b"\x1b[?1049h\x1b[2J\x1b[H");
+        match prelude {
+            FramePrelude::Initial => {
+                // Clear primary screen first. If the captured
+                // session is currently using the alternate screen
+                // (vim, less, htop, mc, fzf — anything that does
+                // full-screen "take over the whole window"), enter
+                // the alt screen on the subscriber's side too
+                // before drawing. The matching `\x1b[?1049l` will
+                // arrive when the captured session exits alt screen
+                // normally — the daemon ingests the sequence into
+                // its grid mode flag, which the next Output frame
+                // won't touch directly but subscriber's terminal
+                // state will follow alt-screen toggles relayed
+                // explicitly. (For v1 we re-render and that's it;
+                // alt-screen exit on captured side just leaves
+                // subscriber in alt — small known limitation,
+                // fixed in Phase 2.)
+                out.extend_from_slice(b"\x1b[2J\x1b[H\x1b[0m");
+                if state.term.mode().contains(TermMode::ALT_SCREEN) {
+                    out.extend_from_slice(b"\x1b[?1049h\x1b[2J\x1b[H");
+                }
             }
-        } else {
-            // Live frame: just home + reset attrs. We'll position
-            // the cursor explicitly per-row so partial updates land
-            // in the right place, and SGR resets ensure stale
-            // attributes from a prior frame don't bleed.
-            out.extend_from_slice(b"\x1b[H\x1b[0m");
+            FramePrelude::Resize => {
+                // Subscriber resized; their terminal may have
+                // newly-revealed rows showing stale pre-attach
+                // content, or hidden rows we last painted. Clear so
+                // we start clean. Don't toggle alt-screen — the
+                // subscriber is already in whichever mode Initial
+                // left them in, and Initial's `\x1b[?1049h` save-
+                // cursor would stack if re-entered.
+                out.extend_from_slice(b"\x1b[2J\x1b[H\x1b[0m");
+            }
+            FramePrelude::Live => {
+                // Live frame: just home + reset attrs. We position
+                // the cursor explicitly per-row so partial updates
+                // land in the right place, and SGR resets ensure
+                // stale attributes from a prior frame don't bleed.
+                out.extend_from_slice(b"\x1b[H\x1b[0m");
+            }
         }
 
         let grid = state.term.grid();
@@ -536,7 +569,7 @@ mod linux {
             state,
             state.dims.lines as u16,
             state.dims.cols as u16,
-            true,
+            FramePrelude::Initial,
         )
     }
 
@@ -1151,7 +1184,7 @@ mod linux {
                         // local-cycle / self-tap checks don't apply.
                         controlling_pty: None,
                     };
-                    let response_payload = serve_request(&sessions, &peer, &payload);
+                    let response_payload = serve_request(&sessions, &streams, &peer, &payload);
                     if tx_to_hop
                         .send(ExtMessage::Response {
                             request_id,
@@ -1297,7 +1330,7 @@ mod linux {
             // viewport. Initial = true emits the screen-clear
             // preamble so the subscriber starts from a known state.
             let replay_bytes =
-                render_grid_for(state, viewport_rows, viewport_cols, true);
+                render_grid_for(state, viewport_rows, viewport_cols, FramePrelude::Initial);
             TapStreamFrame::Initial {
                 rows: state.dims.lines as u16,
                 cols: state.dims.cols as u16,
@@ -1567,7 +1600,12 @@ mod linux {
     /// Decode a `TapRequest` from `payload`, run the handler, encode
     /// the `TapResponse`. Decode failures are surfaced as an error
     /// response so the peer always sees something well-formed.
-    fn serve_request(sessions: &SessionTable, peer: &PeerContext, payload: &[u8]) -> Vec<u8> {
+    fn serve_request(
+        sessions: &SessionTable,
+        streams: &StreamsMap,
+        peer: &PeerContext,
+        payload: &[u8],
+    ) -> Vec<u8> {
         let cfg = bincode::config::standard();
         let req: TapRequest = match bincode::serde::decode_from_slice(payload, cfg) {
             Ok((req, _)) => req,
@@ -1576,12 +1614,13 @@ mod linux {
                 return bincode::serde::encode_to_vec(&err, cfg).unwrap_or_default();
             }
         };
-        let resp = handle_tap_request(sessions, peer, req);
+        let resp = handle_tap_request(sessions, streams, peer, req);
         bincode::serde::encode_to_vec(&resp, cfg).unwrap_or_default()
     }
 
-    fn handle_tap_request(
+    pub(crate) fn handle_tap_request(
         sessions: &SessionTable,
+        streams: &StreamsMap,
         peer: &PeerContext,
         req: TapRequest,
     ) -> TapResponse {
@@ -1655,6 +1694,85 @@ mod linux {
             TapRequest::SetQuarantine { pty_index, quarantined } => {
                 handle_set_quarantine(sessions, peer, pty_index, quarantined)
             }
+            TapRequest::ResizeSubscription { stream_id, rows, cols } => {
+                handle_resize_subscription(sessions, streams, stream_id, rows, cols)
+            }
+        }
+    }
+
+    /// Update an open subscription's viewport and immediately push a
+    /// fresh full-grid render to the subscriber so any newly-revealed
+    /// rows are clean and any clipped content is re-clipped to the
+    /// new bounds.
+    ///
+    /// We don't gate on peer auth here: the stream_id was issued to
+    /// this peer at attach time and only they hold it. The worst a
+    /// malicious caller could do with a guessed stream_id is force
+    /// the legitimate subscriber's view to re-render at a different
+    /// size — annoying but not a privilege escalation.
+    fn handle_resize_subscription(
+        sessions: &SessionTable,
+        streams: &StreamsMap,
+        stream_id: u64,
+        rows: u16,
+        cols: u16,
+    ) -> TapResponse {
+        // Reject zero dims as ill-formed — render_grid_for handles
+        // 0 by clamping to 1, but a 1×1 viewport isn't useful and
+        // probably indicates a buggy caller. Better to error.
+        if rows == 0 || cols == 0 {
+            return TapResponse::Error(format!(
+                "ResizeSubscription: invalid viewport {cols}x{rows}"
+            ));
+        }
+
+        // Look up the target pty under the streams lock. Hold a
+        // clone of the tx so we can push the post-resize render
+        // without holding the streams lock during the render call.
+        let (target_pty, tx) = {
+            let mut map = streams.lock().expect("streams mutex poisoned");
+            let Some(rec) = map.get_mut(&stream_id) else {
+                return TapResponse::Error(format!(
+                    "ResizeSubscription: no such stream_id={stream_id}"
+                ));
+            };
+            rec.viewport_rows = rows;
+            rec.viewport_cols = cols;
+            (rec.target_pty, rec.tx.clone())
+        };
+
+        // Render at the new size with a clear-screen prelude so
+        // anything left over from the prior viewport is wiped.
+        let bytes = {
+            let table = sessions.lock().expect("session table mutex poisoned");
+            let Some(state) = table.get(&target_pty) else {
+                // Session went away between Subscribe and Resize.
+                // The subscriber's forwarder will see StreamClosed
+                // separately; just ack the size update.
+                return TapResponse::SubscriptionResized {
+                    stream_id,
+                    rows,
+                    cols,
+                };
+            };
+            render_grid_for(state, rows, cols, FramePrelude::Resize)
+        };
+
+        // Send the refresh frame. Channel-send is non-blocking; if
+        // the subscriber's already disconnected the send fails
+        // silently and the forwarder cleans up.
+        let _ = tx.send(SubscriberMsg::Frame(TapStreamFrame::Output(bytes)));
+
+        info!(
+            stream_id,
+            target_pty,
+            viewport = format!("{cols}x{rows}"),
+            "subscription resized"
+        );
+        TapResponse::SubscriptionResized {
+            stream_id,
+            rows,
+            cols,
         }
     }
 
@@ -2712,7 +2830,7 @@ mod linux {
                                     state,
                                     rec.viewport_rows,
                                     rec.viewport_cols,
-                                    false,
+                                    FramePrelude::Live,
                                 );
                                 Some((sid, bytes))
                             })
