@@ -209,23 +209,37 @@ emit_picker(
 )
 
 # ── Senior: presses Enter to attach ──
-# Repaint bob's screen state. Bob's pty currently has reload-failure
-# output, status output, and journalctl output — three commands worth.
-# To fit in 24 rows, keep the most recent journalctl block + the prompt
-# and drop the older status block.
-t_attach = 9.5
+# Both panes paint the same content at attach time, sourced from
+# one string so they're guaranteed to agree. Bob's pane is "fake
+# repainted" here — in real tap bob's terminal doesn't get
+# re-rendered when someone attaches. The marketing cast cares about
+# pane consistency more than simulating bob's terminal-emulator
+# scrollback. Without this, bob's accumulated wrap+scroll
+# divergences vs alice's clean snapshot are visible to viewers.
+#
+# Lines kept short enough to never wrap in 80 cols.
+t_attach = 11.5
+shared_screen = (
+    bob_prompt() + "sudo systemctl reload nginx\r\n"
+    + "Job for nginx.service failed (control process exit code).\r\n"
+    + "See: journalctl -xeu nginx.service\r\n"
+    + bob_prompt() + "sudo systemctl status nginx\r\n"
+    + f"{RED}×{RESET} nginx.service - A high performance web server\r\n"
+    + f"     Active: {RED}failed{RESET} (Result: exit-code)\r\n"
+    + "   Main PID: 4421 (code=exited, status=1/FAILURE)\r\n"
+    + bob_prompt() + "sudo journalctl -u nginx -n 3 --no-pager\r\n"
+    + "Apr 30 14:22:11 systemd[1]: Reloading nginx.service...\r\n"
+    + f"Apr 30 14:22:11 nginx[4421]: nginx: [{RED}emerg{RESET}] invalid value \"foo\" in site.conf:42\r\n"
+    + "Apr 30 14:22:11 systemd[1]: Reload failed for nginx.service.\r\n"
+    + bob_prompt()
+)
+# Bob's pane: clear and re-paint to the canonical state.
+at(t_attach, JUNIOR, "\x1b[2J\x1b[H")
+at(t_attach + 0.02, JUNIOR, shared_screen)
+# Alice's pane: same content, prefixed with the connect banner.
 attach_snapshot = (
     f"{DIM}[tap connect pty=7 bob@web-prod — Ctrl-T detach  Ctrl-G message]{RESET}\r\n"
-    + bob_prompt() + "sudo systemctl reload nginx\r\n"
-    + "Job for nginx.service failed because the control process exited with error code.\r\n"
-    + "See \"systemctl status nginx.service\" and \"journalctl -xeu nginx.service\" for details.\r\n"
-    + bob_prompt() + "sudo journalctl -u nginx -n 5 --no-pager\r\n"
-    + "Apr 30 14:22:11 web-prod systemd[1]: Reloading nginx.service...\r\n"
-    + "Apr 30 14:22:11 web-prod nginx[4421]: nginx: the configuration file /etc/nginx/nginx.conf syntax is\r\n"
-    + f"Apr 30 14:22:11 web-prod nginx[4421]: nginx: [emerg] invalid value \"foo\" in /etc/nginx/conf.d/site.conf:42\r\n"
-    + "Apr 30 14:22:11 web-prod systemd[1]: nginx.service: Control process exited, code=exited, status=1\r\n"
-    + "Apr 30 14:22:11 web-prod systemd[1]: Reload failed for nginx.service.\r\n"
-    + bob_prompt()
+    + shared_screen
 )
 at(t_attach, SENIOR, "\x1b[2J\x1b[H")
 at(t_attach + 0.05, SENIOR, attach_snapshot)
@@ -356,7 +370,10 @@ at(t_thanks_send + 0.05, SENIOR, BOB_MSG)
 at(t_thanks_send + 0.10, SENIOR, bob_prompt())
 
 # ── Senior: detaches (Ctrl-T, no visible char), picker reappears ──
-t_detach = t_thanks_send + 1.4
+# Hold on the reply banner for ~3.5s so viewers actually register
+# it — 1.4s before picker takeover was below conscious-perception
+# threshold for many people, especially at the end of a long demo.
+t_detach = t_thanks_send + 3.5
 emit_picker(
     t_detach,
     highlight_bob=True,
