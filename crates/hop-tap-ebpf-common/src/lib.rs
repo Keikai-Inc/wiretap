@@ -17,7 +17,27 @@
 // when slicing the destination buffer for `bpf_probe_read_kernel_buf`.
 // Larger writes are truncated at this length and `PtyWriteEvent::total_len`
 // records the original `count` so userspace can flag truncation.
-pub const MAX_CHUNK: usize = 128;
+//
+// Sized at 4 KiB to cover the bulk of real-world pty writes — vim / nvim
+// startup splashes (~700-1500 B), htop full-screen redraws at 80x24
+// (~3-4 KiB with SGR runs), tmux pane repaints. The 128 B previous
+// value silently chopped vim's splash mid-paint; subscribers saw only
+// the first few cursor moves and the `~` column from a small follow-up
+// write, with the centered welcome text completely missing.
+//
+// The slot is held in a `PerCpuArray<PtyWriteEvent>` (see
+// `EVENT_SCRATCH` in the eBPF program), so this size doesn't pressure
+// the 512 B BPF stack — only the per-CPU scratch and the perf-event
+// ring buffer. The buffer is 128 pages (~512 KiB) per CPU, so at 4 KiB
+// per event we can still queue ~120 in-flight events per CPU before
+// the kernel starts dropping them.
+//
+// If apps doing single writes > 4 KiB show truncation symptoms in
+// practice, bump further (8 KiB or 16 KiB are both fine — verifier and
+// memory budget are forgiving). A more involved alternative is
+// chunked events with offsets reassembled in userspace, but uniform
+// sizing is simpler and pty traffic isn't bandwidth-constrained.
+pub const MAX_CHUNK: usize = 4096;
 
 // PTY subtype constants from `include/uapi/linux/tty.h`. Matched
 // against `tty_struct.driver.subtype` to tag direction:
