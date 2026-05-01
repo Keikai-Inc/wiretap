@@ -9,6 +9,8 @@
 
 pub mod extension;
 pub mod protocol;
+pub mod query_filter;
+pub mod responder;
 
 #[cfg(target_os = "linux")]
 pub mod honeypot;

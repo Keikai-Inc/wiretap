@@ -83,6 +83,7 @@ mod linux {
     use hop_tap_d::protocol::{
         SessionInfo, TapRequest, TapResponse, TapStreamFrame, TapStreamRequest,
     };
+    use hop_tap_d::query_filter;
     use tokio::sync::mpsc;
     use alacritty_terminal::{
         event::VoidListener,
@@ -2581,7 +2582,18 @@ mod linux {
                     if state.subscribers.is_empty() {
                         None
                     } else {
-                        Some(event.data[..captured].to_vec())
+                        // Strip captured-app queries (DA1/DA2/DSR/
+                        // DECRQM/OSC color queries/CSI t reports/etc.)
+                        // before broadcasting. Bob's actual terminal at
+                        // the master end of the pty answered them
+                        // already; we don't want subscribers' local
+                        // terminals to *also* answer (their answers
+                        // would race back via Inject and corrupt the
+                        // captured app's input stream as `:RRRR/GGGG/
+                        // BBBB`-style ex-mode garbage). See
+                        // `query_filter.rs` and
+                        // `docs/render-only-architecture.md`.
+                        Some(query_filter::strip_queries(&event.data[..captured]))
                     }
                 }
                 PTY_TYPE_MASTER => {
