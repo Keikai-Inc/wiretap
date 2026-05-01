@@ -505,11 +505,31 @@ mod linux {
             FramePrelude::Resize => {
                 // Subscriber resized; their terminal may have
                 // newly-revealed rows showing stale pre-attach
-                // content, or hidden rows we last painted. Clear so
-                // we start clean. Don't toggle alt-screen — the
-                // subscriber is already in whichever mode Initial
-                // left them in, and Initial's `\x1b[?1049h` save-
-                // cursor would stack if re-entered.
+                // content, scroll regions left over from the
+                // previous size, or screen-mode state that doesn't
+                // match bob's grid (alt-screen toggled since
+                // attach). Be aggressive: reset scroll region,
+                // force the screen mode to match bob's grid, clear,
+                // home, reset attrs.
+                //
+                // \x1b[r resets DECSTBM (top/bottom margins) — a
+                // previously-set scroll region from bob's grid
+                // (e.g. vim setting one for status-line freezing)
+                // would otherwise apply to alice's render after
+                // resize, confining cells to a region smaller than
+                // her viewport.
+                //
+                // \x1b[?1049h/l forces alice's terminal to bob's
+                // current alt-screen state. Idempotent if already
+                // there. This is the bit that fixes the "alice
+                // resizes after bob exited alt-screen → garbled
+                // mode mismatch" case.
+                out.extend_from_slice(b"\x1b[r");
+                if state.term.mode().contains(TermMode::ALT_SCREEN) {
+                    out.extend_from_slice(b"\x1b[?1049h");
+                } else {
+                    out.extend_from_slice(b"\x1b[?1049l");
+                }
                 out.extend_from_slice(b"\x1b[2J\x1b[H\x1b[0m");
             }
             FramePrelude::Live => {
