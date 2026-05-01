@@ -83,7 +83,6 @@ mod linux {
     use hop_tap_d::protocol::{
         SessionInfo, TapRequest, TapResponse, TapStreamFrame, TapStreamRequest,
     };
-    use hop_tap_d::query_filter;
     use tokio::sync::mpsc;
     use alacritty_terminal::{
         event::VoidListener,
@@ -142,6 +141,14 @@ mod linux {
         pub tx: mpsc::UnboundedSender<SubscriberMsg>,
         pub peer_controlling_pty: Option<i32>,
         pub target_pty: i32,
+        /// Subscriber's local terminal viewport size. Live frames
+        /// are rendered to these dimensions: clipped to the top-
+        /// left when the captured pty is larger, padded otherwise.
+        /// Zero means "unknown" — daemon falls back to the captured
+        /// pty's dims and the subscriber's terminal absorbs any
+        /// mismatch.
+        pub viewport_rows: u16,
+        pub viewport_cols: u16,
     }
 
     /// Daemon-shared registry of active stream subscribers, keyed
@@ -417,37 +424,62 @@ mod linux {
     /// Skips `WIDE_CHAR_SPACER` cells (the placeholder column after
     /// a wide char) and steps the column cursor by 2 on the wide
     /// char itself.
-    fn render_grid_to_bytes(state: &SessionState) -> Vec<u8> {
-        let mut out: Vec<u8> = Vec::with_capacity(state.dims.cols * state.dims.lines * 8);
-        // Always start by resetting the receiver's primary screen.
-        out.extend_from_slice(b"\x1b[2J\x1b[H\x1b[0m");
+    /// Render the captured pty's grid into bytes targeting a
+    /// subscriber's terminal of `vp_rows × vp_cols`. The grid is
+    /// **clipped** to the visible region (top-left intersection of
+    /// captured-grid and subscriber-viewport): if the subscriber is
+    /// smaller than bob's pty, only the top-left fits; if larger,
+    /// the extra space stays whatever it was (cleared on Initial,
+    /// untouched on Output frames).
+    ///
+    /// `initial = true` emits a screen-clear preamble so the
+    /// subscriber starts from a known state. `false` skips the
+    /// clear — used for live updates where each render overwrites
+    /// the prior render's cells in-place.
+    fn render_grid_for(
+        state: &SessionState,
+        vp_rows: u16,
+        vp_cols: u16,
+        initial: bool,
+    ) -> Vec<u8> {
+        let render_lines = (state.dims.lines as u16).min(vp_rows.max(1)) as i32;
+        let render_cols = (state.dims.cols as u16).min(vp_cols.max(1)) as usize;
+        let mut out: Vec<u8> =
+            Vec::with_capacity(render_lines as usize * render_cols * 8);
 
-        // If the captured session is currently using the alternate
-        // screen (vim, less, htop, mc, fzf — anything that does
-        // full-screen "take over the whole window"), put the
-        // receiver into the alt screen too before drawing. Otherwise
-        // the receiver would render vim's content onto its primary
-        // screen, and the eventual `\x1b[?1049l` from the live
-        // stream would leave them in a confused state with vim
-        // leftovers visible.
-        //
-        // `\x1b[?1049h` is xterm's combined "save cursor + enter
-        // alt screen + clear alt screen". The matching exit will
-        // arrive in the live byte stream when the captured session
-        // exits alt screen normally.
-        let in_alt = state.term.mode().contains(TermMode::ALT_SCREEN);
-        if in_alt {
-            out.extend_from_slice(b"\x1b[?1049h\x1b[2J\x1b[H");
+        if initial {
+            // Clear primary screen first. If the captured session is
+            // currently using the alternate screen (vim, less, htop,
+            // mc, fzf — anything that does full-screen "take over
+            // the whole window"), enter the alt screen on the
+            // subscriber's side too before drawing. The matching
+            // `\x1b[?1049l` will arrive when the captured session
+            // exits alt screen normally — the daemon ingests the
+            // sequence into its grid mode flag, which the next
+            // Output frame won't touch directly but subscriber's
+            // terminal state will follow alt-screen toggles relayed
+            // explicitly. (For v1 we re-render and that's it; alt-
+            // screen exit on captured side just leaves subscriber in
+            // alt — small known limitation, fixed in Phase 2.)
+            out.extend_from_slice(b"\x1b[2J\x1b[H\x1b[0m");
+            if state.term.mode().contains(TermMode::ALT_SCREEN) {
+                out.extend_from_slice(b"\x1b[?1049h\x1b[2J\x1b[H");
+            }
+        } else {
+            // Live frame: just home + reset attrs. We'll position
+            // the cursor explicitly per-row so partial updates land
+            // in the right place, and SGR resets ensure stale
+            // attributes from a prior frame don't bleed.
+            out.extend_from_slice(b"\x1b[H\x1b[0m");
         }
 
         let grid = state.term.grid();
-        let dims = state.dims;
         let mut last_attrs: Option<(Color, Color, Flags)> = None;
 
-        for line_idx in 0..dims.lines as i32 {
+        for line_idx in 0..render_lines {
             let _ = write!(out, "\x1b[{};1H", line_idx + 1);
             let mut col = 0usize;
-            while col < dims.cols {
+            while col < render_cols {
                 let p = Point::new(Line(line_idx), Column(col));
                 let cell = &grid[p];
 
@@ -471,19 +503,41 @@ mod linux {
 
                 col += if cell.flags.contains(Flags::WIDE_CHAR) { 2 } else { 1 };
             }
+            // Erase to end of line: clears any prior content that
+            // extended past the captured grid's columns (e.g. when
+            // the subscriber is wider than the captured pty and the
+            // previous render painted further). Cheap; no flicker.
+            if (render_cols as u16) < vp_cols {
+                out.extend_from_slice(b"\x1b[K");
+            }
         }
 
-        // Final reset and cursor placement.
+        // Final reset and cursor placement. If bob's cursor sits
+        // outside the subscriber's viewport (smaller subscriber, or
+        // in a row/col we clipped), don't move the cursor — leave
+        // it wherever the last cell write landed.
         out.extend_from_slice(b"\x1b[0m");
         let cursor_pt = grid.cursor.point;
-        let _ = write!(
-            out,
-            "\x1b[{};{}H",
-            cursor_pt.line.0 + 1,
-            cursor_pt.column.0 + 1
-        );
+        let crow = cursor_pt.line.0 + 1;
+        let ccol = cursor_pt.column.0 + 1;
+        if (crow as u16) <= vp_rows && (ccol as u16) <= vp_cols {
+            let _ = write!(out, "\x1b[{crow};{ccol}H");
+        }
 
         out
+    }
+
+    /// Convenience: render the grid at its native dimensions. Used
+    /// for log dumps and tests; live broadcasts go through
+    /// `render_grid_for` with each subscriber's actual viewport.
+    #[allow(dead_code)]
+    fn render_grid_to_bytes(state: &SessionState) -> Vec<u8> {
+        render_grid_for(
+            state,
+            state.dims.lines as u16,
+            state.dims.cols as u16,
+            true,
+        )
     }
 
     /// Emit an SGR sequence that establishes `cell`'s attributes
@@ -1177,6 +1231,8 @@ mod linux {
         next_stream_id: &Arc<AtomicU64>,
         peer: &PeerContext,
         pty_index: i32,
+        viewport_rows: u16,
+        viewport_cols: u16,
     ) -> Result<SubscribeOk, String> {
         // Self-tap: peer's own controlling tty is the target. Refuse
         // with the same not-found wording so we don't leak whether
@@ -1212,6 +1268,22 @@ mod linux {
         let stream_id = next_stream_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = mpsc::unbounded_channel::<SubscriberMsg>();
 
+        // Normalize viewport: 0/0 from a caller that didn't send
+        // dims falls back to the captured pty's own size, which
+        // gives a no-op clip and renders the full grid (matches
+        // pre-Phase-1.10 behaviour). Storing the normalised value
+        // means render_grid_for never has to special-case zero.
+        let (viewport_rows, viewport_cols) = {
+            let table = sessions.lock().expect("session table mutex poisoned");
+            let Some(state) = table.get(&pty_index) else {
+                return Err(format!("no session with pty_index={pty_index}"));
+            };
+            (
+                if viewport_rows == 0 { state.dims.lines as u16 } else { viewport_rows },
+                if viewport_cols == 0 { state.dims.cols as u16 } else { viewport_cols },
+            )
+        };
+
         let initial = {
             let mut table = sessions.lock().expect("session table mutex poisoned");
             let Some(state) = table.get_mut(&pty_index) else {
@@ -1221,10 +1293,15 @@ mod linux {
                 return Err(format!("no session with pty_index={pty_index}"));
             }
             state.subscribers.push(stream_id);
+            // Render the captured pty's grid for the subscriber's
+            // viewport. Initial = true emits the screen-clear
+            // preamble so the subscriber starts from a known state.
+            let replay_bytes =
+                render_grid_for(state, viewport_rows, viewport_cols, true);
             TapStreamFrame::Initial {
                 rows: state.dims.lines as u16,
                 cols: state.dims.cols as u16,
-                replay_bytes: render_grid_to_bytes(state),
+                replay_bytes,
             }
         };
 
@@ -1242,9 +1319,16 @@ mod linux {
                     tx,
                     peer_controlling_pty: peer.controlling_pty,
                     target_pty: pty_index,
+                    viewport_rows,
+                    viewport_cols,
                 },
             );
-        info!(stream_id, pty_index, "stream subscribed");
+        info!(
+            stream_id,
+            pty_index,
+            viewport = format!("{viewport_cols}x{viewport_rows}"),
+            "stream subscribed"
+        );
         Ok(SubscribeOk { stream_id, rx })
     }
 
@@ -1277,9 +1361,21 @@ mod linux {
                 return;
             }
         };
-        let TapStreamRequest::Subscribe { pty_index } = req;
+        let TapStreamRequest::Subscribe {
+            pty_index,
+            viewport_rows,
+            viewport_cols,
+        } = req;
 
-        match register_subscriber(sessions, streams, next_stream_id, peer, pty_index) {
+        match register_subscriber(
+            sessions,
+            streams,
+            next_stream_id,
+            peer,
+            pty_index,
+            viewport_rows,
+            viewport_cols,
+        ) {
             Err(reason) => {
                 let _ = tx_to_hop.send(ExtMessage::StreamClosed {
                     stream_id: request_id,
@@ -1420,11 +1516,15 @@ mod linux {
     /// same time).
     struct FanOut {
         subscribers: Vec<u64>,
-        /// Some(bytes) if this event carried slave→master output to
-        /// forward; None for input or empty events.
-        live_bytes: Option<Vec<u8>>,
-        /// Some((rows, cols)) if the kernel-reported dimensions
-        /// changed on this event.
+        /// Per-subscriber rendered Output frames. Each (stream_id,
+        /// bytes) pair was produced by `render_grid_for` against
+        /// that subscriber's viewport; the bytes go directly to
+        /// that subscriber's channel. None when this event didn't
+        /// produce captured output (input events, or no subscribers).
+        per_subscriber_renders: Option<Vec<(u64, Vec<u8>)>>,
+        /// Some((rows, cols)) if the captured pty's kernel-reported
+        /// dimensions changed on this event. Sent to all subscribers
+        /// as informational — their viewports are independent.
         dim_change: Option<(u16, u16)>,
     }
 
@@ -1437,21 +1537,28 @@ mod linux {
         if f.subscribers.is_empty() {
             return;
         }
-        let mut to_emit: Vec<SubscriberMsg> = Vec::new();
-        if let Some((rows, cols)) = f.dim_change {
-            to_emit.push(SubscriberMsg::Frame(TapStreamFrame::Resize { rows, cols }));
-        }
-        if let Some(bytes) = f.live_bytes {
-            to_emit.push(SubscriberMsg::Frame(TapStreamFrame::Output(bytes)));
-        }
-        if to_emit.is_empty() {
-            return;
-        }
         let guard = streams.lock().expect("streams mutex poisoned");
-        for &sid in &f.subscribers {
-            if let Some(rec) = guard.get(&sid) {
-                for msg in &to_emit {
-                    let _ = rec.tx.send(msg.clone());
+
+        // Resize frames are informational and go to every subscriber
+        // unchanged — the captured pty's dims, not the subscriber's
+        // viewport.
+        if let Some((rows, cols)) = f.dim_change {
+            let resize = SubscriberMsg::Frame(TapStreamFrame::Resize { rows, cols });
+            for &sid in &f.subscribers {
+                if let Some(rec) = guard.get(&sid) {
+                    let _ = rec.tx.send(resize.clone());
+                }
+            }
+        }
+
+        // Each rendered Output frame is per-subscriber; route to the
+        // matching stream_id.
+        if let Some(renders) = f.per_subscriber_renders {
+            for (sid, bytes) in renders {
+                if let Some(rec) = guard.get(&sid) {
+                    let _ = rec
+                        .tx
+                        .send(SubscriberMsg::Frame(TapStreamFrame::Output(bytes)));
                 }
             }
         }
@@ -2574,7 +2681,16 @@ mod linux {
                 || state.dims.lines != prev_dims.lines)
                 .then_some((state.dims.lines as u16, state.dims.cols as u16));
 
-            let live_bytes: Option<Vec<u8>> = match event.subtype {
+            // Render-on-update: each subscriber receives a fresh
+            // re-render of the captured pty's grid clipped/padded to
+            // the subscriber's viewport, NOT the raw pty bytes.
+            // This decouples subscribers' terminal sizes from the
+            // captured pty's size and structurally prevents
+            // subscribers' terminals from seeing protocol queries
+            // (so they can't volunteer responses that would race
+            // back as keystroke garbage). See
+            // `docs/render-only-architecture.md`.
+            let per_subscriber_renders: Option<Vec<(u64, Vec<u8>)>> = match event.subtype {
                 PTY_TYPE_SLAVE => {
                     state.output_bytes += event.total_len as u64;
                     state.output_events += 1;
@@ -2582,18 +2698,27 @@ mod linux {
                     if state.subscribers.is_empty() {
                         None
                     } else {
-                        // Strip captured-app queries (DA1/DA2/DSR/
-                        // DECRQM/OSC color queries/CSI t reports/etc.)
-                        // before broadcasting. Bob's actual terminal at
-                        // the master end of the pty answered them
-                        // already; we don't want subscribers' local
-                        // terminals to *also* answer (their answers
-                        // would race back via Inject and corrupt the
-                        // captured app's input stream as `:RRRR/GGGG/
-                        // BBBB`-style ex-mode garbage). See
-                        // `query_filter.rs` and
-                        // `docs/render-only-architecture.md`.
-                        Some(query_filter::strip_queries(&event.data[..captured]))
+                        // Look up each subscriber's viewport under
+                        // the streams lock and render once per
+                        // subscriber. Lock order sessions→streams
+                        // matches register_subscriber's pattern.
+                        let map = streams.lock().expect("streams mutex poisoned");
+                        let renders: Vec<(u64, Vec<u8>)> = state
+                            .subscribers
+                            .iter()
+                            .filter_map(|&sid| {
+                                let rec = map.get(&sid)?;
+                                let bytes = render_grid_for(
+                                    state,
+                                    rec.viewport_rows,
+                                    rec.viewport_cols,
+                                    false,
+                                );
+                                Some((sid, bytes))
+                            })
+                            .collect();
+                        drop(map);
+                        Some(renders)
                     }
                 }
                 PTY_TYPE_MASTER => {
@@ -2618,15 +2743,15 @@ mod linux {
             };
 
             // Snapshot subscribers only when we actually have something
-            // to forward (live bytes OR a dim change). For sessions
+            // to forward (renders OR a dim change). For sessions
             // with no subscribers the hot path stays a single empty
             // check.
             if state.subscribers.is_empty() {
                 None
-            } else if live_bytes.is_some() || dim_change.is_some() {
+            } else if per_subscriber_renders.is_some() || dim_change.is_some() {
                 Some(FanOut {
                     subscribers: state.subscribers.clone(),
-                    live_bytes,
+                    per_subscriber_renders,
                     dim_change,
                 })
             } else {

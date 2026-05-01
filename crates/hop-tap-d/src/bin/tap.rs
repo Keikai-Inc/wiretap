@@ -437,7 +437,16 @@ async fn connect(
     // doesn't matter here.)
     let info = fetch_status_info(&mut read_half, &mut write_half, next_id, pty).await?;
 
-    // 1. Subscribe to the watch stream and confirm the daemon
+    // 1. Capture our local terminal size *before* subscribing. The
+    //    daemon renders bob's grid clipped/padded to these dims and
+    //    streams cell-positioned cells, not raw pty bytes — so the
+    //    daemon needs to know how big our viewport is up front.
+    //    Fall back to 80x24 if the size syscall fails (unlikely; tty
+    //    must be present for the subsequent raw-mode setup anyway).
+    let (vp_cols, vp_rows) =
+        crossterm::terminal::size().unwrap_or((80, 24));
+
+    // 2. Subscribe to the watch stream and confirm the daemon
     //    accepted it before we touch the local terminal. If the
     //    server rejects (no such pty, forbidden), we want a clean
     //    error rather than a tornado of raw-mode chaos.
@@ -447,7 +456,11 @@ async fn connect(
         &mut write_half,
         &LocalMessage::Subscribe {
             request_id: sub_request_id,
-            payload: TapStreamRequest::Subscribe { pty_index: pty },
+            payload: TapStreamRequest::Subscribe {
+                pty_index: pty,
+                viewport_rows: vp_rows,
+                viewport_cols: vp_cols,
+            },
         },
     )
     .await?;

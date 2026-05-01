@@ -72,12 +72,77 @@ daemon's `Term`**. Each boundary has exactly one terminal at the end:
   its responses for its own UI (picker, compose mode), never relays
   them anywhere
 
-## Phase 1: filter queries out of the subscriber broadcast (~80 lines)
+## Phase 1.10 (shipped): render-on-update — subscribers see cells, not raw bytes
 
-> **Earlier draft of this section proposed a daemon-side responder
-> that answered queries directly (~400 lines, similar to tmux's
+Phase 1 began as "filter captured-app queries from the broadcast"
+(closed the OSC color leak) but didn't fix subscribers having a
+different terminal size from the captured pty — vim's absolute
+cursor positioning to col 80 wraps badly when alice's terminal is
+only 60 cols wide.
+
+Phase 1.10 promotes Phase 1 to the architecturally correct shape:
+**subscribers no longer receive raw pty bytes. The daemon renders
+its alacritty grid into cell-positioned cursor + SGR + UTF-8
+targeting each subscriber's viewport, and broadcasts that.**
+
+Wire/code changes:
+
+- `TapStreamRequest::Subscribe` gains `viewport_rows`/`viewport_cols`
+  fields. The local `tap connect` CLI captures
+  `crossterm::terminal::size()` and includes it. Hop callers must do
+  the same.
+- `StreamRecord` stores the per-subscriber viewport.
+- `render_grid_for(state, vp_rows, vp_cols, initial)` walks the
+  daemon's grid, clipping to `min(captured_dims, viewport)` and
+  emitting one `\x1b[r;1H` cursor move per row + SGR-grouped UTF-8
+  cells. `initial=true` emits a `\x1b[2J\x1b[H` preamble (and an
+  alt-screen enter when the captured pty is in alt mode); live
+  frames skip the clear since each frame paints all visible cells.
+- `ingest_event`'s slave→master path now renders **per subscriber**
+  (lookup viewport under the streams lock, render once per stream)
+  instead of broadcasting raw bytes once.
+- `query_filter.rs` deleted. With subscribers no longer seeing raw
+  pty output, the captured app's queries can't reach their local
+  terminals; nothing to filter.
+
+What this fixes:
+
+- **Size mismatch** — small alice tapping a big bob no longer mis-
+  renders. Alice sees the top-left of bob's grid, clipped sensibly.
+- **Query leak class is now structural** — subscribers don't see
+  vim's OSC queries, DA1, DECRQM-private, etc., because they don't
+  see raw pty bytes at all. The query filter was a proxy for what
+  this change does properly.
+- **Truncation amplification** — when an eBPF-truncated batch lands
+  in the daemon, the grid is whatever-it-knows; render emits
+  whatever the grid currently says, which is at worst stale-by-one-
+  batch instead of "half a sequence written verbatim to alice's
+  terminal".
+
+What this v1 does *not* yet do:
+
+- **Diffs.** Every output batch produces a full re-render of the
+  visible region (~3-5 KiB at 80×24 with SGR runs, lower for
+  sparser content). Bandwidth is fine on local sockets and the hop
+  bridge; if a future profile shows it dominating, swap in a
+  per-subscriber shadow grid + dirty-cell diff. Code shape is the
+  same, just keep a previous-grid copy and emit only changed cells.
+- **Mid-session viewport resize.** If alice resizes her terminal
+  she needs to detach and reattach for the new size to take
+  effect. A `TapRequest::ResizeSubscription { stream_id, rows,
+  cols }` is the natural follow-up — ~30 lines, drop in any time.
+- **Alt-screen exit relay.** When the captured app exits alt screen
+  (`\x1b[?1049l`), the live render no longer emits raw bytes that
+  would propagate that. Subscribers stay in alt-screen mode until
+  they detach. Workaround for now: detach restores normal screen.
+  Phase 2 tracks mode flag transitions explicitly.
+
+### Earlier mis-step (kept for posterity)
+
+> The very first Phase 1 sketch proposed a daemon-side responder
+> that *answered* queries directly (~400 lines, similar to tmux's
 > `input.c`). That was wrong for our architecture and is recorded
-> in "Why we don't add a daemon-side responder" below.**
+> in "Why we don't add a daemon-side responder" below.
 
 ### What we actually do
 

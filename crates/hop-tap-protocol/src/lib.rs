@@ -185,7 +185,23 @@ pub struct SessionInfo {
 /// to subscribe to live updates from a specific session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TapStreamRequest {
-    Subscribe { pty_index: i32 },
+    /// Open a subscription to the captured pty's grid.
+    ///
+    /// `viewport_rows` / `viewport_cols` is the subscriber's local
+    /// terminal size. The daemon renders the captured pty's grid
+    /// clipped to (or padded out from) these dimensions and streams
+    /// cell-positioned cursor moves + SGR + UTF-8 — never raw pty
+    /// bytes from the captured session. That decouples the
+    /// subscriber's terminal size from the captured pty's size and
+    /// closes the class of bugs where the subscriber's terminal
+    /// volunteers protocol responses (OSC color queries, focus
+    /// events, mouse) that race back into the captured app's input
+    /// stream as keystrokes.
+    Subscribe {
+        pty_index: i32,
+        viewport_rows: u16,
+        viewport_cols: u16,
+    },
 }
 
 /// Carried inside `ExtMessage::StreamFrame.payload`. The first frame
@@ -193,29 +209,33 @@ pub enum TapStreamRequest {
 /// catches the subscriber up to current state; subsequent frames
 /// stream live as the session produces output.
 ///
-/// Wire fidelity is byte-level: `Output(bytes)` is the raw kernel-
-/// captured slave→master write, including any escape sequences. The
-/// subscriber writes those bytes to its own terminal verbatim and
-/// the receiving terminal interprets them — same path the original
-/// shell→pty bytes would take. No client-side emulator round-trip.
+/// Both `Initial::replay_bytes` and `Output(bytes)` carry rendered
+/// terminal output — cursor-positioned cells, SGR runs, UTF-8 —
+/// targeting the subscriber's viewport size. Subscribers write the
+/// bytes to their stdout verbatim. The bytes are *not* the raw
+/// captured pty stream; they're a re-render of the daemon's grid
+/// state for this specific subscriber's terminal dimensions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TapStreamFrame {
     /// Sent once, immediately after `StreamOpened`. Carries the
-    /// kernel's current view of the session's dimensions plus a
-    /// `replay_bytes` payload synthesised from the daemon's grid
-    /// state — write it to your terminal first so the screen is
-    /// in sync before live frames start arriving.
+    /// captured pty's dimensions (informational — what the captured
+    /// app thinks its window size is) plus `replay_bytes` rendered
+    /// to the subscriber's viewport. Write it to your terminal first
+    /// so the screen is in sync before live frames start arriving.
     Initial {
         rows: u16,
         cols: u16,
         replay_bytes: Vec<u8>,
     },
-    /// Live slave→master output bytes since the last frame. Written
-    /// verbatim to the subscriber's terminal.
+    /// A new full re-render of the captured pty's grid, clipped /
+    /// padded to the subscriber's viewport. Each frame paints all
+    /// visible cells; cursor moves position the writes at the right
+    /// row/col. Subscribers can dump this into their stdout without
+    /// any state tracking — every render is self-contained.
     Output(Vec<u8>),
-    /// The kernel-reported dimensions changed (TIOCSWINSZ). The
-    /// subscriber may or may not propagate this to its own terminal
-    /// — semantically it's "this is the size the underlying session
-    /// thinks it has," not "resize your viewport now."
+    /// The captured pty's kernel-reported dimensions changed
+    /// (TIOCSWINSZ on the captured side). Informational. The
+    /// subscriber's viewport is unchanged — the daemon will keep
+    /// rendering at the subscriber's size.
     Resize { rows: u16, cols: u16 },
 }

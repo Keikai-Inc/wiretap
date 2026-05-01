@@ -223,8 +223,20 @@ fn handle_subscribe(
     req: TapStreamRequest,
     out_tx: mpsc::UnboundedSender<LocalMessage>,
 ) {
-    let TapStreamRequest::Subscribe { pty_index } = req;
-    match super::register_subscriber(sessions, streams, next_stream_id, peer, pty_index) {
+    let TapStreamRequest::Subscribe {
+        pty_index,
+        viewport_rows,
+        viewport_cols,
+    } = req;
+    match super::register_subscriber(
+        sessions,
+        streams,
+        next_stream_id,
+        peer,
+        pty_index,
+        viewport_rows,
+        viewport_cols,
+    ) {
         Err(reason) => {
             let _ = out_tx.send(LocalMessage::StreamClosed {
                 stream_id: request_id,
