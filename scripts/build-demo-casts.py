@@ -19,6 +19,11 @@ Run:
 import json
 import os
 import random
+import sys
+
+# Allow `from picker_render import render_picker` regardless of cwd.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from picker_render import render_picker
 
 # Both panes are 80x24 (standard) so each cast renders at a comfortable
 # size in the dual-player layout (~half-page each on desktop, full-width
@@ -167,57 +172,39 @@ t_admin = T_INTRUSION + 4.5
 t_admin = type_str(t_admin, ADMIN, "tap", cps=10)
 at(t_admin + 0.30, ADMIN, "\r\n")
 
-# Picker frame appears
-PICKER_HEADER = (
-    "\x1b[2J\x1b[H"
-    f"{BOLD}┌── tap — terminal session picker ─────────────────────────────────────────────┐{RESET}\r\n"
-    f"{BOLD}│{RESET} pty   user                comm        age      idle                         {BOLD}│{RESET}\r\n"
-)
-PICKER_FOOTER = (
-    f"{BOLD}└──────────────────────────────────────────────────────────────────────────────┘{RESET}\r\n"
-    f"{DIM}2 session(s) — ↑/↓ select  Enter=connect  l=lock  Q=quarantine  x=kill  q=quit{RESET}"
-)
-
-
-def picker_body(highlight_root=True, quarantined=False):
-    """Render a snapshot of the picker body (rows minus header/footer).
-
-    Each row shows `loginuser(euid)`. alice(0) is alice sudo'd to root —
-    expected for an operator. www-data(0) is the smoking gun: the apache
-    service account has no business holding a root shell. Some 0day
-    landed an attacker in apache's worker, and a chained privesc bumped
-    them to euid 0. The mismatch (in red) is the visual tell."""
-    rows = []
-    # alice's row — operator's own session (running tap right now).
-    rows.append(
-        f"{BOLD}│{RESET}    3   alice(0)           tap         82s      0ms                         {BOLD}│{RESET}"
-    )
-    # www-data's row — login=www-data but euid=0. Apache → root shell.
-    label = "🎭  4" if quarantined else "    4"
-    line = f"{label}   {RED}www-data(0){RESET}         bash        45s      0ms                       "
-    if highlight_root:
-        line = REV + line + RESET
-    rows.append(f"{BOLD}│{RESET} {line}{BOLD}│{RESET}")
-    # spacer
-    rows.append(f"{BOLD}│{RESET}                                                                              {BOLD}│{RESET}")
-    # preview header — origin is apache (parent process chain leads to httpd)
-    rows.append(f"{BOLD}│{RESET}  {DIM}preview of pty 4 (origin: apache2 → euid 0) ── live{RESET}                        {BOLD}│{RESET}")
-    return "\r\n".join(rows) + "\r\n"
-
-
 def emit_picker(t, highlight_root=True, quarantined=False, preview_lines=None):
-    """Write the full picker frame."""
-    parts = [PICKER_HEADER, picker_body(highlight_root, quarantined)]
-    # Preview area: 6 lines of fake snapshot inside the box. Pad to width.
-    preview = preview_lines or ["", "", "", "", "", ""]
-    for line in preview[:6]:
-        # Truncate to fit inside the box (74 chars of inner width).
-        s = line[:74].ljust(74)
-        parts.append(f"{BOLD}│{RESET}  {s}{BOLD}│{RESET}\r\n")
-    while len(preview) < 6:
-        preview.append("")
-    parts.append(PICKER_FOOTER)
-    at(t, ADMIN, "".join(parts))
+    """Build and emit a full 80x24 picker frame, matching the real tap UI.
+
+    alice(0) is alice sudo'd to root — expected for an operator. www-data(0)
+    is the smoking gun: a service account has no business holding a root
+    shell. tap shows it as login(euid); the mismatch (in red) is the
+    visual tell of the apache 0day → privesc."""
+    sessions = [
+        {
+            "pty": "3",
+            "user": "alice(0)",
+            "comm": "tap",
+            "age": "82s",
+            "idle": "0ms",
+        },
+        {
+            "pty": "4",
+            "user": "www-data(0)",
+            "comm": "bash",
+            "age": "45s",
+            "idle": "0ms",
+            "user_color": RED,
+            "prefix": "🎭 " if quarantined else "",
+        },
+    ]
+    highlight_idx = 1 if highlight_root else 0
+    frame = render_picker(
+        sessions=sessions,
+        highlight_idx=highlight_idx,
+        preview_lines=preview_lines or [],
+        preview_label_pty=sessions[highlight_idx]["pty"],
+    )
+    at(t, ADMIN, frame)
 
 
 # Picker first appears around t=5.0 after the user types `tap` + Enter.
@@ -481,25 +468,28 @@ at(t_drop + 0.3, HACKER, "Connection to web-prod closed by remote host.\r\n")
 at(t_drop + 0.6, HACKER, "Connection to web-prod closed.\r\n")
 at(t_drop + 0.9, HACKER, f"{DIM}[ session ended ]{RESET}\r\n")
 
-# Picker refreshes — only alice's session left
+# Picker refreshes — only alice's session left after the kill
 t_picker_after = t_kill + 0.6
-at(t_picker_after, ADMIN, "\x1b[2J\x1b[H")
-at(t_picker_after + 0.05, ADMIN, PICKER_HEADER)
-at(t_picker_after + 0.10, ADMIN,
-   f"{BOLD}│{RESET} {REV}    3   alice(0)           tap         87s      0ms                         {RESET}{BOLD}│{RESET}\r\n")
-at(t_picker_after + 0.15, ADMIN,
-   f"{BOLD}│{RESET}                                                                              {BOLD}│{RESET}\r\n")
-at(t_picker_after + 0.20, ADMIN,
-   f"{BOLD}│{RESET}  {DIM}preview of pty 3 (alice → euid 0) ── live{RESET}                                  {BOLD}│{RESET}\r\n")
-at(t_picker_after + 0.25, ADMIN,
-   f"{BOLD}│{RESET}                                                                              {BOLD}│{RESET}\r\n")
-at(t_picker_after + 0.30, ADMIN,
-   f"{BOLD}│{RESET}  {RED}root@web-prod{RESET}:~# tap                                                        {BOLD}│{RESET}\r\n")
-at(t_picker_after + 0.35, ADMIN,
-   f"{BOLD}│{RESET}                                                                              {BOLD}│{RESET}\r\n")
-at(t_picker_after + 0.40, ADMIN,
-   f"{BOLD}│{RESET}                                                                              {BOLD}│{RESET}\r\n")
-at(t_picker_after + 0.45, ADMIN, PICKER_FOOTER)
+final_sessions = [
+    {
+        "pty": "3",
+        "user": "alice(0)",
+        "comm": "tap",
+        "age": "87s",
+        "idle": "0ms",
+    },
+]
+final_frame = render_picker(
+    sessions=final_sessions,
+    highlight_idx=0,
+    preview_lines=[
+        f"{RED}root@web-prod{RESET}:~# tap",
+        "",
+        "(this session)",
+    ],
+    preview_label_pty="3",
+)
+at(t_picker_after, ADMIN, final_frame)
 
 # End: small beat, then both terminals settle.
 T_END = t_picker_after + 3.0

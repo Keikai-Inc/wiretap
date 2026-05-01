@@ -18,6 +18,10 @@ Run:
 import json
 import os
 import random
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from picker_render import render_picker
 
 W, H = 80, 24
 
@@ -156,45 +160,38 @@ t_tap = 7.0
 t_tap = type_str(t_tap, SENIOR, "tap", cps=10)
 at(t_tap + 0.30, SENIOR, "\r\n")
 
-# Picker frame for the pairing scenario. Two ptys: alice's own + bob's.
-PICKER_HEADER = (
-    "\x1b[2J\x1b[H"
-    f"{BOLD}┌── tap — terminal session picker ─────────────────────────────────────────────┐{RESET}\r\n"
-    f"{BOLD}│{RESET} pty   user                comm        age      idle                         {BOLD}│{RESET}\r\n"
-)
-PICKER_FOOTER = (
-    f"{BOLD}└──────────────────────────────────────────────────────────────────────────────┘{RESET}\r\n"
-    f"{DIM}2 session(s) — ↑/↓ select  Enter=connect  l=lock  Q=quarantine  x=kill  q=quit{RESET}"
-)
-
-
-def picker_body(highlight_bob=True):
-    """Both rows are non-suspicious — alice is sudo'd (expected), bob is
-    a regular uid 1001 user holding his own shell. No red, no flagged
-    mismatch; this is the everyday `who's logged in?` view."""
-    rows = []
-    rows.append(
-        f"{BOLD}│{RESET}    3   alice(0)           tap         3m       0ms                         {BOLD}│{RESET}"
-    )
-    line = f"    7   {YELLOW}bob(1001){RESET}          bash        18m      0ms                         "
-    if highlight_bob:
-        line = REV + line + RESET
-    rows.append(f"{BOLD}│{RESET} {line}{BOLD}│{RESET}")
-    rows.append(f"{BOLD}│{RESET}                                                                              {BOLD}│{RESET}")
-    rows.append(f"{BOLD}│{RESET}  {DIM}preview of pty 7 (bob) ── live{RESET}                                             {BOLD}│{RESET}")
-    return "\r\n".join(rows) + "\r\n"
-
-
 def emit_picker(t, highlight_bob=True, preview_lines=None):
-    parts = [PICKER_HEADER, picker_body(highlight_bob)]
-    preview = preview_lines or ["", "", "", "", "", ""]
-    for line in preview[:6]:
-        s = line[:74].ljust(74)
-        parts.append(f"{BOLD}│{RESET}  {s}{BOLD}│{RESET}\r\n")
-    while len(preview) < 6:
-        preview.append("")
-    parts.append(PICKER_FOOTER)
-    at(t, SENIOR, "".join(parts))
+    """Render the picker for the pairing scenario.
+
+    Both rows are non-suspicious: alice is sudo'd to root (expected
+    for an operator), bob is a regular uid 1001 user holding his own
+    shell. No red, no privesc mismatch — this is the everyday
+    'who's-logged-in?' view."""
+    sessions = [
+        {
+            "pty": "3",
+            "user": "alice(0)",
+            "comm": "tap",
+            "age": "3m",
+            "idle": "0ms",
+        },
+        {
+            "pty": "7",
+            "user": "bob(1001)",
+            "comm": "bash",
+            "age": "18m",
+            "idle": "0ms",
+            "user_color": YELLOW,
+        },
+    ]
+    highlight_idx = 1 if highlight_bob else 0
+    frame = render_picker(
+        sessions=sessions,
+        highlight_idx=highlight_idx,
+        preview_lines=preview_lines or [],
+        preview_label_pty=sessions[highlight_idx]["pty"],
+    )
+    at(t, SENIOR, frame)
 
 
 # Picker first appears after the `tap\r\n`.
