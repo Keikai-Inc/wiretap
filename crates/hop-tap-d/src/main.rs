@@ -462,6 +462,21 @@ mod linux {
     ) -> Vec<u8> {
         let render_lines = (state.dims.lines as u16).min(vp_rows.max(1)) as i32;
         let render_cols = (state.dims.cols as u16).min(vp_cols.max(1)) as usize;
+        // Bottom-anchored row clip: when the subscriber's viewport is
+        // shorter than the captured grid, show the BOTTOM rows of
+        // bob's grid (where the prompt/cursor live), not the top.
+        // For interactive shells, top rows are old scrollback; bottom
+        // rows are what the user is currently doing — that's what an
+        // operator wants to see when they tap in. For full-screen
+        // apps using alt-screen (vim/htop), the whole grid is "live"
+        // but the cursor is still typically in the lower half (vim's
+        // status line / htop's scrollable list), so bottom-clip
+        // tends to keep that visible too.
+        //
+        // `row_offset` = how many of bob's TOP rows we skip. For
+        // alice ≥ bob it's 0 (no clip); for alice < bob it's
+        // (bob.rows - alice.rows).
+        let row_offset: i32 = (state.dims.lines as i32) - render_lines;
         let mut out: Vec<u8> =
             Vec::with_capacity(render_lines as usize * render_cols * 8);
 
@@ -509,11 +524,16 @@ mod linux {
         let grid = state.term.grid();
         let mut last_attrs: Option<(Color, Color, Flags)> = None;
 
-        for line_idx in 0..render_lines {
-            let _ = write!(out, "\x1b[{};1H", line_idx + 1);
+        for vp_line_idx in 0..render_lines {
+            // Map subscriber's row to captured-grid row by adding
+            // the bottom-anchor offset. When alice ≥ bob this is a
+            // no-op; otherwise it skips bob's first `row_offset`
+            // rows so we render bob's bottom rows.
+            let bob_line_idx = vp_line_idx + row_offset;
+            let _ = write!(out, "\x1b[{};1H", vp_line_idx + 1);
             let mut col = 0usize;
             while col < render_cols {
-                let p = Point::new(Line(line_idx), Column(col));
+                let p = Point::new(Line(bob_line_idx), Column(col));
                 let cell = &grid[p];
 
                 // Skip the placeholder column for a wide char; the
@@ -545,16 +565,24 @@ mod linux {
             }
         }
 
-        // Final reset and cursor placement. If bob's cursor sits
-        // outside the subscriber's viewport (smaller subscriber, or
-        // in a row/col we clipped), don't move the cursor — leave
-        // it wherever the last cell write landed.
+        // Final reset and cursor placement. Translate bob's cursor
+        // from grid coords to viewport coords by subtracting the
+        // bottom-anchor offset; only place if it's actually visible
+        // in the viewport. If the cursor falls outside (e.g. bob's
+        // cursor is in cols beyond alice's right edge), don't move
+        // — leave it wherever the last cell write landed.
         out.extend_from_slice(b"\x1b[0m");
         let cursor_pt = grid.cursor.point;
-        let crow = cursor_pt.line.0 + 1;
-        let ccol = cursor_pt.column.0 + 1;
-        if (crow as u16) <= vp_rows && (ccol as u16) <= vp_cols {
-            let _ = write!(out, "\x1b[{crow};{ccol}H");
+        let bob_crow = cursor_pt.line.0;
+        let bob_ccol = cursor_pt.column.0 as i32;
+        let vp_crow = bob_crow - row_offset; // 0-based viewport row
+        let vp_ccol = bob_ccol; // cols aren't offset (left-clip)
+        if vp_crow >= 0
+            && vp_crow < render_lines
+            && vp_ccol >= 0
+            && (vp_ccol as u16) < vp_cols
+        {
+            let _ = write!(out, "\x1b[{};{}H", vp_crow + 1, vp_ccol + 1);
         }
 
         out
