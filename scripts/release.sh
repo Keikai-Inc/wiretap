@@ -152,7 +152,7 @@ if [[ "${SITE_ONLY}" -eq 1 ]]; then
   upload_site
   invalidate_site_paths
   echo ""
-  echo "Site updated: https://tap.keik.ai/"
+  echo "Site updated: https://tap.keikai.ai/"
   exit 0
 fi
 
@@ -400,4 +400,4 @@ echo ""
 echo "Binaries:"
 ls -lh "${DIST_DIR}"/hop-tap-* | grep -v sha256
 echo ""
-echo "Install: curl -fsSL https://tap.keik.ai/install.sh | bash"
+echo "Install: curl -fsSL https://tap.keikai.ai/install.sh | bash"

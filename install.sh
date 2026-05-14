@@ -2,13 +2,13 @@
 # Installer for hop-tap (the terminal-capture extension for hop).
 #
 # Usage:
-#   curl -fsSL https://tap.keik.ai/install.sh | bash
-#   curl -fsSL https://tap.keik.ai/install.sh | bash -s -- --version 0.1.0
+#   curl -fsSL https://tap.keikai.ai/install.sh | bash
+#   curl -fsSL https://tap.keikai.ai/install.sh | bash -s -- --version 0.1.0
 #
 # Behavior:
 #   - Linux-only (eBPF). On macOS/other this exits with a clear error.
 #   - If `hop` is not installed (or its daemon isn't running), this
-#     script first delegates to `https://hop.keik.ai/install-daemon.sh`
+#     script first delegates to `https://hop.keikai.ai/install-daemon.sh`
 #     to bring up hop, then continues.
 #   - Downloads the hop-tap-d daemon and tap binaries to
 #     /usr/local/bin, drops a manifest at /etc/hop/extensions/tap-terminal.toml,
@@ -24,8 +24,8 @@
 
 set -euo pipefail
 
-BASE_URL="${HOP_TAP_CDN_URL:-https://tap.keik.ai}"
-HOP_BASE_URL="${HOP_CDN_URL:-https://hop.keik.ai}"
+BASE_URL="${HOP_TAP_CDN_URL:-https://tap.keikai.ai}"
+HOP_BASE_URL="${HOP_CDN_URL:-https://hop.keikai.ai}"
 
 # --- Colour helpers (disabled when piped) ------------------------------------
 

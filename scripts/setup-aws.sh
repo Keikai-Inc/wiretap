@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# One-time AWS infrastructure setup for tap (`tap.keik.ai`).
+# One-time AWS infrastructure setup for tap (`tap.keikai.ai`).
 #
 # Mirrors hop's scripts/setup-aws.sh: creates an S3 bucket for
 # release artifacts and the website, an Origin Access Control,
@@ -54,7 +54,7 @@ CALLER_REF="tap-releases-$(date +%s)"
 DIST_CONFIG=$(cat <<EOF
 {
   "CallerReference": "${CALLER_REF}",
-  "Comment": "tap.keik.ai - tap releases + website",
+  "Comment": "tap.keikai.ai - tap releases + website",
   "Enabled": true,
   "DefaultRootObject": "index.html",
   "DefaultCacheBehavior": {
@@ -136,12 +136,12 @@ echo "Next steps (semi-manual; need ACM validation wait):"
 echo ""
 echo "  # 1. Request the cert in us-east-1 (CloudFront requires it there):"
 echo "  aws acm request-certificate \\"
-echo "    --domain-name tap.keik.ai \\"
+echo "    --domain-name tap.keikai.ai \\"
 echo "    --validation-method DNS \\"
 echo "    --region us-east-1"
 echo ""
 echo "  # 2. Read the validation CNAME from the cert and add it to Route 53"
-echo "  #    (the keik.ai zone). Wait ~1-5 min for ACM to mark it Issued."
+echo "  #    (the keikai.ai zone). Wait ~1-5 min for ACM to mark it Issued."
 echo ""
 echo "  # 3. Attach Aliases + ViewerCertificate to the distribution:"
 echo "  aws cloudfront update-distribution \\"
@@ -149,5 +149,5 @@ echo "    --id ${DIST_ID} \\"
 echo "    --if-match <ETag from get-distribution-config> \\"
 echo "    --distribution-config <updated config with Aliases + ViewerCertificate>"
 echo ""
-echo "  # 4. Add Route 53 A/AAAA alias records for tap.keik.ai →"
+echo "  # 4. Add Route 53 A/AAAA alias records for tap.keikai.ai →"
 echo "  #    ${DIST_DOMAIN}"

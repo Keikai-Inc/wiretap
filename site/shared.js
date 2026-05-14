@@ -38,9 +38,9 @@
   if (footerEl) {
     footerEl.innerHTML =
       '<div class="footer-bottom">' +
-        '<p class="footer-copy">&copy; 2026 <a href="https://keik.ai">Keik.ai</a> Cybersecurity. ' +
+        '<p class="footer-copy">&copy; 2026 <a href="https://keikai.ai">Keikai.ai</a> Cybersecurity. ' +
           'tap is the missing Linux administrator command. ' +
-          'Optional integration with <a href="https://hop.keik.ai">hop</a> for remote and AI access.</p>' +
+          'Optional integration with <a href="https://hop.keikai.ai">hop</a> for remote and AI access.</p>' +
       '</div>';
   }
 })();
