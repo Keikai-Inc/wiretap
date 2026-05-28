@@ -129,10 +129,10 @@ async fn main() -> Result<()> {
 /// `getpwuid_r` (handles non-login shells), then to a literal
 /// "uid=N" string. The daemon trusts whatever string we send.
 fn whoami_or_uid() -> String {
-    if let Ok(u) = std::env::var("USER") {
-        if !u.is_empty() {
-            return u;
-        }
+    if let Ok(u) = std::env::var("USER")
+        && !u.is_empty()
+    {
+        return u;
     }
     // SAFETY: getuid is signal-safe; fetched once at startup.
     let uid = unsafe { libc::getuid() };
@@ -142,10 +142,11 @@ fn whoami_or_uid() -> String {
     // pwent storage and we copy out immediately.
     unsafe {
         let pw = libc::getpwuid(uid);
-        if !pw.is_null() && !(*pw).pw_name.is_null() {
-            if let Ok(s) = std::ffi::CStr::from_ptr((*pw).pw_name).to_str() {
-                return s.to_string();
-            }
+        if !pw.is_null()
+            && !(*pw).pw_name.is_null()
+            && let Ok(s) = std::ffi::CStr::from_ptr((*pw).pw_name).to_str()
+        {
+            return s.to_string();
         }
     }
     format!("uid={uid}")
@@ -643,14 +644,16 @@ async fn connect(
                     StdinEvent::Bytes(bytes) => {
                         match handle_stdin_bytes(
                             bytes,
-                            &mut mode,
-                            &mut stdout,
-                            term_rows,
-                            term_cols,
-                            &mut write_half,
-                            &mut inject_id,
-                            &mut admin_id,
-                            pty,
+                            StdinCtx {
+                                mode: &mut mode,
+                                stdout: &mut stdout,
+                                rows: term_rows,
+                                cols: term_cols,
+                                write: &mut write_half,
+                                inject_id: &mut inject_id,
+                                admin_id: &mut admin_id,
+                                pty,
+                            },
                         ).await {
                             Ok(()) => {}
                             Err(e) => {
@@ -701,10 +704,10 @@ async fn connect(
                                 // frame so the captured session's
                                 // output doesn't scroll the prompt away
                                 // mid-edit.
-                                if session_ready && matches!(mode, ConnectMode::Compose(_)) {
-                                    if let ConnectMode::Compose(buf) = &mode {
-                                        paint_compose_prompt(&mut stdout, term_rows, term_cols, buf);
-                                    }
+                                if session_ready
+                                    && let ConnectMode::Compose(buf) = &mode
+                                {
+                                    paint_compose_prompt(&mut stdout, term_rows, term_cols, buf);
                                 }
                                 let _ = stdout.flush();
                             }
@@ -742,12 +745,12 @@ async fn connect(
                                 );
                                 let _ = stdout.write_all(banner.as_bytes());
                                 set_window_title(&mut stdout, &info);
-                                if session_ready && matches!(mode, ConnectMode::Compose(_)) {
-                                    if let ConnectMode::Compose(buf) = &mode {
-                                        paint_compose_prompt(
-                                            &mut stdout, term_rows, term_cols, buf,
-                                        );
-                                    }
+                                if session_ready
+                                    && let ConnectMode::Compose(buf) = &mode
+                                {
+                                    paint_compose_prompt(
+                                        &mut stdout, term_rows, term_cols, buf,
+                                    );
                                 }
                                 let _ = stdout.flush();
                             }
@@ -780,30 +783,30 @@ async fn connect(
                 // bob's pty content (still rendered at the old
                 // viewport) will wrap awkwardly in the new window
                 // and leave stale paint at the bottom.
-                if let Ok((c, r)) = crossterm::terminal::size() {
-                    if (c, r) != (term_cols, term_rows) {
-                        term_cols = c;
-                        term_rows = r;
-                        if let ConnectMode::Compose(buf) = &mode {
-                            paint_compose_prompt(&mut stdout, term_rows, term_cols, buf);
-                        }
-                        // Fire-and-forget — daemon replies with
-                        // SubscriptionResized which we ignore.
-                        let resize_id = *next_id;
-                        *next_id += 1;
-                        let _ = send_local(
-                            &mut write_half,
-                            &LocalMessage::Call {
-                                request_id: resize_id,
-                                payload: TapRequest::ResizeSubscription {
-                                    stream_id,
-                                    rows: r,
-                                    cols: c,
-                                },
-                            },
-                        )
-                        .await;
+                if let Ok((c, r)) = crossterm::terminal::size()
+                    && (c, r) != (term_cols, term_rows)
+                {
+                    term_cols = c;
+                    term_rows = r;
+                    if let ConnectMode::Compose(buf) = &mode {
+                        paint_compose_prompt(&mut stdout, term_rows, term_cols, buf);
                     }
+                    // Fire-and-forget — daemon replies with
+                    // SubscriptionResized which we ignore.
+                    let resize_id = *next_id;
+                    *next_id += 1;
+                    let _ = send_local(
+                        &mut write_half,
+                        &LocalMessage::Call {
+                            request_id: resize_id,
+                            payload: TapRequest::ResizeSubscription {
+                                stream_id,
+                                rows: r,
+                                cols: c,
+                            },
+                        },
+                    )
+                    .await;
                 }
                 let _ = stdout.flush();
             }
@@ -888,17 +891,32 @@ async fn fetch_status_info(
 /// for what follows. In Compose mode, accumulate bytes into the
 /// message buffer, watching for Enter (send), Esc (cancel), and
 /// Backspace.
-async fn handle_stdin_bytes(
-    bytes: Vec<u8>,
-    mode: &mut ConnectMode,
-    stdout: &mut std::io::StdoutLock<'static>,
+/// Borrowed per-call context for [`handle_stdin_bytes`]. Bundles the
+/// connect loop's mutable state so the handler takes two args instead
+/// of nine. Constructed fresh each call and consumed by value; the
+/// borrows live only for the duration of the call.
+struct StdinCtx<'a> {
+    mode: &'a mut ConnectMode,
+    stdout: &'a mut std::io::StdoutLock<'static>,
     rows: u16,
     cols: u16,
-    write: &mut OwnedWriteHalf,
-    inject_id: &mut u64,
-    admin_id: &mut u64,
+    write: &'a mut OwnedWriteHalf,
+    inject_id: &'a mut u64,
+    admin_id: &'a mut u64,
     pty: i32,
-) -> Result<()> {
+}
+
+async fn handle_stdin_bytes(bytes: Vec<u8>, ctx: StdinCtx<'_>) -> Result<()> {
+    let StdinCtx {
+        mode,
+        stdout,
+        rows,
+        cols,
+        write,
+        inject_id,
+        admin_id,
+        pty,
+    } = ctx;
     const CTRL_G: u8 = 0x07;
     const ENTER_CR: u8 = 0x0D;
     const ENTER_LF: u8 = 0x0A;
@@ -1176,10 +1194,7 @@ async fn run_tui(socket: &std::path::Path) -> Result<Option<TuiAction>> {
         if target_pty != preview_pty {
             preview_pty = target_pty;
             preview = match target_pty {
-                Some(pty) => match refresh_snapshot(&mut conn, &mut next_id, pty).await {
-                    Ok(p) => Some(p),
-                    Err(_) => None,
-                },
+                Some(pty) => refresh_snapshot(&mut conn, &mut next_id, pty).await.ok(),
                 None => None,
             };
         }
@@ -1426,13 +1441,17 @@ async fn run_tui(socket: &std::path::Path) -> Result<Option<TuiAction>> {
                     (KeyCode::Char('q'), _) | (KeyCode::Esc, _) => return Ok(None),
                     (KeyCode::Char('c'), KeyModifiers::CONTROL) => return Ok(None),
                     (KeyCode::Up, _) | (KeyCode::Char('k'), _) => {
-                        if let Some(i) = state.selected() {
-                            if i > 0 { state.select(Some(i - 1)); }
+                        if let Some(i) = state.selected()
+                            && i > 0
+                        {
+                            state.select(Some(i - 1));
                         }
                     }
                     (KeyCode::Down, _) | (KeyCode::Char('j'), _) => {
-                        if let Some(i) = state.selected() {
-                            if i + 1 < sessions.len() { state.select(Some(i + 1)); }
+                        if let Some(i) = state.selected()
+                            && i + 1 < sessions.len()
+                        {
+                            state.select(Some(i + 1));
                         }
                     }
                     (KeyCode::Enter, _) => {
