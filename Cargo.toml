@@ -79,14 +79,12 @@ nix = { version = "0.30", features = ["fs", "mount", "process", "sched", "user",
 # Testing
 tempfile = "3"
 
-# Local-dev override: when hop is checked out as a sibling under
-# ~/git-projects/, edits to hop-vt are picked up immediately by
-# hop-tap builds without bouncing through a git push + tag. CI on a
-# machine without the sibling checkout resolves the workspace dep
-# above via the pinned tag instead. The URL must match the git dep
-# exactly for the patch to apply.
-[patch."ssh://git@github.com/thedracle/hop.git"]
-hop-vt = { path = "../hop/crates/hop-vt" }
+# Note: the local-dev override for hop-vt lives in .cargo/config.toml
+# as a [paths] entry, NOT as a [patch] here. [paths] is silently
+# ignored when the path doesn't exist, so the cross/Docker release
+# build (where the sibling ../hop checkout isn't mounted) falls back
+# to the pinned git dep from the cargo cache. A [patch] would instead
+# hard-error on the missing path inside the container.
 
 [profile.release]
 lto = true

@@ -1,3 +1,17 @@
+# Local-dev override for the hop-vt git dependency: when hop is
+# checked out as a sibling under ~/git-projects/, this points hop-vt
+# at the working copy so edits show up in hop-tap builds immediately
+# (no push + retag cycle). [paths] entries whose path does not exist
+# are silently ignored — so on a machine / CI / cross container
+# without the sibling checkout, this line is a no-op and cargo
+# resolves hop-vt from the pinned git tag instead. That is exactly
+# why the override lives here as [paths] and not as a Cargo.toml
+# [patch] (which would hard-error on the missing path).
+#
+# Must stay above the [net] table: `paths` is a top-level key, and a
+# bare key after a [table] header would bind into that table.
+paths = ["../hop/crates/hop-vt"]
+
 # Cargo's libgit2 transport can't use the SSH agent reliably, so
 # fetching the hop git dep (private repo) fails with "failed to
 # authenticate when downloading repository". Delegating to the
