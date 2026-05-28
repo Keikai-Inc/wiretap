@@ -40,6 +40,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # emulator choice for the full rationale.)
 alacritty_terminal = { version = "0.26", default-features = false }
 
+# Shared off-screen terminal grid + rendering primitives. Lives in
+# the hop workspace because hop's session-resume path needs the same
+# render that hop-tap's subscriber stream does. The [patch] block at
+# the bottom redirects to the sibling checkout for local dev; CI / a
+# clean clone resolves via the git URL pinned to a hop release tag.
+hop-vt = { git = "ssh://git@github.com/thedracle/hop.git", tag = "v0.6.15" }
+
 # Serialization (used as we add features).
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
@@ -71,6 +78,15 @@ nix = { version = "0.30", features = ["fs", "mount", "process", "sched", "user",
 
 # Testing
 tempfile = "3"
+
+# Local-dev override: when hop is checked out as a sibling under
+# ~/git-projects/, edits to hop-vt are picked up immediately by
+# hop-tap builds without bouncing through a git push + tag. CI on a
+# machine without the sibling checkout resolves the workspace dep
+# above via the pinned tag instead. The URL must match the git dep
+# exactly for the patch to apply.
+[patch."ssh://git@github.com/thedracle/hop.git"]
+hop-vt = { path = "../hop/crates/hop-vt" }
 
 [profile.release]
 lto = true

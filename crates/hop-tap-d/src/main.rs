@@ -84,16 +84,7 @@ mod linux {
         SessionInfo, TapRequest, TapResponse, TapStreamFrame, TapStreamRequest,
     };
     use tokio::sync::mpsc;
-    use alacritty_terminal::{
-        event::VoidListener,
-        grid::Dimensions,
-        index::{Column, Line, Point},
-        term::{
-            cell::{Cell, Flags},
-            Config, Term, TermMode,
-        },
-        vte::ansi::{Color, Processor},
-    };
+    use hop_vt::{Prelude, VtScreen};
     use anyhow::{bail, Context, Result};
     use aya::{
         include_bytes_aligned, maps::AsyncPerfEventArray, programs::KProbe, util::online_cpus,
@@ -156,39 +147,16 @@ mod linux {
     pub(crate) type StreamsMap = Arc<Mutex<HashMap<u64, StreamRecord>>>;
 
     // Phase 1.8g replaced the rolling-byte replay buffer with a
-    // deterministic grid walk in `render_grid_to_bytes`. The
-    // alacritty Term carries the canonical state; we synthesize
-    // escape sequences from it when a subscriber attaches. This
-    // is strictly better: the byte buffer could start mid-CSI and
-    // confuse a fresh terminal, while the grid render is always
-    // self-contained.
+    // deterministic grid walk. As of the hop-vt extraction the grid +
+    // render machinery lives in the hop workspace and is shared with
+    // hop's session-resume path; see hop-vt's crate docs for the API
+    // and the rationale for repaint-over-replay.
 
     /// Fallback dimensions used only until the first `pty_write`
     /// surfaces real ones. Most sessions will resize within
     /// milliseconds of opening (the shell's stty / SIGWINCH path).
-    const FALLBACK_COLS: usize = 80;
-    const FALLBACK_ROWS: usize = 24;
-
-    /// Mutable `Dimensions` impl for `Term` construction and resize.
-    /// `total_lines == screen_lines` so the grid carries no
-    /// scrollback (per-session memory stays bounded; alacritty's
-    /// default 10k-line history would inflate it ~400×).
-    #[derive(Copy, Clone)]
-    struct FixedDims {
-        cols: usize,
-        lines: usize,
-    }
-    impl Dimensions for FixedDims {
-        fn total_lines(&self) -> usize {
-            self.lines
-        }
-        fn screen_lines(&self) -> usize {
-            self.lines
-        }
-        fn columns(&self) -> usize {
-            self.cols
-        }
-    }
+    const FALLBACK_COLS: u16 = 80;
+    const FALLBACK_ROWS: u16 = 24;
 
     static EBPF_OBJECT: &[u8] = include_bytes_aligned!(
         "../../hop-tap-ebpf/target/bpfel-unknown-none/release/hop-tap-ebpf"
@@ -221,9 +189,7 @@ mod linux {
         input_bytes: u64,
         output_events: u64,
         input_events: u64,
-        processor: Processor,
-        term: Term<VoidListener>,
-        dims: FixedDims,
+        screen: VtScreen,
         // stream_ids currently subscribed to live updates from this
         // session. Most sessions have zero subscribers so the fan-out
         // hot path is just an `is_empty()` check.
@@ -278,13 +244,7 @@ mod linux {
             uid: u32,
             gid: u32,
         ) -> Self {
-            let dims = FixedDims {
-                cols: FALLBACK_COLS,
-                lines: FALLBACK_ROWS,
-            };
-            let mut config = Config::default();
-            config.scrolling_history = 0;
-            let term = Term::new(config, &dims, VoidListener);
+            let screen = VtScreen::new(FALLBACK_ROWS, FALLBACK_COLS);
             Self {
                 pty_index,
                 created_at: now,
@@ -301,9 +261,7 @@ mod linux {
                 input_bytes: 0,
                 output_events: 0,
                 input_events: 0,
-                processor: Processor::new(),
-                term,
-                dims,
+                screen,
                 subscribers: Vec::new(),
                 master_holder_pid: 0,
                 master_fd: -1,
@@ -315,68 +273,32 @@ mod linux {
         }
 
         /// Resize the off-screen terminal if the kernel-reported
-        /// dimensions have changed since our last update. Skips
-        /// (0, 0) which the kernel surfaces for ptys that haven't
-        /// been sized yet (e.g. immediately after open, before the
-        /// terminal emulator issues TIOCSWINSZ).
+        /// dimensions have changed. `VtScreen::resize` ignores (0, 0)
+        /// (kernel surfaces zeroes for ptys not yet sized via
+        /// TIOCSWINSZ) and is idempotent for unchanged dims, so this
+        /// is a thin pass-through.
         fn maybe_resize(&mut self, rows: u16, cols: u16) {
-            if rows == 0 || cols == 0 {
-                return;
-            }
-            let new_cols = cols as usize;
-            let new_lines = rows as usize;
-            if new_cols == self.dims.cols && new_lines == self.dims.lines {
-                return;
-            }
-            self.dims = FixedDims {
-                cols: new_cols,
-                lines: new_lines,
-            };
-            self.term.resize(self.dims);
+            self.screen.resize(rows, cols);
         }
 
         fn ingest_output(&mut self, bytes: &[u8]) {
-            self.processor.advance(&mut self.term, bytes);
+            self.screen.advance(bytes);
         }
 
         fn snapshot_last_line(&self) -> Option<String> {
-            let grid = self.term.grid();
-            let cols = self.dims.cols;
-            let lines = self.dims.lines as i32;
-            for line_idx in (0..lines).rev() {
-                let row = self.read_row(grid, line_idx, cols);
-                let trimmed = row.trim_end();
-                if !trimmed.is_empty() {
-                    return Some(trimmed.to_string());
-                }
-            }
-            None
+            self.screen
+                .text_rows()
+                .into_iter()
+                .rev()
+                .map(|row| row.trim_end().to_string())
+                .find(|row| !row.is_empty())
         }
 
         /// Render every visible row top-to-bottom into a `Vec<String>`.
         /// Trailing whitespace is preserved so the caller can decide
         /// whether to display fixed-width or trim.
         fn snapshot_full_screen(&self) -> Vec<String> {
-            let grid = self.term.grid();
-            let cols = self.dims.cols;
-            let lines = self.dims.lines as i32;
-            (0..lines)
-                .map(|line_idx| self.read_row(grid, line_idx, cols))
-                .collect()
-        }
-
-        fn read_row(
-            &self,
-            grid: &alacritty_terminal::grid::Grid<alacritty_terminal::term::cell::Cell>,
-            line_idx: i32,
-            cols: usize,
-        ) -> String {
-            let mut row = String::with_capacity(cols);
-            for col in 0..cols {
-                let p = Point::new(Line(line_idx), Column(col));
-                row.push(grid[p].c);
-            }
-            row
+            self.screen.text_rows()
         }
 
         fn to_session_info(&self) -> SessionInfo {
@@ -400,287 +322,6 @@ mod linux {
                 idle_ms: self.last_activity.elapsed().as_millis() as u64,
                 locked: self.locked,
                 quarantined: self.quarantined,
-            }
-        }
-    }
-
-    /// Render the alacritty Term's current grid as a self-contained
-    /// byte sequence that, when written to a fresh terminal,
-    /// reproduces the screen state with colors and basic attributes.
-    ///
-    /// Output shape:
-    ///   ESC [2J ESC [H ESC [0m              clear, home, reset
-    ///   ESC [<row>;1H                       per-row cursor placement
-    ///   ESC [0;<flags>;<fg>;<bg>m  <chars>  per-cell SGR + char
-    ///   ...
-    ///   ESC [0m                              final attribute reset
-    ///   ESC [<cy>;<cx>H                     final cursor position
-    ///
-    /// We emit a fresh `\x1b[0;...m` SGR per attribute change rather
-    /// than computing a true diff — slightly more bytes on the wire,
-    /// significantly simpler logic, and not on a hot path (only
-    /// fires when a subscriber attaches).
-    ///
-    /// Skips `WIDE_CHAR_SPACER` cells (the placeholder column after
-    /// a wide char) and steps the column cursor by 2 on the wide
-    /// char itself.
-    /// Frame prelude — determines what the renderer emits before the
-    /// cell paint loop. Different attach/refresh scenarios need
-    /// different setup:
-    ///
-    /// - `Initial`: subscriber just attached. Clear primary screen,
-    ///   reset SGR, and if the captured grid is in alt-screen mode
-    ///   enter alt-screen on the subscriber too so subsequent live
-    ///   frames render onto the alt buffer (matching what the
-    ///   captured app expects).
-    /// - `Live`: subscriber already has prior content. Just home
-    ///   the cursor and reset SGR. Cells overwrite the previous
-    ///   frame's cells.
-    /// - `Resize`: subscriber's local terminal grew or shrank,
-    ///   possibly exposing rows we never painted (or hiding ones
-    ///   we did). Clear so newly-revealed rows don't show stale
-    ///   content; do NOT toggle alt-screen (subscriber is already
-    ///   wherever Initial put them).
-    enum FramePrelude {
-        Initial,
-        Live,
-        Resize,
-    }
-
-    /// Render the captured pty's grid into bytes targeting a
-    /// subscriber's terminal of `vp_rows × vp_cols`. The grid is
-    /// **clipped** to the visible region (top-left intersection of
-    /// captured-grid and subscriber-viewport): if the subscriber is
-    /// smaller than bob's pty, only the top-left fits; if larger,
-    /// the extra space is cleared on Initial / Resize and left
-    /// untouched on Live frames.
-    fn render_grid_for(
-        state: &SessionState,
-        vp_rows: u16,
-        vp_cols: u16,
-        prelude: FramePrelude,
-    ) -> Vec<u8> {
-        let render_lines = (state.dims.lines as u16).min(vp_rows.max(1)) as i32;
-        let render_cols = (state.dims.cols as u16).min(vp_cols.max(1)) as usize;
-        // Bottom-anchored row clip: when the subscriber's viewport is
-        // shorter than the captured grid, show the BOTTOM rows of
-        // bob's grid (where the prompt/cursor live), not the top.
-        // For interactive shells, top rows are old scrollback; bottom
-        // rows are what the user is currently doing — that's what an
-        // operator wants to see when they tap in. For full-screen
-        // apps using alt-screen (vim/htop), the whole grid is "live"
-        // but the cursor is still typically in the lower half (vim's
-        // status line / htop's scrollable list), so bottom-clip
-        // tends to keep that visible too.
-        //
-        // `row_offset` = how many of bob's TOP rows we skip. For
-        // alice ≥ bob it's 0 (no clip); for alice < bob it's
-        // (bob.rows - alice.rows).
-        let row_offset: i32 = (state.dims.lines as i32) - render_lines;
-        let mut out: Vec<u8> =
-            Vec::with_capacity(render_lines as usize * render_cols * 8);
-
-        match prelude {
-            FramePrelude::Initial => {
-                // Clear primary screen first. If the captured
-                // session is currently using the alternate screen
-                // (vim, less, htop, mc, fzf — anything that does
-                // full-screen "take over the whole window"), enter
-                // the alt screen on the subscriber's side too
-                // before drawing. The matching `\x1b[?1049l` will
-                // arrive when the captured session exits alt screen
-                // normally — the daemon ingests the sequence into
-                // its grid mode flag, which the next Output frame
-                // won't touch directly but subscriber's terminal
-                // state will follow alt-screen toggles relayed
-                // explicitly. (For v1 we re-render and that's it;
-                // alt-screen exit on captured side just leaves
-                // subscriber in alt — small known limitation,
-                // fixed in Phase 2.)
-                out.extend_from_slice(b"\x1b[2J\x1b[H\x1b[0m");
-                if state.term.mode().contains(TermMode::ALT_SCREEN) {
-                    out.extend_from_slice(b"\x1b[?1049h\x1b[2J\x1b[H");
-                }
-            }
-            FramePrelude::Resize => {
-                // Subscriber resized; their terminal may have
-                // newly-revealed rows showing stale pre-attach
-                // content, scroll regions left over from the
-                // previous size, or screen-mode state that doesn't
-                // match bob's grid (alt-screen toggled since
-                // attach). Be aggressive: reset scroll region,
-                // force the screen mode to match bob's grid, clear,
-                // home, reset attrs.
-                //
-                // \x1b[r resets DECSTBM (top/bottom margins) — a
-                // previously-set scroll region from bob's grid
-                // (e.g. vim setting one for status-line freezing)
-                // would otherwise apply to alice's render after
-                // resize, confining cells to a region smaller than
-                // her viewport.
-                //
-                // \x1b[?1049h/l forces alice's terminal to bob's
-                // current alt-screen state. Idempotent if already
-                // there. This is the bit that fixes the "alice
-                // resizes after bob exited alt-screen → garbled
-                // mode mismatch" case.
-                out.extend_from_slice(b"\x1b[r");
-                if state.term.mode().contains(TermMode::ALT_SCREEN) {
-                    out.extend_from_slice(b"\x1b[?1049h");
-                } else {
-                    out.extend_from_slice(b"\x1b[?1049l");
-                }
-                out.extend_from_slice(b"\x1b[2J\x1b[H\x1b[0m");
-            }
-            FramePrelude::Live => {
-                // Live frame: just home + reset attrs. We position
-                // the cursor explicitly per-row so partial updates
-                // land in the right place, and SGR resets ensure
-                // stale attributes from a prior frame don't bleed.
-                out.extend_from_slice(b"\x1b[H\x1b[0m");
-            }
-        }
-
-        let grid = state.term.grid();
-        let mut last_attrs: Option<(Color, Color, Flags)> = None;
-
-        for vp_line_idx in 0..render_lines {
-            // Map subscriber's row to captured-grid row by adding
-            // the bottom-anchor offset. When alice ≥ bob this is a
-            // no-op; otherwise it skips bob's first `row_offset`
-            // rows so we render bob's bottom rows.
-            let bob_line_idx = vp_line_idx + row_offset;
-            let _ = write!(out, "\x1b[{};1H", vp_line_idx + 1);
-            let mut col = 0usize;
-            while col < render_cols {
-                let p = Point::new(Line(bob_line_idx), Column(col));
-                let cell = &grid[p];
-
-                // Skip the placeholder column for a wide char; the
-                // wide char itself was already emitted in the prior
-                // iteration.
-                if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
-                    col += 1;
-                    continue;
-                }
-
-                let attrs = (cell.fg, cell.bg, cell.flags);
-                if last_attrs.as_ref() != Some(&attrs) {
-                    emit_sgr(&mut out, cell);
-                    last_attrs = Some(attrs);
-                }
-
-                let mut buf = [0u8; 4];
-                let s = cell.c.encode_utf8(&mut buf);
-                out.extend_from_slice(s.as_bytes());
-
-                col += if cell.flags.contains(Flags::WIDE_CHAR) { 2 } else { 1 };
-            }
-            // Erase to end of line: clears any prior content that
-            // extended past the captured grid's columns (e.g. when
-            // the subscriber is wider than the captured pty and the
-            // previous render painted further). Cheap; no flicker.
-            if (render_cols as u16) < vp_cols {
-                out.extend_from_slice(b"\x1b[K");
-            }
-        }
-
-        // Final reset and cursor placement. Translate bob's cursor
-        // from grid coords to viewport coords by subtracting the
-        // bottom-anchor offset; only place if it's actually visible
-        // in the viewport. If the cursor falls outside (e.g. bob's
-        // cursor is in cols beyond alice's right edge), don't move
-        // — leave it wherever the last cell write landed.
-        out.extend_from_slice(b"\x1b[0m");
-        let cursor_pt = grid.cursor.point;
-        let bob_crow = cursor_pt.line.0;
-        let bob_ccol = cursor_pt.column.0 as i32;
-        let vp_crow = bob_crow - row_offset; // 0-based viewport row
-        let vp_ccol = bob_ccol; // cols aren't offset (left-clip)
-        if vp_crow >= 0
-            && vp_crow < render_lines
-            && vp_ccol >= 0
-            && (vp_ccol as u16) < vp_cols
-        {
-            let _ = write!(out, "\x1b[{};{}H", vp_crow + 1, vp_ccol + 1);
-        }
-
-        out
-    }
-
-    /// Convenience: render the grid at its native dimensions. Used
-    /// for log dumps and tests; live broadcasts go through
-    /// `render_grid_for` with each subscriber's actual viewport.
-    #[allow(dead_code)]
-    fn render_grid_to_bytes(state: &SessionState) -> Vec<u8> {
-        render_grid_for(
-            state,
-            state.dims.lines as u16,
-            state.dims.cols as u16,
-            FramePrelude::Initial,
-        )
-    }
-
-    /// Emit an SGR sequence that establishes `cell`'s attributes
-    /// from a fully-reset state. Always starts with `\x1b[0` so the
-    /// receiver doesn't accumulate stale flags from prior cells.
-    fn emit_sgr(out: &mut Vec<u8>, cell: &Cell) {
-        out.extend_from_slice(b"\x1b[0");
-        if cell.flags.contains(Flags::BOLD) {
-            out.extend_from_slice(b";1");
-        }
-        if cell.flags.contains(Flags::DIM) {
-            out.extend_from_slice(b";2");
-        }
-        if cell.flags.contains(Flags::ITALIC) {
-            out.extend_from_slice(b";3");
-        }
-        if cell.flags.intersects(Flags::ALL_UNDERLINES) {
-            out.extend_from_slice(b";4");
-        }
-        if cell.flags.contains(Flags::INVERSE) {
-            out.extend_from_slice(b";7");
-        }
-        if cell.flags.contains(Flags::HIDDEN) {
-            out.extend_from_slice(b";8");
-        }
-        if cell.flags.contains(Flags::STRIKEOUT) {
-            out.extend_from_slice(b";9");
-        }
-        emit_color(out, cell.fg, /* fg = */ true);
-        emit_color(out, cell.bg, /* fg = */ false);
-        out.extend_from_slice(b"m");
-    }
-
-    fn emit_color(out: &mut Vec<u8>, color: Color, is_fg: bool) {
-        let base = if is_fg { 30 } else { 40 };
-        let bright_base = if is_fg { 90 } else { 100 };
-        let default_code = if is_fg { 39 } else { 49 };
-        let extended_lead = if is_fg { 38 } else { 48 };
-        match color {
-            Color::Named(named) => {
-                let n = named as u32;
-                if n < 8 {
-                    let _ = write!(out, ";{}", base + n);
-                } else if n < 16 {
-                    let _ = write!(out, ";{}", bright_base + (n - 8));
-                } else {
-                    // Foreground / Background / Cursor / Dim* / etc.
-                    // — fall back to "default" for unknown nameds.
-                    let _ = write!(out, ";{}", default_code);
-                }
-            }
-            Color::Indexed(idx) if idx < 8 => {
-                let _ = write!(out, ";{}", base + idx as u32);
-            }
-            Color::Indexed(idx) if idx < 16 => {
-                let _ = write!(out, ";{}", bright_base + (idx - 8) as u32);
-            }
-            Color::Indexed(idx) => {
-                let _ = write!(out, ";{};5;{}", extended_lead, idx);
-            }
-            Color::Spec(rgb) => {
-                let _ = write!(out, ";{};2;{};{};{}", extended_lead, rgb.r, rgb.g, rgb.b);
             }
         }
     }
@@ -1353,15 +994,16 @@ mod linux {
         // dims falls back to the captured pty's own size, which
         // gives a no-op clip and renders the full grid (matches
         // pre-Phase-1.10 behaviour). Storing the normalised value
-        // means render_grid_for never has to special-case zero.
+        // means VtScreen::render never has to special-case zero.
         let (viewport_rows, viewport_cols) = {
             let table = sessions.lock().expect("session table mutex poisoned");
             let Some(state) = table.get(&pty_index) else {
                 return Err(format!("no session with pty_index={pty_index}"));
             };
+            let (grid_rows, grid_cols) = state.screen.dims();
             (
-                if viewport_rows == 0 { state.dims.lines as u16 } else { viewport_rows },
-                if viewport_cols == 0 { state.dims.cols as u16 } else { viewport_cols },
+                if viewport_rows == 0 { grid_rows } else { viewport_rows },
+                if viewport_cols == 0 { grid_cols } else { viewport_cols },
             )
         };
 
@@ -1375,13 +1017,16 @@ mod linux {
             }
             state.subscribers.push(stream_id);
             // Render the captured pty's grid for the subscriber's
-            // viewport. Initial = true emits the screen-clear
-            // preamble so the subscriber starts from a known state.
+            // viewport. Initial prelude clears + forces matching screen
+            // mode so the subscriber starts from a known state.
             let replay_bytes =
-                render_grid_for(state, viewport_rows, viewport_cols, FramePrelude::Initial);
+                state
+                    .screen
+                    .render(viewport_rows, viewport_cols, Prelude::Initial);
+            let (grid_rows, grid_cols) = state.screen.dims();
             TapStreamFrame::Initial {
-                rows: state.dims.lines as u16,
-                cols: state.dims.cols as u16,
+                rows: grid_rows,
+                cols: grid_cols,
                 replay_bytes,
             }
         };
@@ -1598,7 +1243,7 @@ mod linux {
     struct FanOut {
         subscribers: Vec<u64>,
         /// Per-subscriber rendered Output frames. Each (stream_id,
-        /// bytes) pair was produced by `render_grid_for` against
+        /// bytes) pair was produced by `VtScreen::render` against
         /// that subscriber's viewport; the bytes go directly to
         /// that subscriber's channel. None when this event didn't
         /// produce captured output (input events, or no subscribers).
@@ -1885,7 +1530,7 @@ mod linux {
         rows: u16,
         cols: u16,
     ) -> TapResponse {
-        // Reject zero dims as ill-formed — render_grid_for handles
+        // Reject zero dims as ill-formed — VtScreen::render handles
         // 0 by clamping to 1, but a 1×1 viewport isn't useful and
         // probably indicates a buggy caller. Better to error.
         if rows == 0 || cols == 0 {
@@ -1923,7 +1568,7 @@ mod linux {
                     cols,
                 };
             };
-            render_grid_for(state, rows, cols, FramePrelude::Resize)
+            state.screen.render(rows, cols, Prelude::Resize)
         };
 
         // Send the refresh frame. Channel-send is non-blocking; if
@@ -2961,11 +2606,10 @@ mod linux {
             // bytes, so escape sequences that depend on dimensions
             // (cursor positioning, scroll regions) interpret against
             // the right grid.
-            let prev_dims = state.dims;
+            let prev_dims = state.screen.dims();
             state.maybe_resize(event.rows, event.cols);
-            let dim_change = (state.dims.cols != prev_dims.cols
-                || state.dims.lines != prev_dims.lines)
-                .then_some((state.dims.lines as u16, state.dims.cols as u16));
+            let new_dims = state.screen.dims();
+            let dim_change = (new_dims != prev_dims).then_some(new_dims);
 
             // Render-on-update: each subscriber receives a fresh
             // re-render of the captured pty's grid clipped/padded to
@@ -2994,11 +2638,10 @@ mod linux {
                             .iter()
                             .filter_map(|&sid| {
                                 let rec = map.get(&sid)?;
-                                let bytes = render_grid_for(
-                                    state,
+                                let bytes = state.screen.render(
                                     rec.viewport_rows,
                                     rec.viewport_cols,
-                                    FramePrelude::Live,
+                                    Prelude::Live,
                                 );
                                 Some((sid, bytes))
                             })

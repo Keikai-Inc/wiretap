@@ -44,6 +44,11 @@ clap.workspace = true
 # workspace Cargo.toml for the choice rationale.
 alacritty_terminal.workspace = true
 
+# Off-screen grid + render shared with hop's session-resume path.
+# Owns a Term internally; replaces hop-tap-d's prior render_grid_for /
+# emit_sgr / emit_color / FramePrelude inline code.
+hop-vt.workspace = true
+
 # Hop extension protocol — local mirror of hop-core's ExtMessage
 # and Bootstrap (we deliberately don't pull hop-core to avoid its
 # heavy transitive dep tree, including iroh / redb / ed25519-dalek).
