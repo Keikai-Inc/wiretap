@@ -98,7 +98,6 @@ mod linux {
     use ipc_channel::ipc::{IpcOneShotServer, IpcSender};
     use std::{
         collections::HashMap,
-        io::Write as _,
         os::fd::RawFd,
         path::PathBuf,
         sync::{
@@ -162,7 +161,7 @@ mod linux {
         "../../hop-tap-ebpf/target/bpfel-unknown-none/release/hop-tap-ebpf"
     );
 
-    struct SessionState {
+    pub(crate) struct SessionState {
         pty_index: i32,
         created_at: Instant,
         last_activity: Instant,
@@ -440,10 +439,10 @@ mod linux {
                 continue;
             };
             let Some(s) = target.to_str() else { continue };
-            if let Some(rest) = s.strip_prefix("/dev/pts/") {
-                if let Ok(n) = rest.parse::<i32>() {
-                    return Some(n);
-                }
+            if let Some(rest) = s.strip_prefix("/dev/pts/")
+                && let Ok(n) = rest.parse::<i32>()
+            {
+                return Some(n);
             }
         }
         None
@@ -527,7 +526,7 @@ mod linux {
     /// before forwarding the call, so the peer_id / peer_username /
     /// peer_role are vouched for by the hop daemon's auth layer.
     #[derive(Debug, Clone)]
-    struct PeerContext {
+    pub(crate) struct PeerContext {
         /// Opaque peer identifier (NodeId). Carried for future audit
         /// logging; not currently used for authorization decisions
         /// (which key off `peer_username` and `peer_role`).
@@ -545,6 +544,7 @@ mod linux {
         ///   - detect 2-cycles when a different connection has the
         ///     reverse subscription open (outer tap on pts/A attached
         ///     to pts/B, inner tap on pts/B asks for pts/A)
+        ///
         /// `None` for hop extension callers (their tty is on a remote
         /// host, so no local cycle is possible) and for connections
         /// whose /proc lookup failed.
@@ -903,11 +903,13 @@ mod linux {
                         controlling_pty: None,
                     };
                     handle_stream_open(
-                        &sessions,
-                        &streams,
-                        &next_stream_id,
-                        &rt_handle,
-                        &tx_to_hop,
+                        StreamOpenCtx {
+                            sessions: &sessions,
+                            streams: &streams,
+                            next_stream_id: &next_stream_id,
+                            rt_handle: &rt_handle,
+                            tx_to_hop: &tx_to_hop,
+                        },
                         &peer,
                         request_id,
                         &payload,
@@ -1058,21 +1060,35 @@ mod linux {
         Ok(SubscribeOk { stream_id, rx })
     }
 
+    /// Daemon-shared context for the hop-side stream handlers. Bundled
+    /// so handle_stream_open stays under clippy's argument limit; the
+    /// borrows live only for the duration of the call.
+    struct StreamOpenCtx<'a> {
+        sessions: &'a SessionTable,
+        streams: &'a StreamsMap,
+        next_stream_id: &'a Arc<AtomicU64>,
+        rt_handle: &'a Handle,
+        tx_to_hop: &'a IpcSender<ExtMessage>,
+    }
+
     /// Hop-side stream open: decode the TapStreamRequest payload,
     /// register the subscriber, send StreamOpened, then spawn a
     /// forwarder task that drains the SubscriberMsg channel and
     /// converts each message to ExtMessage::StreamFrame /
     /// StreamClosed.
     fn handle_stream_open(
-        sessions: &SessionTable,
-        streams: &StreamsMap,
-        next_stream_id: &Arc<AtomicU64>,
-        rt_handle: &Handle,
-        tx_to_hop: &IpcSender<ExtMessage>,
+        ctx: StreamOpenCtx<'_>,
         peer: &PeerContext,
         request_id: u64,
         payload: &[u8],
     ) {
+        let StreamOpenCtx {
+            sessions,
+            streams,
+            next_stream_id,
+            rt_handle,
+            tx_to_hop,
+        } = ctx;
         let cfg = bincode::config::standard();
         let req: TapStreamRequest = match bincode::serde::decode_from_slice(payload, cfg) {
             Ok((req, _)) => req,
@@ -1182,10 +1198,10 @@ mod linux {
             .lock()
             .expect("streams mutex poisoned")
             .remove(&stream_id);
-        if let Ok(mut table) = sessions.lock() {
-            if let Some(state) = table.get_mut(&pty_index) {
-                state.subscribers.retain(|&id| id != stream_id);
-            }
+        if let Ok(mut table) = sessions.lock()
+            && let Some(state) = table.get_mut(&pty_index)
+        {
+            state.subscribers.retain(|&id| id != stream_id);
         }
     }
 
@@ -1350,12 +1366,15 @@ mod linux {
                 }
                 let table = sessions.lock().expect("session table mutex poisoned");
                 match table.get(&pty_index) {
-                    Some(s) if peer.scope_allows(s) => TapResponse::Snapshot {
-                        pty_index,
-                        rows: s.dims.lines as u16,
-                        cols: s.dims.cols as u16,
-                        contents: s.snapshot_full_screen(),
-                    },
+                    Some(s) if peer.scope_allows(s) => {
+                        let (grid_rows, grid_cols) = s.screen.dims();
+                        TapResponse::Snapshot {
+                            pty_index,
+                            rows: grid_rows,
+                            cols: grid_cols,
+                            contents: s.snapshot_full_screen(),
+                        }
+                    }
                     Some(_) => {
                         // Session exists but this peer can't see it.
                         // Surface as the same error as "doesn't exist"
@@ -1494,10 +1513,10 @@ mod linux {
         let mut delivered = 0usize;
         let map = streams.lock().expect("streams mutex poisoned");
         for sid in &subscribers {
-            if let Some(rec) = map.get(sid) {
-                if rec.tx.send(SubscriberMsg::Frame(frame.clone())).is_ok() {
-                    delivered += 1;
-                }
+            if let Some(rec) = map.get(sid)
+                && rec.tx.send(SubscriberMsg::Frame(frame.clone())).is_ok()
+            {
+                delivered += 1;
             }
         }
 
@@ -2010,10 +2029,10 @@ mod linux {
         pty_index: i32,
         opener_pid: u32,
     ) -> std::io::Result<libc::pid_t> {
-        if let Ok(pgrp) = foreground_pgrp(pty_index) {
-            if pgrp > 0 {
-                return Ok(pgrp);
-            }
+        if let Ok(pgrp) = foreground_pgrp(pty_index)
+            && pgrp > 0
+        {
+            return Ok(pgrp);
         }
         pgrp_via_opener(opener_pid)
     }
@@ -2326,17 +2345,17 @@ mod linux {
         // which is the very thing this is trying to enable.
         {
             let mut table = sessions.lock().expect("session table mutex poisoned");
-            if let Some(state) = table.get_mut(&pty_index) {
-                if state.master_fd >= 0 {
-                    // SAFETY: we own this fd and we're about to
-                    // mark it as -1 so SessionState's Drop won't
-                    // double-close.
-                    unsafe {
-                        libc::close(state.master_fd);
-                    }
-                    state.master_fd = -1;
-                    state.master_holder_pid = 0;
+            if let Some(state) = table.get_mut(&pty_index)
+                && state.master_fd >= 0
+            {
+                // SAFETY: we own this fd and we're about to
+                // mark it as -1 so SessionState's Drop won't
+                // double-close.
+                unsafe {
+                    libc::close(state.master_fd);
                 }
+                state.master_fd = -1;
+                state.master_holder_pid = 0;
             }
         }
 
@@ -2537,13 +2556,13 @@ mod linux {
                 let kind = e.kind();
                 let raw = e.raw_os_error();
                 let mut table = sessions.lock().expect("session table mutex poisoned");
-                if let Some(state) = table.get_mut(&pty_index) {
-                    if state.master_fd == fd {
-                        unsafe {
-                            libc::close(state.master_fd);
-                        }
-                        state.master_fd = -1;
+                if let Some(state) = table.get_mut(&pty_index)
+                    && state.master_fd == fd
+                {
+                    unsafe {
+                        libc::close(state.master_fd);
                     }
+                    state.master_fd = -1;
                 }
                 drop(table);
                 warn!(pty_index, ?kind, errno = ?raw, "inject write failed; cleared cached fd");

@@ -109,12 +109,11 @@ fn find_master_fd_in(pid: u32, pty_index: i32) -> io::Result<c_int> {
             Err(_) => continue,
         };
         for line in body.lines() {
-            if let Some(rest) = line.strip_prefix("tty-index:") {
-                if let Ok(n) = rest.trim().parse::<i32>() {
-                    if n == pty_index {
-                        return Ok(fd);
-                    }
-                }
+            if let Some(rest) = line.strip_prefix("tty-index:")
+                && let Ok(n) = rest.trim().parse::<i32>()
+                && n == pty_index
+            {
+                return Ok(fd);
             }
         }
     }
