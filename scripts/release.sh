@@ -10,13 +10,17 @@
 # What it builds (Linux only — hop-tap is eBPF):
 #   - hop-tap-d-linux-x86_64,  hop-tap-d-linux-arm64
 #   - tap-linux-x86_64, tap-linux-arm64
+#   - hop-tap-ebpf (the embedded BPF object, for HOP_TAP_SKIP_EBPF_BUILD=1 builds)
 #   + matching .sha256 files
 #
-# eBPF wrinkle: the kernel-side crate builds with vlad's stage1-vlad
-# rustc + bpfel-unknown-none target. The output is BPF bytecode, host-
-# arch-independent, so we build it ONCE on the release host and embed
-# the same .bpf.o into every userspace cross-build via
-# HOP_TAP_SKIP_EBPF_BUILD=1.
+# eBPF wrinkle: the kernel-side crate builds with a pinned rustc fork
+# (rustup toolchain `stage1-vlad`, see docs/ebpf-toolchain.md) for the
+# bpfel-unknown-none target. The output is BPF bytecode, host-arch-
+# independent, so we build it ONCE on the release host, embed the same
+# object into every userspace cross-build via HOP_TAP_SKIP_EBPF_BUILD=1,
+# and publish it alongside the binaries as `hop-tap-ebpf` (+ .sha256)
+# so contributors without the fork can build userspace against the
+# exact bytecode users run.
 
 set -euo pipefail
 
@@ -339,8 +343,13 @@ done
 
 # --- Upload to S3 -----------------------------------------------------------
 
+# The eBPF object is published unstripped (strip would drop .BTF.ext) so a
+# userspace-only build can embed the shipped bytecode (docs/ebpf-toolchain.md).
+cp "${EBPF_OUT}" "${DIST_DIR}/hop-tap-ebpf"
+shasum -a 256 "${DIST_DIR}/hop-tap-ebpf" | awk '{print $1}' > "${DIST_DIR}/hop-tap-ebpf.sha256"
+
 echo "==> Uploading binaries to s3://${BUCKET}/v${VERSION}/"
-for f in "${RELEASE_BINS[@]}"; do
+for f in "${RELEASE_BINS[@]}" "${DIST_DIR}/hop-tap-ebpf"; do
   aws s3 cp "${f}"          "s3://${BUCKET}/v${VERSION}/$(basename "${f}")"
   aws s3 cp "${f}.sha256"   "s3://${BUCKET}/v${VERSION}/$(basename "${f}").sha256"
 done

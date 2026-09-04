@@ -3,14 +3,17 @@
 Hop extension that captures every TTY/PTY session on a Linux host via
 eBPF and lets remote peers list, view, and (eventually) drive them.
 
-This is a clean-slate rebuild of the prototype `term-capture-ebpf`,
-using **vlad's rustc fork** for native `#[relocatable]` CO-RE field
-access in pure Rust — no Kunai dependency, no vendored C shims, no
-`bindgen`-generated `vmlinux.rs`.
+The kernel-side program is pure Rust with native `#[relocatable]`
+CO-RE field access — no C shims, no `bindgen`-generated `vmlinux.rs`.
+That relies on a pinned rustc fork implementing
+[RFC 3966](https://github.com/rust-lang/rfcs/pull/3966); see
+[`docs/ebpf-toolchain.md`](docs/ebpf-toolchain.md) for exactly what is
+pinned and how to build it (`scripts/build-ebpf-toolchain.sh` does it
+for you). Only `crates/hop-tap-ebpf` needs it; the daemon and CLI build
+with stable Rust.
 
-See `docs/hop-tap-plan.md` (in the `hop` repo) for the full design
-doc, and `term-capture-ebpf/DESCRIPTION.md` for the original
-prototype's architecture (the behavior we're targeting).
+The design doc is `docs/technical/tap.md` in the
+[wirehop](https://github.com/Keikai-Inc/wirehop) repo.
 
 ## Status
 
@@ -39,7 +42,7 @@ hop-tap/
 ├── Cargo.toml                       # workspace (excludes hop-tap-ebpf)
 ├── crates/
 │   ├── hop-tap-ebpf-common/         # shared no_std types (event structs)
-│   ├── hop-tap-ebpf/                # kernel-side; built with vlad's stage1 rustc
+│   ├── hop-tap-ebpf/                # kernel-side; pinned rustc fork, see docs/ebpf-toolchain.md
 │   │   └── .cargo/config.toml       # bpfel-unknown-none + bpf-linker
 │   ├── hop-tap-protocol/            # wire types (TapRequest/Response,
 │   │                                #   stream frames). Tiny crate;

@@ -1,13 +1,19 @@
 # eBPF target configuration for hop-tap-ebpf.
 #
 # The actual build is driven by hop-tap-d's build.rs, which invokes
-# `cargo +stage1-vlad build` here. The toolchain must be vlad's rustc
-# fork that supports #[relocatable] for native CO-RE field-offset
-# relocations.
+# `cargo +stage1-vlad build` here. The toolchain is a pinned rustc fork
+# that supports `#[relocatable]` for native CO-RE field-offset
+# relocations; see docs/ebpf-toolchain.md for the exact commits and
+# how to build it (or run scripts/build-ebpf-toolchain.sh).
 #
 # The linker is bpf-linker (https://github.com/aya-rs/bpf-linker),
 # the LLVM-IR-level BPF linker that produces the final .bpf.o object
-# with .BTF and .BTF.ext sections.
+# with .BTF and .BTF.ext sections. rustc's BPF targets default to a
+# linker named `bpf-linker`, resolved from PATH, so nothing is
+# configured here. To use a binary that is not on PATH:
+#
+#   cargo +stage1-vlad build --release \
+#     --config 'target.bpfel-unknown-none.linker="/path/to/bpf-linker"'
 
 [build]
 target = "bpfel-unknown-none"
@@ -16,10 +22,6 @@ target = "bpfel-unknown-none"
 build-std = ["core"]
 
 [target.bpfel-unknown-none]
-# Path to the bpf-linker binary. If you're working from /Users/dev/git-projects/bpf-linker
-# this default works; otherwise override via the BPF_LINKER env var or
-# pass --config 'target.bpfel-unknown-none.linker="..."'.
-linker = "/Users/dev/git-projects/bpf-linker/target/release/bpf-linker"
 rustflags = [
     "-C", "debuginfo=2",
     "-C", "link-arg=--btf",

@@ -1,12 +1,13 @@
 //! Cross-compiles the kernel-side `hop-tap-ebpf` crate as part of the
 //! userspace daemon build.
 //!
-//! Modeled on `term-capture-ebpf/dd-pty-linux-ebpf/build.rs` — the key
-//! difference is the toolchain: we invoke vlad's stage1 rustc fork
-//! (linked as `stage1-vlad`) so `#[relocatable]` is available for
-//! Phase 1.3+. The toolchain is overridable via `HOP_TAP_BPF_TOOLCHAIN`
-//! for CI / contributors who don't have vlad's fork built locally
-//! (e.g. set it to `nightly` while testing pre-CO-RE plumbing).
+//! The eBPF crate needs a pinned rustc fork that supports
+//! `#[relocatable]` (native CO-RE field-offset relocations), registered
+//! as the rustup toolchain `stage1-vlad`. `docs/ebpf-toolchain.md` has
+//! the exact commits and `scripts/build-ebpf-toolchain.sh` builds it.
+//! The toolchain name is overridable via `HOP_TAP_BPF_TOOLCHAIN`, and
+//! `HOP_TAP_SKIP_EBPF_BUILD=1` embeds a prebuilt object (each release
+//! publishes the one it shipped as `hop-tap-ebpf`).
 //!
 //! Gated on `cfg(target_os = "linux")` so the workspace still resolves
 //! and builds (sans bytecode) on macOS dev machines. The userspace
