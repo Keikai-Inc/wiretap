@@ -157,9 +157,8 @@ mod linux {
     const FALLBACK_COLS: u16 = 80;
     const FALLBACK_ROWS: u16 = 24;
 
-    static EBPF_OBJECT: &[u8] = include_bytes_aligned!(
-        "../../hop-tap-ebpf/target/bpfel-unknown-none/release/hop-tap-ebpf"
-    );
+    static EBPF_OBJECT: &[u8] =
+        include_bytes_aligned!(concat!(env!("OUT_DIR"), "/hop-tap-ebpf"));
 
     pub(crate) struct SessionState {
         pty_index: i32,
