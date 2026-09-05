@@ -1,0 +1,149 @@
+name: Release
+
+# Builds, signs and publishes a WireTap release from GitHub-hosted runners on a
+# tag push. The eBPF object is built in the pinned toolchain image (see
+# toolchain-image.yml); the userspace binaries are cross-built with that object
+# embedded, signed with the RSA release key from secrets, and uploaded to S3
+# over AWS OIDC (no long-lived keys) plus a GitHub Release.
+#
+# One-time setup (see the repo's release notes / AGENTS.md):
+#   - secret HOP_SIGNING_KEY_PEM  : RSA release private key (PEM text)
+#   - secret AWS_ROLE_ARN         : OIDC role allowed to publish (see IAM below)
+#   - secret HOP_TAP_CF_DISTRIBUTION_ID : tap CloudFront distribution to invalidate
+#   - a `release` environment with a required reviewer (matches the OIDC trust)
+
+on:
+  push:
+    tags: ["v*"]
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write   # create the GitHub Release
+  id-token: write   # AWS OIDC
+  packages: read    # pull the toolchain image
+
+env:
+  EBPF_PATH: crates/hop-tap-ebpf/target/bpfel-unknown-none/release/hop-tap-ebpf
+
+jobs:
+  # 1) Build the eBPF object in the pinned toolchain image.
+  ebpf:
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/keikai-inc/wiretap-toolchain:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the eBPF program
+        working-directory: crates/hop-tap-ebpf
+        run: cargo +stage1-vlad build --release --target bpfel-unknown-none
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ebpf-object
+          path: ${{ env.EBPF_PATH }}
+          if-no-files-found: error
+
+  # 2) Cross-build the userspace binaries (musl, static) with the object embedded,
+  #    then checksum and sign each.
+  build:
+    needs: ebpf
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            arch: x86_64
+          - target: aarch64-unknown-linux-musl
+            arch: arm64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cross
+        run: cargo install cross --git https://github.com/cross-rs/cross --locked
+      - name: Fetch the eBPF object into the include path
+        uses: actions/download-artifact@v4
+        with:
+          name: ebpf-object
+          path: crates/hop-tap-ebpf/target/bpfel-unknown-none/release/
+      - name: Cross-build daemon, CLI and honeypot
+        env:
+          HOP_TAP_SKIP_EBPF_BUILD: "1"   # the object is already present; do not rebuild
+        run: |
+          cross build --release --target "${{ matrix.target }}" \
+            --bin hop-tap-d --bin tap --bin tap-honeypot -p hop-tap-d
+      - name: Stage, checksum and sign
+        env:
+          SIGNING_KEY: ${{ secrets.HOP_SIGNING_KEY_PEM }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          for b in hop-tap-d tap tap-honeypot; do
+            cp "target/${{ matrix.target }}/release/$b" "dist/${b}-linux-${{ matrix.arch }}"
+          done
+          [ -n "$SIGNING_KEY" ] || { echo "HOP_SIGNING_KEY_PEM is empty" >&2; exit 1; }
+          printf '%s' "$SIGNING_KEY" > "$RUNNER_TEMP/key.pem"
+          pub="$RUNNER_TEMP/pub.pem"; openssl rsa -in "$RUNNER_TEMP/key.pem" -pubout -out "$pub" 2>/dev/null
+          cd dist
+          for f in *-linux-${{ matrix.arch }}; do
+            sha256sum "$f" | awk '{print $1}' > "$f.sha256"
+            openssl dgst -sha256 -sign "$RUNNER_TEMP/key.pem" -out "$f.sig" "$f"
+            openssl dgst -sha256 -verify "$pub" -signature "$f.sig" "$f" >/dev/null
+          done
+          rm -f "$RUNNER_TEMP/key.pem" "$pub"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.arch }}
+          path: dist/
+
+  # 3) Publish to S3 (OIDC) + a GitHub Release, and invalidate the CDN.
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: release   # gates the OIDC trust; add a required reviewer
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { name: ebpf-object, path: ebpf/ }
+      - uses: actions/download-artifact@v4
+        with: { name: dist-x86_64, path: dist/ }
+      - uses: actions/download-artifact@v4
+        with: { name: dist-arm64, path: dist/ }
+      - name: Sign and checksum the eBPF object
+        env:
+          SIGNING_KEY: ${{ secrets.HOP_SIGNING_KEY_PEM }}
+        run: |
+          set -euo pipefail
+          cp ebpf/hop-tap-ebpf dist/hop-tap-ebpf
+          cd dist
+          sha256sum hop-tap-ebpf | awk '{print $1}' > hop-tap-ebpf.sha256
+          printf '%s' "$SIGNING_KEY" > "$RUNNER_TEMP/key.pem"
+          openssl dgst -sha256 -sign "$RUNNER_TEMP/key.pem" -out hop-tap-ebpf.sig hop-tap-ebpf
+          rm -f "$RUNNER_TEMP/key.pem"
+      - name: Version from tag
+        id: v
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+      - name: Upload to S3
+        run: |
+          set -euo pipefail
+          VER="${{ steps.v.outputs.version }}"
+          for f in dist/*; do
+            aws s3 cp "$f" "s3://hop-tap-releases/v${VER}/$(basename "$f")"
+          done
+          printf '%s' "$VER" > latest && aws s3 cp latest "s3://hop-tap-releases/latest" --content-type text/plain
+      - name: Invalidate CDN
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id "${{ secrets.HOP_TAP_CF_DISTRIBUTION_ID }}" --paths "/*" || true
+      - name: GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release create "${GITHUB_REF_NAME}" dist/* --title "WireTap ${GITHUB_REF_NAME}" --generate-notes

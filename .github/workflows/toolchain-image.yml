@@ -1,0 +1,52 @@
+name: eBPF toolchain image
+
+# Builds docker/toolchain.Dockerfile (the pinned rustc fork + bpf-linker) on a
+# GitHub runner and pushes it to this repo's GitHub Container Registry, so the
+# 30-90 min rustc bootstrap happens once in the cloud and CI/release jobs just
+# pull it. Built rarely: on demand, or when the toolchain inputs change.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - docker/toolchain.Dockerfile
+      - scripts/build-ebpf-toolchain.sh
+      - docs/ebpf-toolchain.md
+
+concurrency:
+  group: toolchain-image
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360   # the rustc bootstrap is long
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free up disk (rustc build needs ~30 GB)
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache
+          df -h /
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/toolchain.Dockerfile
+          push: true
+          tags: |
+            ghcr.io/keikai-inc/wiretap-toolchain:latest
+            ghcr.io/keikai-inc/wiretap-toolchain:${{ github.sha }}
