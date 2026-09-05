@@ -17,6 +17,7 @@ resolver = "2"
 version = "0.2.30"
 edition = "2024"
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/Keikai-Inc/wiretap"
 
 [workspace.dependencies]
 # Workspace-internal
@@ -49,7 +50,7 @@ alacritty_terminal = { version = "0.26", default-features = false }
 # a local [paths]/[patch] override is avoided because `cross` mounts only
 # the overridden subdir, breaking hop-vt's `*.workspace = true` in the
 # container. (crates.io is the intended end state.)
-hop-vt = { git = "https://github.com/Keikai-Inc/wirehop.git", tag = "hop-vt-0.9.37" }
+hop-vt = { package = "wirehop-vt", version = "0.9.37" }
 
 # Serialization (used as we add features).
 serde = { version = "1", features = ["derive"] }

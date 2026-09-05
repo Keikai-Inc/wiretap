@@ -3,6 +3,8 @@ name = "hop-tap-ebpf-common"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "Shared no_std event types for the WireTap eBPF terminal-capture programs (kernel and userspace)."
+repository.workspace = true
 
 [features]
 default = []
