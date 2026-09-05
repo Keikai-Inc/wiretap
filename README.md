@@ -67,7 +67,7 @@ Report vulnerabilities privately: see [`SECURITY.md`](SECURITY.md).
 ## Install
 
 ```bash
-curl -fsSL https://wirehop.org/tap/install.sh | bash
+curl -fsSL https://tap.keikai.ai/install.sh | bash
 ```
 
 The installer auto-detects whether WireHop is on the host and picks a mode; both
@@ -108,7 +108,7 @@ To run both, install WireHop first, then `hop-tap`:
 
 ```bash
 curl -fsSL https://wirehop.org/install-daemon.sh | bash
-curl -fsSL https://wirehop.org/tap/install.sh | bash
+curl -fsSL https://tap.keikai.ai/install.sh | bash
 ```
 
 ### Verify

@@ -1,6 +1,6 @@
 [Unit]
 Description=hop-tap eBPF terminal capture daemon
-Documentation=https://wirehop.org/tap
+Documentation=https://github.com/Keikai-Inc/wiretap
 # Start after hop so the manifest is in place before we open the
 # bootstrap rendezvous; if hop comes back later (restart, upgrade)
 # we'll be re-read on its next start.

@@ -341,6 +341,33 @@ for f in "${RELEASE_BINS[@]}"; do
   shasum -a 256 "${f}" | awk '{print $1}' > "${f}.sha256"
 done
 
+# --- Sign artifacts (detached openssl RSA; install.sh verifies) -------------
+# Fail-closed once install.sh embeds a pubkey. Key defaults to the shared
+# WireHop release key so tap and hop verify against the same identity.
+if [[ -z "${HOP_SIGNING_KEY:-}" && -f "${HOME}/.hop-signing/hop-release-private.pem" ]]; then
+  HOP_SIGNING_KEY="${HOME}/.hop-signing/hop-release-private.pem"
+fi
+if grep -q -- "-----BEGIN PUBLIC KEY-----" "${PROJECT_ROOT}/install.sh" 2>/dev/null \
+   && [[ -z "${HOP_SIGNING_KEY:-}" ]]; then
+  echo "Error: install.sh embeds a release pubkey, so releases MUST be signed." >&2
+  echo "       Set HOP_SIGNING_KEY or restore ~/.hop-signing/hop-release-private.pem" >&2
+  exit 1
+fi
+if [[ -n "${HOP_SIGNING_KEY:-}" ]]; then
+  [[ -f "${HOP_SIGNING_KEY}" ]] || { echo "Error: HOP_SIGNING_KEY=${HOP_SIGNING_KEY} not found" >&2; exit 1; }
+  echo "==> Signing artifacts with ${HOP_SIGNING_KEY}"
+  for f in "${RELEASE_BINS[@]}" "${DIST_DIR}/hop-tap-ebpf"; do
+    [[ -f "${f}" ]] || continue
+    openssl dgst -sha256 -sign "${HOP_SIGNING_KEY}" -out "${f}.sig" "${f}"
+    pub="$(mktemp)"; openssl rsa -in "${HOP_SIGNING_KEY}" -pubout -out "${pub}" 2>/dev/null
+    openssl dgst -sha256 -verify "${pub}" -signature "${f}.sig" "${f}" >/dev/null \
+      || { echo "Error: self-verify failed for ${f}" >&2; rm -f "${pub}"; exit 1; }
+    rm -f "${pub}"
+  done
+else
+  echo "==> HOP_SIGNING_KEY unset — unsigned release (install.sh verifies checksum only)"
+fi
+
 # --- Upload to S3 -----------------------------------------------------------
 
 # The eBPF object is published unstripped (strip would drop .BTF.ext) so a
@@ -352,6 +379,7 @@ echo "==> Uploading binaries to s3://${BUCKET}/v${VERSION}/"
 for f in "${RELEASE_BINS[@]}" "${DIST_DIR}/hop-tap-ebpf"; do
   aws s3 cp "${f}"          "s3://${BUCKET}/v${VERSION}/$(basename "${f}")"
   aws s3 cp "${f}.sha256"   "s3://${BUCKET}/v${VERSION}/$(basename "${f}").sha256"
+  [[ -f "${f}.sig" ]] && aws s3 cp "${f}.sig" "s3://${BUCKET}/v${VERSION}/$(basename "${f}").sig"
 done
 
 echo "==> Uploading latest version marker"

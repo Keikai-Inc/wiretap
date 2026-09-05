@@ -25,6 +25,10 @@
 set -euo pipefail
 
 BASE_URL="${HOP_TAP_CDN_URL:-https://tap.keikai.ai}"
+# Release-signing public key. Empty => checksum-only (current). When signed
+# releases begin, embed the WireHop release pubkey here and installs become
+# fail-closed (a missing/bad .sig aborts). Override for testing with HOP_TAP_PUBKEY.
+HOP_TAP_PUBKEY="${HOP_TAP_PUBKEY:-}"
 HOP_BASE_URL="${HOP_CDN_URL:-https://hop.keikai.ai}"
 
 # --- Colour helpers (disabled when piped) ------------------------------------
@@ -187,6 +191,30 @@ info "Verifying checksums..."
 verify_sha256 "${TMPDIR_HOPTAP}/hop-tap-d" "${TMPDIR_HOPTAP}/hop-tap-d.sha256"
 verify_sha256 "${TMPDIR_HOPTAP}/tap" "${TMPDIR_HOPTAP}/tap.sha256"
 verify_sha256 "${TMPDIR_HOPTAP}/tap-honeypot" "${TMPDIR_HOPTAP}/tap-honeypot.sha256"
+
+# --- Verify signatures (when a pubkey is embedded) --------------------------
+# Checksums prove integrity, not provenance: a compromised CDN could serve a
+# matching binary+checksum. When HOP_TAP_PUBKEY is embedded, require a valid
+# detached openssl signature over each binary and fail closed. Empty => skipped.
+verify_sig() {
+  local file="$1" url="$2" name="$3"
+  [[ -n "${HOP_TAP_PUBKEY}" ]] || return 0
+  command -v openssl >/dev/null 2>&1 || die "Signature verification needs openssl, which was not found."
+  if ! fetch "${url}.sig" "${file}.sig" 2>/dev/null; then
+    die "Signed releases expected, but no signature found for ${name}. Aborting."
+  fi
+  printf '%s\n' "${HOP_TAP_PUBKEY}" > "${TMPDIR_HOPTAP}/pub.pem"
+  openssl dgst -sha256 -verify "${TMPDIR_HOPTAP}/pub.pem" \
+      -signature "${file}.sig" "${file}" >/dev/null 2>&1 \
+    || die "Signature verification FAILED for ${name}. Refusing to install."
+}
+if [[ -n "${HOP_TAP_PUBKEY}" ]]; then
+  info "Verifying signatures..."
+  verify_sig "${TMPDIR_HOPTAP}/hop-tap-d" "${DAEMON_URL}" "hop-tap-d"
+  verify_sig "${TMPDIR_HOPTAP}/tap" "${TAP_URL}" "tap"
+  verify_sig "${TMPDIR_HOPTAP}/tap-honeypot" "${HONEYPOT_URL}" "tap-honeypot"
+  info "Signatures verified."
+fi
 
 # --- Install binaries --------------------------------------------------------
 #
