@@ -28,8 +28,13 @@ ARG LLVM_MAJOR=22
 RUN curl -fsSL https://apt.llvm.org/llvm.sh -o /tmp/llvm.sh \
     && chmod +x /tmp/llvm.sh && /tmp/llvm.sh ${LLVM_MAJOR} \
     && apt-get update && apt-get install -y --no-install-recommends \
-        llvm-${LLVM_MAJOR}-dev libpolly-${LLVM_MAJOR}-dev clang-${LLVM_MAJOR} \
-    && rm -rf /var/lib/apt/lists/* /tmp/llvm.sh
+        llvm-${LLVM_MAJOR}-dev libpolly-${LLVM_MAJOR}-dev \
+        clang-${LLVM_MAJOR} lld-${LLVM_MAJOR} \
+    && rm -rf /var/lib/apt/lists/* /tmp/llvm.sh \
+    # bpf-linker's llvm-sys build links with clang/lld; expose unversioned names.
+    && for t in clang clang++ lld ld.lld; do \
+         ln -sf "/usr/bin/${t}-${LLVM_MAJOR}" "/usr/bin/${t}"; \
+       done
 ENV LLVM_SYS_221_PREFIX=/usr/lib/llvm-22
 
 # rustup (a recent nightly; the build script registers the fork as stage1-vlad).
@@ -42,10 +47,14 @@ FROM base AS toolchain
 WORKDIR /src
 COPY scripts/build-ebpf-toolchain.sh scripts/build-ebpf-toolchain.sh
 COPY docs/ebpf-toolchain.md docs/ebpf-toolchain.md
-# Builds rustc (download-ci-llvm, so no LLVM source build) and bpf-linker, then
-# registers the `stage1-vlad` rustup toolchain that crates/hop-tap-ebpf uses.
+# Two layers so the ~20 min rustc bootstrap caches independently of the quick
+# bpf-linker build (GHA layer cache in the workflow). First builds + registers
+# the `stage1-vlad` toolchain (download-ci-llvm, no LLVM source build)...
 RUN LLVM_SYS_221_PREFIX=/usr/lib/llvm-22 \
-    ./scripts/build-ebpf-toolchain.sh --work /opt/hop-tap-toolchain
-# Sanity: the toolchain resolves and can see the BPF target.
+    ./scripts/build-ebpf-toolchain.sh --work /opt/hop-tap-toolchain --skip-linker
+# ...then bpf-linker against LLVM 22.
+RUN LLVM_SYS_221_PREFIX=/usr/lib/llvm-22 \
+    ./scripts/build-ebpf-toolchain.sh --work /opt/hop-tap-toolchain --skip-rustc
+# Sanity: the toolchain resolves and bpf-linker is on PATH.
 RUN rustup toolchain list | grep -q stage1-vlad \
-    && cargo +stage1-vlad --version
+    && cargo +stage1-vlad --version && bpf-linker --version

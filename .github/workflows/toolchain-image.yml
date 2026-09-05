@@ -50,3 +50,5 @@ jobs:
           tags: |
             ghcr.io/keikai-inc/wiretap-toolchain:latest
             ghcr.io/keikai-inc/wiretap-toolchain:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
