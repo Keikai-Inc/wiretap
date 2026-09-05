@@ -29,12 +29,15 @@ RUN curl -fsSL https://apt.llvm.org/llvm.sh -o /tmp/llvm.sh \
     && chmod +x /tmp/llvm.sh && /tmp/llvm.sh ${LLVM_MAJOR} \
     && apt-get update && apt-get install -y --no-install-recommends \
         llvm-${LLVM_MAJOR}-dev libpolly-${LLVM_MAJOR}-dev \
-        clang-${LLVM_MAJOR} lld-${LLVM_MAJOR} \
+        clang-${LLVM_MAJOR} lld-${LLVM_MAJOR} llvm-${LLVM_MAJOR} \
     && rm -rf /var/lib/apt/lists/* /tmp/llvm.sh \
-    # bpf-linker's llvm-sys build links with clang/lld; expose unversioned names.
-    && for t in clang clang++ lld ld.lld; do \
+    # bpf-linker's llvm-sys build wants clang/lld as the linker and llvm-config
+    # under the LLVM prefix; expose the unversioned names it looks for.
+    && for t in clang clang++ lld ld.lld llvm-config; do \
          ln -sf "/usr/bin/${t}-${LLVM_MAJOR}" "/usr/bin/${t}"; \
-       done
+       done \
+    && mkdir -p /usr/lib/llvm-${LLVM_MAJOR}/bin \
+    && ln -sf /usr/bin/llvm-config-${LLVM_MAJOR} /usr/lib/llvm-${LLVM_MAJOR}/bin/llvm-config
 ENV LLVM_SYS_221_PREFIX=/usr/lib/llvm-22
 
 # rustup (a recent nightly; the build script registers the fork as stage1-vlad).
