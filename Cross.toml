@@ -1,0 +1,10 @@
+# Cross-compilation config. hop-tap-d's build.rs cross-builds the eBPF crate
+# with the pinned rustc fork; that toolchain is not in cross's containers, so
+# userspace cross builds pass HOP_TAP_SKIP_EBPF_BUILD=1 and it must reach the
+# build script inside the container.
+[build.env]
+passthrough = [
+    "HOP_TAP_SKIP_EBPF_BUILD",
+    "HOP_TAP_BPF_TOOLCHAIN",
+    "AWS_LC_SYS_CMAKE_BUILDER",
+]
