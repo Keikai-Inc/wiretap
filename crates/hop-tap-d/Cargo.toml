@@ -4,6 +4,8 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 build = "build.rs"
+description = "WireTap: system-wide, tmux-style terminal session audit for Linux over eBPF. Daemon (hop-tap-d) plus the tap CLI."
+repository.workspace = true
 
 [[bin]]
 name = "hop-tap-d"

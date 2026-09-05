@@ -21,8 +21,8 @@ repository = "https://github.com/Keikai-Inc/wiretap"
 
 [workspace.dependencies]
 # Workspace-internal
-hop-tap-ebpf-common = { path = "crates/hop-tap-ebpf-common" }
-hop-tap-protocol = { path = "crates/hop-tap-protocol" }
+hop-tap-ebpf-common = { path = "crates/hop-tap-ebpf-common", version = "0.2.30" }
+hop-tap-protocol = { path = "crates/hop-tap-protocol", version = "0.2.30" }
 
 # Async runtime
 tokio = { version = "1", features = ["macros", "net", "rt", "rt-multi-thread", "sync", "time", "signal", "io-util"] }
