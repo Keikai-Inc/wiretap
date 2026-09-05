@@ -40,16 +40,16 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # emulator choice for the full rationale.)
 alacritty_terminal = { version = "0.26", default-features = false }
 
-# Shared off-screen terminal grid + rendering primitives. Lives in
-# the hop workspace because hop's session-resume path needs the same
-# render that hop-tap's subscriber stream does. Pinned to a hop
-# release tag; cargo checks out the whole hop repo (workspace root
-# included) so hop-vt's workspace-inherited manifest resolves. Editing
-# hop-vt requires a new hop tag + bumping the pin here — a local
-# [paths]/[patch] override is deliberately avoided because `cross`
-# mounts only the overridden subdir, not hop's workspace root, which
-# breaks hop-vt's `*.workspace = true` inheritance in the container.
-hop-vt = { git = "https://github.com/Keikai-Inc/wirehop.git", tag = "v0.9.37" }
+# Shared off-screen terminal grid + rendering primitives. Lives in the
+# public WireHop workspace (github.com/Keikai-Inc/wirehop) because its
+# session-resume path needs the same render hop-tap's subscriber stream
+# does. Pinned to the `hop-vt-0.9.37` tag; cargo checks out the whole
+# repo (workspace root included) so hop-vt's workspace-inherited manifest
+# resolves. Editing hop-vt means a new tag there + bumping the pin here;
+# a local [paths]/[patch] override is avoided because `cross` mounts only
+# the overridden subdir, breaking hop-vt's `*.workspace = true` in the
+# container. (crates.io is the intended end state.)
+hop-vt = { git = "https://github.com/Keikai-Inc/wirehop.git", tag = "hop-vt-0.9.37" }
 
 # Serialization (used as we add features).
 serde = { version = "1", features = ["derive"] }
