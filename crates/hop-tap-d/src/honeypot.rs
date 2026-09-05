@@ -27,7 +27,9 @@
 //! 5. Child: `pivot_root(2)` into the sandbox root.
 //! 6. Child: `setsid()` + `ioctl(slave_fd, TIOCSCTTY)` so the captured
 //!    pty becomes our controlling tty.
-//! 7. Child: drop capabilities, set `PR_SET_NO_NEW_PRIVS`.
+//! 7. Child: `PR_SET_NO_NEW_PRIVS` and exec as an unprivileged uid, so the
+//!    kernel clears the impostor shell's capabilities at execve and it
+//!    cannot regain them (the entry point refuses a root inside-uid).
 //! 8. Child: `execve("/bin/bash", ...)` with the user's preserved env
 //!    (or as much of it as we can plausibly reconstruct).
 //!
@@ -123,6 +125,18 @@ impl SandboxSpec {
 /// happen on the child side. The parent waits on the child; if the
 /// parent is killed the child follows via `PR_SET_PDEATHSIG=SIGKILL`.
 pub fn enter_sandbox_and_exec(spec: SandboxSpec) -> Result<std::convert::Infallible> {
+    // Refuse to run the decoy as root *inside* the user namespace. The
+    // namespace maps the sandbox uid to the daemon's real euid (root), so an
+    // inside uid of 0 would give the impostor shell a full capability set that
+    // is effective against host-owned resources. A non-zero inside uid execs
+    // bash unprivileged, and with PR_SET_NO_NEW_PRIVS the kernel clears its
+    // capabilities at execve and it cannot regain them. Containment depends on
+    // that, so make it a precondition rather than a caller's responsibility.
+    anyhow::ensure!(
+        spec.uid != 0 && spec.gid != 0,
+        "refusing to spawn the quarantine sandbox with uid/gid 0 (would run the \
+         decoy as host-mapped root); use an unprivileged uid/gid"
+    );
     let euid = nix::unistd::geteuid().as_raw();
     let egid = nix::unistd::getegid().as_raw();
 

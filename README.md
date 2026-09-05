@@ -127,7 +127,9 @@ moves the user into an impostor environment: a child that `unshare(2)`s into
 fresh mount/PID/network/UTS/IPC/user namespaces, builds a sandbox root in tmpfs
 with the host's `/usr` bind-mounted read-only, synthesizes believable
 `/etc/*` files, `pivot_root(2)`s in, takes the captured PTY as its controlling
-terminal, drops capabilities and `execve`s a shell. The user keeps typing and
+terminal, sets `PR_SET_NO_NEW_PRIVS`, and `execve`s a shell as an
+unprivileged uid so the kernel clears its capabilities at exec and it
+cannot regain them. The user keeps typing and
 sees plausible responses, but nothing they do touches the real host.
 
 It is reversible by design: release the quarantine and the daemon kills the
