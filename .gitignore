@@ -3,3 +3,7 @@
 Cargo.lock
 *.swp
 .DS_Store
+
+# Local agent guidance / session artifacts — never published.
+/CLAUDE.md
+/.claude/
