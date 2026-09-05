@@ -1,10 +1,10 @@
 name: Release
 
 # Builds, signs and publishes a WireTap release from GitHub-hosted runners on a
-# tag push. The eBPF object is built in the pinned toolchain image (see
-# toolchain-image.yml); the userspace binaries are cross-built with that object
-# embedded, signed with the RSA release key from secrets, and uploaded to S3
-# over AWS OIDC (no long-lived keys) plus a GitHub Release.
+# tag push. The userspace binaries are cross-built against the committed eBPF
+# object (crates/hop-tap-ebpf/ is only needed to regenerate it), signed with the
+# RSA release key from secrets, and uploaded to S3 over AWS OIDC (no long-lived
+# keys) plus a GitHub Release.
 #
 # One-time setup (see the repo's release notes / AGENTS.md):
 #   - secret HOP_SIGNING_KEY_PEM  : RSA release private key (PEM text)
@@ -23,35 +23,13 @@ concurrency:
 permissions:
   contents: write   # create the GitHub Release
   id-token: write   # AWS OIDC
-  packages: read    # pull the toolchain image
-
-env:
-  EBPF_PATH: crates/hop-tap-ebpf/target/bpfel-unknown-none/release/hop-tap-ebpf
 
 jobs:
-  # 1) Build the eBPF object in the pinned toolchain image.
-  ebpf:
-    runs-on: ubuntu-latest
-    container:
-      image: ghcr.io/keikai-inc/wiretap-toolchain:latest
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
-    steps:
-      - uses: actions/checkout@v4
-      - name: Build the eBPF program
-        working-directory: crates/hop-tap-ebpf
-        run: cargo +stage1-vlad build --release --target bpfel-unknown-none
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ebpf-object
-          path: ${{ env.EBPF_PATH }}
-          if-no-files-found: error
-
-  # 2) Cross-build the userspace binaries (musl, static) with the object embedded,
-  #    then checksum and sign each.
+  # Cross-build the userspace binaries (musl, static) against the committed
+  # eBPF object, then checksum and sign each. No toolchain image needed: the
+  # relocatable object ships in the repo (crates/hop-tap-d/ebpf/), and build.rs
+  # embeds it when HOP_TAP_SKIP_EBPF_BUILD is set.
   build:
-    needs: ebpf
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -65,11 +43,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Install cross
         run: cargo install cross --git https://github.com/cross-rs/cross --locked
-      - name: Fetch the eBPF object into the include path
-        uses: actions/download-artifact@v4
-        with:
-          name: ebpf-object
-          path: crates/hop-tap-ebpf/target/bpfel-unknown-none/release/
       - name: Cross-build daemon, CLI and honeypot
         env:
           HOP_TAP_SKIP_EBPF_BUILD: "1"   # the object is already present; do not rebuild
@@ -108,8 +81,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
-        with: { name: ebpf-object, path: ebpf/ }
-      - uses: actions/download-artifact@v4
         with: { name: dist-x86_64, path: dist/ }
       - uses: actions/download-artifact@v4
         with: { name: dist-arm64, path: dist/ }
@@ -118,7 +89,7 @@ jobs:
           SIGNING_KEY: ${{ secrets.HOP_SIGNING_KEY_PEM }}
         run: |
           set -euo pipefail
-          cp ebpf/hop-tap-ebpf dist/hop-tap-ebpf
+          cp crates/hop-tap-d/ebpf/hop-tap-ebpf.bpf.o dist/hop-tap-ebpf
           cd dist
           sha256sum hop-tap-ebpf | awk '{print $1}' > hop-tap-ebpf.sha256
           printf '%s' "$SIGNING_KEY" > "$RUNNER_TEMP/key.pem"
