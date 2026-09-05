@@ -95,6 +95,21 @@ configuration: type `tap` and you are in. The installer auto-detects whether
 WireHop is on the host and picks a mode; both fully work, and switching is just
 re-running it.
 
+Or install the binaries with cargo and set the service up in one command:
+
+```bash
+cargo install hop-tap-d      # installs `tap`, `hop-tap-d`, `tap-honeypot`
+sudo tap setup               # writes + enables the systemd unit, starts the daemon
+tap                          # you're in
+```
+
+`cargo install` builds against a committed, architecture-independent eBPF object,
+so it needs neither the pinned toolchain nor root at build time. `sudo tap setup`
+is the built-in installer for the daemon: it writes
+`/etc/systemd/system/hop-tap.service`, enables it, and starts `hop-tap-d` as
+root (idempotent, re-run after an upgrade). If the daemon is not running, `tap`
+tells you to run it.
+
 ### Standalone mode (WireHop not installed)
 
 `tap` is a self-contained local audit tool. The installer puts `hop-tap-d` (the
@@ -174,17 +189,18 @@ never touch the toolchain.
 
 ## Building
 
-Userspace daemon and CLI (stable Rust):
+The relocatable eBPF object is committed at
+`crates/hop-tap-d/ebpf/hop-tap-ebpf.bpf.o`, and `build.rs` embeds it by default,
+so the daemon and CLI build with stable Rust and no special setup:
 
 ```bash
 HOP_TAP_SKIP_EBPF_BUILD=1 cargo build --release -p hop-tap-d
 ```
 
-`hop-tap-d`'s `build.rs` normally cross-builds the eBPF object;
-`HOP_TAP_SKIP_EBPF_BUILD=1` skips that and uses the prebuilt object shipped with
-releases. To build the kernel-side crate yourself you need the pinned toolchain
-(`scripts/build-ebpf-toolchain.sh` reproduces it; the CI image in
-`docker/toolchain.Dockerfile` is the same recipe). Then:
+To rebuild the object yourself you need the pinned rustc fork + bpf-linker
+(`scripts/build-ebpf-toolchain.sh` reproduces the toolchain; the CI image in
+`docker/toolchain.Dockerfile` is the same recipe). `build.rs` picks up a fresh
+build automatically when the `stage1-vlad` toolchain is installed:
 
 ```bash
 cd crates/hop-tap-ebpf

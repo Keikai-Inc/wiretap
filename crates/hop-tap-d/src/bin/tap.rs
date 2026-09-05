@@ -67,6 +67,10 @@ enum Cmd {
         #[arg(value_name = "MESSAGE")]
         message: Vec<String>,
     },
+    /// Install and start the hop-tap daemon as a systemd service.
+    /// Run as root: `sudo tap setup`. Writes the unit, enables it and
+    /// starts the daemon. Idempotent; re-run after an upgrade.
+    Setup,
 }
 
 #[tokio::main]
@@ -88,9 +92,16 @@ async fn main() -> Result<()> {
     }
 
     let cmd = args.cmd.unwrap();
+
+    // `setup` runs before the daemon exists, so handle it before connecting.
+    if matches!(cmd, Cmd::Setup) {
+        return do_setup();
+    }
+
     let stream = UnixStream::connect(&args.socket).await.with_context(|| {
         format!(
-            "connecting to {}\n(is hop-tap-d running?  `sudo systemctl status hop-tap`)",
+            "connecting to {}\n(daemon not running? install and start it with `sudo tap setup`, \
+             or check `sudo systemctl status hop-tap`)",
             args.socket.display()
         )
     })?;
@@ -121,8 +132,110 @@ async fn main() -> Result<()> {
             )
             .await
         }
+        Cmd::Setup => unreachable!("handled before connecting"),
     }
 }
+
+/// Install the systemd unit and start the daemon. Linux + systemd only.
+#[cfg(target_os = "linux")]
+fn do_setup() -> Result<()> {
+    use std::process::Command;
+
+    // SAFETY: geteuid is always safe.
+    if unsafe { libc::geteuid() } != 0 {
+        bail!("tap setup installs a systemd service and must run as root: try `sudo tap setup`");
+    }
+    if which("systemctl").is_none() {
+        bail!(
+            "systemctl not found. hop-tap ships a unit at \
+             https://github.com/Keikai-Inc/wiretap/blob/main/hop-tap.service — \
+             install it for your init system and start hop-tap-d as root."
+        );
+    }
+    let daemon = locate_daemon().context(
+        "could not find the hop-tap-d binary (it ships next to `tap`); \
+         install it and re-run `sudo tap setup`",
+    )?;
+    let unit = SERVICE_UNIT.replace("@DAEMON@", &daemon.display().to_string());
+    let unit_path = "/etc/systemd/system/hop-tap.service";
+    std::fs::write(unit_path, unit).with_context(|| format!("writing {unit_path}"))?;
+    run(Command::new("systemctl").arg("daemon-reload"))?;
+    run(Command::new("systemctl").args(["enable", "--now", "hop-tap"]))?;
+    println!("hop-tap installed and running (daemon: {}).", daemon.display());
+    println!("Try it:      tap");
+    println!("Status:      sudo systemctl status hop-tap");
+    println!("Logs:        sudo journalctl -u hop-tap -f");
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn do_setup() -> Result<()> {
+    bail!("hop-tap is Linux-only (eBPF); `tap setup` has nothing to do here.");
+}
+
+/// The daemon binary: next to the running `tap`, else on PATH, else the
+/// conventional install location.
+#[cfg(target_os = "linux")]
+fn locate_daemon() -> Option<std::path::PathBuf> {
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        let cand = dir.join("hop-tap-d");
+        if cand.is_file() {
+            return Some(cand);
+        }
+    }
+    if let Some(p) = which("hop-tap-d") {
+        return Some(p);
+    }
+    let fallback = std::path::PathBuf::from("/usr/local/bin/hop-tap-d");
+    fallback.is_file().then_some(fallback)
+}
+
+#[cfg(target_os = "linux")]
+fn which(bin: &str) -> Option<std::path::PathBuf> {
+    std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths)
+            .map(|d| d.join(bin))
+            .find(|p| p.is_file())
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn run(cmd: &mut std::process::Command) -> Result<()> {
+    let status = cmd.status().with_context(|| format!("running {cmd:?}"))?;
+    if !status.success() {
+        bail!("{cmd:?} failed: {status}");
+    }
+    Ok(())
+}
+
+/// systemd unit written by `tap setup`. `@DAEMON@` is replaced with the
+/// resolved hop-tap-d path. Mirrors the repo's hop-tap.service.
+#[cfg(target_os = "linux")]
+const SERVICE_UNIT: &str = "\
+[Unit]
+Description=hop-tap eBPF terminal capture daemon
+Documentation=https://github.com/Keikai-Inc/wiretap
+After=hop.service network.target
+Wants=hop.service
+
+[Service]
+Type=simple
+User=root
+ExecStart=@DAEMON@ --bootstrap /run/hop-tap/bootstrap
+RuntimeDirectory=hop-tap
+RuntimeDirectoryMode=0755
+Restart=on-failure
+RestartSec=5
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+ReadWritePaths=/run/hop-tap -/etc/hop
+
+[Install]
+WantedBy=multi-user.target
+";
 
 /// Best-effort caller name for the `from` field on outgoing
 /// messages. Reads `$USER` first (set by login), falls back to
