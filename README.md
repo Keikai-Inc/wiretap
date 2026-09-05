@@ -98,7 +98,7 @@ re-running it.
 Or install the binaries with cargo and set the service up in one command:
 
 ```bash
-cargo install hop-tap-d      # installs `tap`, `hop-tap-d`, `tap-honeypot`
+cargo install wiretap-d      # installs `tap`, `hop-tap-d`, `tap-honeypot`
 sudo tap setup               # writes + enables the systemd unit, starts the daemon
 tap                          # you're in
 ```
@@ -194,7 +194,7 @@ The relocatable eBPF object is committed at
 so the daemon and CLI build with stable Rust and no special setup:
 
 ```bash
-HOP_TAP_SKIP_EBPF_BUILD=1 cargo build --release -p hop-tap-d
+HOP_TAP_SKIP_EBPF_BUILD=1 cargo build --release -p wiretap-d
 ```
 
 To rebuild the object yourself you need the pinned rustc fork + bpf-linker

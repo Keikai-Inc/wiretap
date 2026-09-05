@@ -26,7 +26,7 @@ constraints must not reach the userspace crates.
 ## Building and testing
 
 ```bash
-HOP_TAP_SKIP_EBPF_BUILD=1 cargo build --release -p hop-tap-d
+HOP_TAP_SKIP_EBPF_BUILD=1 cargo build --release -p wiretap-d
 HOP_TAP_SKIP_EBPF_BUILD=1 cargo clippy --all-targets   # must be warning-clean
 HOP_TAP_SKIP_EBPF_BUILD=1 cargo test
 ```

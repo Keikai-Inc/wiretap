@@ -24,7 +24,7 @@ command -v docker >/dev/null || { echo "need docker" >&2; exit 2; }
 command -v cross  >/dev/null || { echo "need cross"  >&2; exit 2; }
 
 echo "==> building tap-honeypot ($TARGET)"
-HOP_TAP_SKIP_EBPF_BUILD=1 cross build --release --target "$TARGET" --bin tap-honeypot -p hop-tap-d \
+HOP_TAP_SKIP_EBPF_BUILD=1 cross build --release --target "$TARGET" --bin tap-honeypot -p wiretap-d \
   || { echo "build failed" >&2; exit 1; }
 cp "$BIN" "$WORK/tap-honeypot"
 

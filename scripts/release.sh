@@ -277,7 +277,7 @@ CROSS_ENV='-e HOP_TAP_SKIP_EBPF_BUILD=1'
 start_build "hop-tap-linux-arm64" bash -c "
   CROSS_CONTAINER_OPTS='${CROSS_ENV}' \
   HOP_TAP_SKIP_EBPF_BUILD=1 cross build --release --target aarch64-unknown-linux-musl \
-    --manifest-path '${PROJECT_ROOT}/Cargo.toml' -p hop-tap-d --bins \
+    --manifest-path '${PROJECT_ROOT}/Cargo.toml' -p wiretap-d --bins \
   && cp '${PROJECT_ROOT}/target/aarch64-unknown-linux-musl/release/hop-tap-d' '${DIST_DIR}/hop-tap-d-linux-arm64' \
   && cp '${PROJECT_ROOT}/target/aarch64-unknown-linux-musl/release/tap' '${DIST_DIR}/tap-linux-arm64' \
   && cp '${PROJECT_ROOT}/target/aarch64-unknown-linux-musl/release/tap-honeypot' '${DIST_DIR}/tap-honeypot-linux-arm64'
@@ -286,7 +286,7 @@ start_build "hop-tap-linux-arm64" bash -c "
 start_build "hop-tap-linux-x86_64" bash -c "
   CROSS_CONTAINER_OPTS='${CROSS_ENV}' \
   HOP_TAP_SKIP_EBPF_BUILD=1 cross build --release --target x86_64-unknown-linux-musl \
-    --manifest-path '${PROJECT_ROOT}/Cargo.toml' -p hop-tap-d --bins \
+    --manifest-path '${PROJECT_ROOT}/Cargo.toml' -p wiretap-d --bins \
   && cp '${PROJECT_ROOT}/target/x86_64-unknown-linux-musl/release/hop-tap-d' '${DIST_DIR}/hop-tap-d-linux-x86_64' \
   && cp '${PROJECT_ROOT}/target/x86_64-unknown-linux-musl/release/tap' '${DIST_DIR}/tap-linux-x86_64' \
   && cp '${PROJECT_ROOT}/target/x86_64-unknown-linux-musl/release/tap-honeypot' '${DIST_DIR}/tap-honeypot-linux-x86_64'

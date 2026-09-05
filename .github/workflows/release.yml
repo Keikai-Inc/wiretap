@@ -48,7 +48,7 @@ jobs:
           HOP_TAP_SKIP_EBPF_BUILD: "1"   # the object is already present; do not rebuild
         run: |
           cross build --release --target "${{ matrix.target }}" \
-            --bin hop-tap-d --bin tap --bin tap-honeypot -p hop-tap-d
+            --bin hop-tap-d --bin tap --bin tap-honeypot -p wiretap-d
       - name: Stage, checksum and sign
         env:
           SIGNING_KEY: ${{ secrets.HOP_SIGNING_KEY_PEM }}

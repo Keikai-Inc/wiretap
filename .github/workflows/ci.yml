@@ -28,7 +28,7 @@ jobs:
       - name: test
         run: cargo test
       - name: release build
-        run: cargo build --release -p hop-tap-d
+        run: cargo build --release -p wiretap-d
 
   # Userspace on Linux, using the prebuilt eBPF object published with releases
   # (release.sh uploads it + a sha256). This lane compiles the code path that
