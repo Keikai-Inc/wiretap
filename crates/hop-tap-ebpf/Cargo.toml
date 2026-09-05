@@ -2,7 +2,7 @@
 name = "hop-tap-ebpf"
 version = "0.1.0"
 edition = "2024"
-license = "LicenseRef-Proprietary"
+license = "MIT OR Apache-2.0"
 
 # This crate is built standalone (not as a workspace member) for the
 # bpfel-unknown-none target with -Z build-std=core. See the workspace

@@ -1,6 +1,0 @@
-# Cargo's libgit2 transport can't use the SSH agent reliably, so
-# fetching the hop git dep (private repo) fails with "failed to
-# authenticate when downloading repository". Delegating to the
-# system `git` CLI uses ~/.ssh/* and the agent as expected.
-[net]
-git-fetch-with-cli = true

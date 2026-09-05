@@ -1,208 +1,180 @@
 # hop-tap
 
-Hop extension that captures every TTY/PTY session on a Linux host via
-eBPF and lets remote peers list, view, and (eventually) drive them.
+Terminal-session audit for Linux, over eBPF. `hop-tap` captures every
+TTY/PTY session on a host straight from the kernel and lets you list them,
+snapshot a screen, watch a live byte stream, and — for a session you decide is
+hostile — freeze it or divert it into a decoy environment. It runs standalone
+as a local audit tool, and, when [WireHop](https://github.com/Keikai-Inc/wirehop)
+is present, over WireHop's authenticated peer-to-peer transport so you can do all
+of that on a remote host by name.
 
-The kernel-side program is pure Rust with native `#[relocatable]`
-CO-RE field access — no C shims, no `bindgen`-generated `vmlinux.rs`.
-That relies on a pinned rustc fork implementing
+The kernel-side program is pure Rust with native `#[relocatable]` CO-RE field
+access — no C shims, no `bindgen`-generated `vmlinux.rs`. One compiled object
+runs across kernel versions because the field offsets are relocated at load
+time. That relies on a pinned rustc fork implementing
 [RFC 3966](https://github.com/rust-lang/rfcs/pull/3966); see
-[`docs/ebpf-toolchain.md`](docs/ebpf-toolchain.md) for exactly what is
-pinned and how to build it (`scripts/build-ebpf-toolchain.sh` does it
-for you). Only `crates/hop-tap-ebpf` needs it; the daemon and CLI build
-with stable Rust.
+[`docs/ebpf-toolchain.md`](docs/ebpf-toolchain.md) for exactly what is pinned
+and how to build it (`scripts/build-ebpf-toolchain.sh` does it for you). **Only
+`crates/hop-tap-ebpf` needs the fork; the daemon and the CLI build with stable
+Rust**, and a prebuilt eBPF object ships with releases so userspace contributors
+never touch the toolchain.
 
-The design doc is `docs/technical/tap.md` in the
-[wirehop](https://github.com/Keikai-Inc/wirehop) repo.
+## What it is for
 
-## Status
+An operator — or an AI agent acting as one — needs to see what is actually
+happening in the shells on a machine: what a session is typing and printing,
+who opened it, and whether it is doing something it should not. `hop-tap`
+answers that from the kernel, so it sees every PTY regardless of which shell,
+multiplexer, or SSH server created it, and it can act on a session without that
+session's cooperation.
 
-Phase 1.7 — Hop extension wiring. With `--bootstrap <path>` the
-daemon writes a TOML rendezvous file, accepts one hop daemon
-connection, performs the Hello/HelloAck handshake, and dispatches
-`ExtMessage::Request`s to a `TapRequest` handler. Subprotocol
-covers `List` (active sessions) and `Snapshot { pty_index }`
-(full 80×24 grid). The bundled `tap` CLI talks to the daemon
-over a local Unix socket (SO_PEERCRED authenticates the caller's
-uid); `tap list / snapshot / watch` work standalone, no hop
-required.
+## Threat model and authorization
 
-ExtMessage wire types are a local mirror of hop-core's; the dep
-on hop-core itself is deliberately avoided to keep hop-tap's
-compile fast.
+Read this before deploying. `hop-tap-d` is a **root daemon that records the
+contents of every terminal on the host**, including passwords typed at a prompt
+and any secret a program prints. Treat its socket, its logs, and its captured
+buffers as containing the most sensitive data on the machine.
 
-Phase 1.7 wires the Hop extension protocol: ipc-channel
-bootstrap, ExtMessage handlers (`list`, `connect`), the
-`hop tap` CLI verb, and the per-peer scope check.
+**Who may see what — local.** The daemon listens on a Unix socket at
+`/run/hop-tap/local.sock` (mode `0666`, world-connectable). On each accept it
+reads `SO_PEERCRED` from the kernel: the caller's uid is authoritative and the
+wire carries no identity claims. From that uid:
 
-## Layout
+- **uid 0 (root)** → `creator` role → every session on the host.
+- **non-root** → `peer` role → only sessions whose opener shares the caller's
+  username.
 
-```
-hop-tap/
-├── Cargo.toml                       # workspace (excludes hop-tap-ebpf)
-├── crates/
-│   ├── hop-tap-ebpf-common/         # shared no_std types (event structs)
-│   ├── hop-tap-ebpf/                # kernel-side; pinned rustc fork, see docs/ebpf-toolchain.md
-│   │   └── .cargo/config.toml       # bpfel-unknown-none + bpf-linker
-│   ├── hop-tap-protocol/            # wire types (TapRequest/Response,
-│   │                                #   stream frames). Tiny crate;
-│   │                                #   hop-cli depends on it via path.
-│   └── hop-tap-d/                   # userspace daemon + bundled `tap` CLI
-└── manifests/
-    └── tap-terminal.toml.example    # example Hop extension manifest
-```
+The rule is "anyone may audit their own sessions; root may audit anyone." No
+groups, no credentials, no configuration. The `0666` socket is deliberate — the
+kernel-verified peer uid, not file permissions, is the access boundary — but it
+means any local user can reach the daemon, so the uid check is the whole
+security model locally. If you do not want non-root users auditing their own
+sessions, do not install `hop-tap`.
+
+**Who may see what — remote.** With WireHop installed, remote access uses
+WireHop's existing peer/role model over authenticated QUIC: a creator sees all
+sessions, other roles are gated by the session's `opener_username`. There is no
+separate remote auth path in `hop-tap`; it inherits WireHop's.
+
+**Acting on a session.** `lock` SIGSTOPs a session's process group; `quarantine`
+freezes the real shell and swaps the user into a namespace-sandboxed decoy (see
+below). Both are creator-only and both are reversible. They are powerful — a
+mistaken quarantine interrupts a legitimate user — so they require confirmation
+in the interactive UI.
+
+Report vulnerabilities privately: see [`SECURITY.md`](SECURITY.md).
 
 ## Install
 
-One-liner for any Linux host:
-
 ```bash
-curl -fsSL https://tap.keik.ai/install.sh | bash
+curl -fsSL https://wirehop.org/tap/install.sh | bash
 ```
 
-The installer auto-detects whether hop is on the host and picks one
-of two modes — both fully working:
+The installer auto-detects whether WireHop is on the host and picks a mode; both
+are fully working, and switching is just re-running it.
 
-### Standalone mode (hop not installed)
+### Standalone mode (WireHop not installed)
 
-`tap` is a fully self-contained local audit utility. The installer
-puts down `hop-tap-d` (the daemon, started by systemd as root) and
-`tap` (the user-facing CLI) in `/usr/local/bin`, then starts the
-daemon. Anyone on the host can use it:
+`tap` is a self-contained local audit tool. The installer puts `hop-tap-d` (the
+daemon, started by systemd as root) and `tap` (the CLI) in `/usr/local/bin` and
+starts the daemon. Anyone on the host can use it, subject to the uid rule above:
 
 ```bash
 tap list                # sessions you can see
 tap snapshot 0          # current screen for pty=0
-tap watch 0             # live byte stream → your terminal
-tap repl                # interactive multi-command session
+tap watch 0             # live byte stream -> your terminal
+tap repl                # interactive TUI: select, connect, lock, quarantine, kill
 ```
 
-**Local permission model.** The daemon listens on a Unix socket
-at `/run/hop-tap/local.sock` (mode 0666, world-connectable). On
-each accept it reads `SO_PEERCRED` from the kernel — the caller's
-uid is authoritative; the wire carries no identity claims.
+### WireHop-integrated mode (WireHop installed and running)
 
-- **uid 0** (root) → `creator` role → sees every session
-- **non-root** → `peer` role → sees only sessions whose opener
-  matches the caller's username
-
-The model is "everyone can audit themselves; root can audit
-anyone" — a natural local audit boundary, no special groups or
-credentials required.
-
-### hop-integrated mode (hop installed and running)
-
-If `hop` is installed and `systemctl is-active hop` returns true at
-install time, the installer also drops a manifest at
-`/etc/hop/extensions/tap-terminal.toml` and restarts hop so it
-picks up the new extension. **Local `tap` works exactly the same.**
-What hop adds is *remote* access: peers on the hop network can
-now run
+If `hop` is installed and `systemctl is-active hop` is true at install time, the
+installer also drops `/etc/hop/extensions/tap-terminal.toml` and restarts hop so
+it loads the extension. Local `tap` is unchanged; what you gain is remote access
+over WireHop's transport:
 
 ```bash
-hop <host> ext list                       # tap.terminal listed as available
-hop <host> tap list                       # active sessions, with opener vs writer
-hop <host> tap snapshot 0                 # 24x80 grid for pty=0
-hop <host> tap watch 0                    # live byte stream
+hop <host> ext list        # tap.terminal listed as available
+hop <host> tap list        # active sessions, with opener vs writer
+hop <host> tap snapshot 0  # 24x80 grid for pty=0
+hop <host> tap watch 0     # live byte stream, rendered in your terminal
 ```
 
-over hop's authenticated QUIC transport. The remote path uses
-hop's existing peer/role permission model (creator sees all;
-other roles gated by `opener_username`).
+Multi-frame responses stream back over the peer's QUIC stream until the session
+closes; the CLI writes the raw captured bytes to stdout, so a watched session
+renders in real time with no client-side emulator round-trip.
 
-### Switching between modes
-
-Modes are decided at install time, but switching is just re-running
-the installer. Install hop after the fact, then re-run
-`curl -fsSL https://tap.keik.ai/install.sh | bash` — the
-detector now sees hop, drops the manifest, and restarts hop.
-
-The installer never auto-installs hop. If you want hop too:
+To run both, install WireHop first, then `hop-tap`:
 
 ```bash
-curl -fsSL https://hop.keik.ai/install-daemon.sh | bash    # then:
-curl -fsSL https://tap.keik.ai/install.sh | bash
+curl -fsSL https://wirehop.org/install-daemon.sh | bash
+curl -fsSL https://wirehop.org/tap/install.sh | bash
 ```
 
 ### Verify
 
 ```bash
-sudo systemctl status hop-tap                    # daemon up
-sudo journalctl -u hop-tap -f                    # tailing logs
-
-# In hop-integrated mode:
-hop <host> ext list                              # tap.terminal listed
-hop <host> tap list                              # active sessions
-
-# In any mode (local-only, no hop required):
-tap list
-tap repl
+sudo systemctl status hop-tap        # daemon up
+sudo journalctl -u hop-tap -f        # logs
+tap list                             # any mode, no WireHop required
 ```
 
-## Production usage
+## Quarantine (the decoy environment)
 
-Once installed, peers can:
+When you mark a captured session suspicious, `hop-tap` freezes the real shell
+(SIGSTOP, with its process tree, environment and file descriptors intact) and
+moves the user into an impostor environment: a child that `unshare(2)`s into
+fresh mount/PID/network/UTS/IPC/user namespaces, builds a sandbox root in tmpfs
+with the host's `/usr` bind-mounted read-only, synthesizes believable
+`/etc/*` files, `pivot_root(2)`s in, takes the captured PTY as its controlling
+terminal, drops capabilities and `execve`s a shell. The user keeps typing and
+sees plausible responses, but nothing they do touches the real host.
 
-```bash
-hop <host> tap list                       # active sessions, with opener vs writer
-hop <host> tap snapshot 0                 # 24x80 grid for pty=0
-hop <host> tap watch 0                    # live byte stream
-```
-
-`hop <host> tap watch <pty>` works end-to-end as of hop's
-extension-system commit `0cd6d09` (the streaming dispatcher in
-hop-core). Multi-frame `PeerResponse`s flow back over the peer's
-QUIC stream until `StreamClosed`; the CLI decodes each
-`TapStreamFrame` and writes raw bytes to stdout, so the operator's
-terminal renders the captured session in real time without any
-client-side emulator round-trip.
-
-The `hop-tap-ebpf` crate is intentionally **outside** the workspace
-because it must be cross-compiled for `bpfel-unknown-none` with
-`-Z build-std=core` on vlad's nightly fork. Putting it in the
-workspace would force those constraints onto the userspace crates
-too. The `hop-tap-d` build.rs (added in Phase 1.2) drives the
-cross-build.
+It is reversible by design: release the quarantine and the daemon kills the
+impostor and SIGCONTs the real shell, and the user is back exactly where they
+were. Whatever they typed into the decoy is discarded.
 
 ## Building
 
-Userspace:
+Userspace daemon and CLI (stable Rust):
 
 ```bash
-cargo build -p hop-tap-d
+HOP_TAP_SKIP_EBPF_BUILD=1 cargo build --release -p hop-tap-d
 ```
 
-Kernel-side (requires vlad's stage1 rustc linked as `stage1-vlad`):
+`hop-tap-d`'s `build.rs` normally cross-builds the eBPF object; setting
+`HOP_TAP_SKIP_EBPF_BUILD=1` skips that and uses the prebuilt object shipped with
+releases. To build the kernel-side crate yourself you need the pinned toolchain
+(`scripts/build-ebpf-toolchain.sh` reproduces it; ~30–90 min for the rustc
+build). Then:
 
 ```bash
 cd crates/hop-tap-ebpf
-cargo +stage1-vlad build --release
+cargo +stage1-vlad build --release      # -> bpfel-unknown-none .bpf.o with BTF
 ```
 
-## Running
+`crates/hop-tap-ebpf` is intentionally **outside** the workspace so its
+`bpfel-unknown-none` + `-Z build-std=core` + fork-toolchain constraints do not
+leak onto the userspace crates.
 
-Not yet — see Phase 1.2.
+## Layout
 
-## Phasing
+```
+crates/
+  hop-tap-ebpf-common/   # shared no_std event types
+  hop-tap-ebpf/          # kernel-side program (pinned rustc fork; see docs/)
+  hop-tap-protocol/      # wire types (TapRequest/Response, stream frames)
+  hop-tap-d/             # userspace daemon + the bundled `tap` CLI + honeypot
+manifests/               # example WireHop extension manifest
+scripts/                 # toolchain build + release
+docs/                    # eBPF toolchain reference
+```
 
-| Sub-phase | What | Status |
-|---|---|---|
-| 1.1 | Workspace skeleton, three crates that build cleanly | done |
-| 1.2 | Minimal eBPF kprobe; userspace reads PingEvents | done |
-| 1.3 | `#[relocatable]` types replace all CO-RE shims | done |
-| 1.4 | Real `pty_write` capture (flat buffer; `iov_iter` walker shelved) | done |
-| 1.5 | Session tracking by `tty_struct.index` | done |
-| 1.6 | `alacritty_terminal::Term` per session; snapshot generation | done |
-| 1.7 | Hop extension wiring (manifest, bootstrap, ExtMessage) | done |
-| 1.8a | PTY dimension tracking via `tty_struct.winsize` | done |
-| 1.8b | Live byte streaming (`StreamOpen` / replay + Output / Resize) | done |
-| 1.8c | Session-end detection via `tty_release_struct` kprobe | done |
-| 1.8d | Owner attribution (uid/gid → username via `getpwuid_r`) | done |
-| 1.8e | Sticky session-opener identity (separate from per-event writer) | done |
-| 1.8f | Probe REPL: multiple commands over one daemon connection | done |
-| 1.8g | SGR-aware grid replay (vim/htop fidelity on mid-session subscribe) | done |
-| 1.8h | `hop &lt;host&gt; tap` verb in hop-cli + extracted `hop-tap-protocol` crate | done |
-| 1.8i | Per-peer scope check (creator sees all; others gated by `opener_username`) | done |
-| 1.8j | `/proc` walk to seed pre-existing sessions with their session leader's identity | done |
-| 1.8k | Alt-screen-aware replay (vim/htop/less subscribers land in the right mode) | done |
-| 1.8l | Extension streaming in hop-core: `hop &lt;host&gt; tap watch` end-to-end | done (in hop repo) |
+The WireHop-side design doc is `docs/technical/tap.md` in the
+[wirehop](https://github.com/Keikai-Inc/wirehop) repo.
+
+## License
+
+MIT OR Apache-2.0, at your option. See [`LICENSE-MIT`](LICENSE-MIT) and
+[`LICENSE-APACHE`](LICENSE-APACHE); bundled dependency licenses are in
+[`THIRD_PARTY_LICENSES.txt`](THIRD_PARTY_LICENSES.txt).

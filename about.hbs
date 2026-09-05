@@ -1,0 +1,16 @@
+Third-party licenses for hop-tap
+================================
+
+This file lists the open-source dependencies bundled or linked by hop-tap and
+their licenses. Regenerate with `cargo about generate about.hbs > THIRD_PARTY_LICENSES.txt`.
+
+{{#each licenses}}
+--------------------------------------------------------------------------------
+{{{name}}} ({{id}})
+
+Used by:
+{{#each used_by}}  - {{crate.name}} {{crate.version}}
+{{/each}}
+{{{text}}}
+
+{{/each}}
